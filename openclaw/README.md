@@ -35,8 +35,11 @@ The image is based on `lscr.io/linuxserver/webtop:ubuntu-xfce`. The Dockerfile i
 
 **Bash**
 
+Run this from the repository root so Docker can include the shared
+`clawmanager-agent/` component.
+
 ```
-docker build -f Dockerfile.openclaw -t openclaw:local .
+docker build -f openclaw/Dockerfile.openclaw -t openclaw:local .
 ```
 
 ### Run
@@ -159,7 +162,7 @@ docker commit webtop-running openclaw:v1.0
 ## Notes
 
 * **Permissions**: the agent runs `chown -R abc:abc` on `/config/.openclaw` and `/config/.config/autostart` before dropping to `abc`, so the default user can read/write persisted config.
-* **Docker Compose**: point `image` at your built tag, or use `build` with `dockerfile: Dockerfile.openclaw`. Do not rely on the stock `webtop` image alone; it will not include this repo’s templates and agent service.
+* **Docker Compose**: point `image` at your built tag, or use `build` from the repository root with `context: .` and `dockerfile: openclaw/Dockerfile.openclaw`. Do not rely on the stock `webtop` image alone; it will not include this repo’s templates and agent services.
 * **Standalone WebTop**: if you do not use ClawManager batch features, you can skip the ClawManager-specific steps in the advanced flow.
 
 ---

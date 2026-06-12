@@ -2,15 +2,22 @@
 
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS agent-builder
 
-WORKDIR /src
-
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG AGENT_VERSION=dev
 
+WORKDIR /src/clawmanager-agent
+COPY clawmanager-agent ./
+RUN go mod download
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
+      go build -trimpath -ldflags="-s -w" \
+      -o /out/clawmanager-agent ./cmd/clawmanager-agent
+
+WORKDIR /src/openclaw
 COPY openclaw/go.mod openclaw/go.sum ./
 RUN go mod download
-
 COPY openclaw/cmd ./cmd
 COPY openclaw/internal ./internal
 
@@ -31,6 +38,8 @@ ENV HOME=/config \
     OPENCLAW_AGENT_CONFIG_PATH=/etc/openclaw-agent/config.yaml \
     OPENCLAW_AGENT_DATA_DIR=/config/openclaw-shell-agent \
     OPENCLAW_AGENT_RUNTIME_TYPE=openclaw-shell \
+    CLAWMANAGER_RUNTIME_TYPE=openclaw-shell \
+    RUNTIME_AGENT_DATA_DIR=/config/clawmanager-agent \
     OPENCLAW_AGENT_RUNTIME_NAME="OpenClaw Shell" \
     OPENCLAW_AGENT_DESKTOP_BASE=none \
     OPENCLAW_AGENT_RUNTIME_PORT=18789 \
@@ -61,6 +70,7 @@ RUN apk add --no-cache \
       git \
       ncurses-terminfo \
       openssh-client \
+      python3 \
       ripgrep \
       tini \
       tmux \
@@ -69,7 +79,6 @@ RUN apk add --no-cache \
     && apk add --no-cache --virtual .openclaw-build-deps \
       g++ \
       make \
-      python3 \
     && npm install -g "openclaw@${OPENCLAW_VERSION}" \
     && npm cache clean --force \
     && apk del .openclaw-build-deps
@@ -81,6 +90,7 @@ COPY openclaw-shell/scripts/enable-redis-team-config.mjs /tmp/enable-redis-team-
 COPY openclaw-shell/scripts/openclaw-shell-entrypoint /usr/local/bin/openclaw-shell-entrypoint
 COPY openclaw-shell/scripts/openclaw-shell-login /usr/local/lib/openclaw-shell/login.sh
 COPY --from=agent-builder /out/openclaw-agent /usr/local/bin/openclaw-agent
+COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
 
 RUN set -eux; \
     addgroup -g 1000 abc 2>/dev/null || true; \
@@ -92,7 +102,7 @@ RUN set -eux; \
     sed -i 's#^\(abc:[^:]*:[^:]*:[^:]*:[^:]*:\)[^:]*:[^:]*#\1/config:/bin/bash#' /etc/passwd; \
     sed -i 's/\r$//' /usr/local/bin/openclaw-shell-entrypoint; \
     sed -i 's/\r$//' /usr/local/lib/openclaw-shell/login.sh; \
-    chmod 755 /usr/local/bin/openclaw-shell-entrypoint /usr/local/bin/openclaw-agent; \
+    chmod 755 /usr/local/bin/openclaw-shell-entrypoint /usr/local/bin/openclaw-agent /usr/local/bin/clawmanager-agent; \
     chmod 644 /usr/local/lib/openclaw-shell/login.sh; \
     mkdir -p \
       /config/.cache/npm \
@@ -102,6 +112,7 @@ RUN set -eux; \
       /config/.openclaw/workspace/skills \
       /config/openclaw-shell-agent/history \
       /config/openclaw-shell-agent/logs \
+      /config/clawmanager-agent \
       /etc/profile.d \
       /etc/openclaw-agent; \
     printf '%s\n' \

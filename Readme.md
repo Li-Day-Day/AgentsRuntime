@@ -2,17 +2,22 @@
 
 This repository contains Docker image definitions for the runtimes used by the ClawManager Agents project.
 
-Each top-level runtime directory can produce one container image. At the moment, the repository includes:
+The repository currently documents these runtime images:
 
 - `hermes`
+- `hermes-lite`
 - `openclaw`
+- `openclaw-lite`
 - `openclaw-shell`
 
 ## Repository layout
 
-- `hermes/`: Hermes runtime image
-- `openclaw/`: OpenClaw runtime image
+- `hermes/`: Hermes runtime image, built from the repository root so it can include the shared `clawmanager-agent/`
+- `hermes-lite`: lite Hermes runtime image, built from the repository root with the Hermes Dockerfile
+- `openclaw/`: OpenClaw runtime image, built from the repository root so it can include the shared `clawmanager-agent/`
+- `openclaw-lite`: lite OpenClaw runtime image, built from the repository root with `openclaw/Dockerfile.openclaw`
 - `openclaw-shell/`: Alpine-based OpenClaw shell runtime image, built from the repository root so it can reuse the OpenClaw agent implementation under `openclaw/`
+- `clawmanager-agent/`: shared managed-runtime agent used by runtime images that need ClawManager runtime gateway control
 
 ## Manual builds
 
@@ -24,7 +29,16 @@ You can build each runtime image directly with Docker from the repository root.
 docker build \
   -f hermes/Dockerfile \
   -t hermes:local \
-  ./hermes
+  .
+```
+
+### Hermes Lite
+
+```bash
+docker build \
+  -f hermes/Dockerfile \
+  -t hermes-lite:local \
+  .
 ```
 
 ### OpenClaw
@@ -33,7 +47,16 @@ docker build \
 docker build \
   -f openclaw/Dockerfile.openclaw \
   -t openclaw:local \
-  ./openclaw
+  .
+```
+
+### OpenClaw Lite
+
+```bash
+docker build \
+  -f openclaw/Dockerfile.openclaw \
+  -t openclaw-lite:local \
+  .
 ```
 
 ### OpenClaw Shell
@@ -59,7 +82,18 @@ docker buildx build \
   -f hermes/Dockerfile \
   -t <registry>/hermes:latest \
   --push \
-  ./hermes
+  .
+```
+
+### Hermes Lite
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f hermes/Dockerfile \
+  -t <registry>/hermes-lite:latest \
+  --push \
+  .
 ```
 
 ### OpenClaw
@@ -70,7 +104,18 @@ docker buildx build \
   -f openclaw/Dockerfile.openclaw \
   -t <registry>/openclaw:latest \
   --push \
-  ./openclaw
+  .
+```
+
+### OpenClaw Lite
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f openclaw/Dockerfile.openclaw \
+  -t <registry>/openclaw-lite:latest \
+  --push \
+  .
 ```
 
 ### OpenClaw Shell

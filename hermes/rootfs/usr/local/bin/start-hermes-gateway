@@ -103,4 +103,4 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 cd /config
-exec hermes gateway
+exec hermes gateway run --accept-hooks --no-supervise

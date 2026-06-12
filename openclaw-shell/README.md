@@ -1,6 +1,6 @@
 # OpenClaw Shell Runtime
 
-This directory defines the Alpine-based OpenClaw shell image. It deliberately omits Webtop, KasmVNC, and browser autostart. The Docker build context is the repository root so the image can reuse the `openclaw-agent` implementation from `openclaw/`.
+This directory defines the Alpine-based OpenClaw shell image. It deliberately omits Webtop, KasmVNC, and browser autostart. The Docker build context is the repository root so the image can reuse the `openclaw-agent` implementation from `openclaw/` and include the shared `clawmanager-agent/` runtime component.
 
 ## Build
 

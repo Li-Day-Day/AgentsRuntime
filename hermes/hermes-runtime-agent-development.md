@@ -1,6 +1,6 @@
 # Hermes Runtime Image and Agent Development Guide
 
-本文面向 Hermes 镜像开发端，说明如何基于 Webtop 构建 ClawManager 可管理的 Hermes runtime 镜像，以及 Hermes 内置 agent 如何接入 ClawManager 的 Agent Control Plane，使 Hermes 像 OpenClaw 一样具备实时状态上报、健康信息上报、skill inventory 同步、skill 包上传和命令轮询能力。
+本文面向 Hermes 镜像开发端，说明如何基于 Webtop 构建 ClawManager 可管理的 Hermes runtime 镜像，以及 Hermes 如何通过共享 `clawmanager-agent` 接入 ClawManager 的 Agent Control Plane，使 Hermes 像 OpenClaw 一样具备实时状态上报、健康信息上报、skill inventory 同步、skill 包上传和命令轮询能力。
 
 ## 目标
 
@@ -34,9 +34,9 @@ USER root
 # 2. 安装 Hermes 本体。
 # COPY hermes /opt/hermes
 
-# 3. 安装 ClawManager Hermes agent。
-COPY hermes-agent /usr/local/bin/hermes-agent
-RUN chmod +x /usr/local/bin/hermes-agent
+# 3. 安装共享 ClawManager agent。
+COPY clawmanager-agent /usr/local/bin/clawmanager-agent
+RUN chmod +x /usr/local/bin/clawmanager-agent
 
 # 4. 注册 s6 longrun 服务，让 agent 随 Webtop 容器启动。
 COPY root/ /
@@ -79,7 +79,7 @@ if [ "${CLAWMANAGER_AGENT_ENABLED:-false}" != "true" ]; then
   sleep infinity
 fi
 
-exec /usr/local/bin/hermes-agent
+exec /usr/local/bin/clawmanager-agent
 ```
 
 Hermes agent 不要占用 `3001`。`3001` 是 Webtop 桌面访问入口，agent 只需要作为后台进程向 ClawManager 发起出站 HTTP 请求。

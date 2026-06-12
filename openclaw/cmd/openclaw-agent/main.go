@@ -11,10 +11,14 @@ import (
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/bootstrap"
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/browser"
 	appconfig "github.com/iamlovingit/clawmanager-openclaw-image/internal/config"
+	configmanager "github.com/iamlovingit/clawmanager-openclaw-image/internal/configmanager"
 	"github.com/iamlovingit/clawmanager-openclaw-image/internal/supervisor"
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	cfg, err := appconfig.Load()
 	if err != nil {
 		log.Fatalf("load config: %v", err)
@@ -24,10 +28,10 @@ func main() {
 		log.Fatalf("bootstrap: %v", err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	if !cfg.Enabled {
+		if err := normalizeRuntimeConfig(cfg); err != nil {
+			log.Fatalf("normalize openclaw config: %v", err)
+		}
 		log.Printf("ClawManager agent disabled; running %s without control plane integration", cfg.RuntimeName)
 		if err := runRuntime(ctx, cfg.OpenClawCommand); err != nil {
 			log.Fatalf("run runtime: %v", err)
@@ -45,6 +49,10 @@ func main() {
 	if err := s.Run(ctx); err != nil {
 		log.Fatalf("run supervisor: %v", err)
 	}
+}
+
+func normalizeRuntimeConfig(cfg appconfig.Config) error {
+	return configmanager.New(cfg, nil, nil).NormalizeActiveConfig()
 }
 
 func runRuntime(ctx context.Context, command []string) error {

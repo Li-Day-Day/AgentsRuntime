@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME="${HOME:-/config}"
+export HERMES_HOME="${HERMES_HOME:-${HOME}/.hermes}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+export NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-${XDG_CACHE_HOME}/npm}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-${XDG_CACHE_HOME}/uv}"
+export HERMES_ACCEPT_HOOKS="${HERMES_ACCEPT_HOOKS:-1}"
+
+mkdir -p \
+    "${HERMES_HOME}" \
+    "${NPM_CONFIG_CACHE}" \
+    "${UV_CACHE_DIR}" \
+    "${XDG_CONFIG_HOME}" \
+    "${XDG_DATA_HOME}"
+
+env_file="${HERMES_HOME}/.env"
+if [ -f "${env_file}" ]; then
+    while IFS= read -r line || [ -n "${line:-}" ]; do
+        line="${line%$'\r'}"
+        [[ "${line}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        if [[ "${value}" == \"*\" && "${value}" == *\" ]]; then
+            value="${value:1:${#value}-2}"
+            value="${value//\\\"/\"}"
+            value="${value//\\\\/\\}"
+        elif [[ "${value}" == \'*\' && "${value}" == *\' ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+        export "${key}=${value}"
+    done <"${env_file}"
+fi
+
+port="${CLAWMANAGER_GATEWAY_PORT:-${PORT:-9119}}"
+host="${HOST:-0.0.0.0}"
+
+case "${port}" in
+    ''|*[!0-9]*)
+        echo "invalid Hermes dashboard port: ${port}" >&2
+        exit 64
+        ;;
+esac
+
+truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y|on|enabled) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+falsey() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        0|false|no|n|off|disabled) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+should_start_team_gateway() {
+    truthy "${CLAWMANAGER_TEAM_ENABLED:-}" || return 1
+    falsey "${CLAWMANAGER_TEAM_AUTORUN:-true}" && return 1
+    [ -n "${CLAWMANAGER_TEAM_REDIS_URL:-}" ] &&
+        [ -n "${CLAWMANAGER_TEAM_ID:-}" ] &&
+        [ -n "${CLAWMANAGER_TEAM_MEMBER_ID:-}" ]
+}
+
+team_gateway_pid=""
+dashboard_pid=""
+
+shutdown() {
+    trap - INT TERM
+    if [ -n "${dashboard_pid}" ]; then
+        kill "${dashboard_pid}" 2>/dev/null || true
+    fi
+    if [ -n "${team_gateway_pid}" ]; then
+        kill "${team_gateway_pid}" 2>/dev/null || true
+    fi
+    wait 2>/dev/null || true
+    exit 143
+}
+
+trap shutdown INT TERM
+
+if should_start_team_gateway; then
+    echo "Starting Hermes Redis Team consumer for member ${CLAWMANAGER_TEAM_MEMBER_ID}"
+    (
+        cd "${HOME}"
+        exec hermes gateway run --accept-hooks --no-supervise
+    ) &
+    team_gateway_pid="$!"
+fi
+
+hermes dashboard \
+    --host "${host}" \
+    --port "${port}" \
+    --no-open \
+    --insecure \
+    --skip-build &
+dashboard_pid="$!"
+
+wait "${dashboard_pid}"
+status="$?"
+dashboard_pid=""
+
+if [ -n "${team_gateway_pid}" ]; then
+    kill "${team_gateway_pid}" 2>/dev/null || true
+    wait "${team_gateway_pid}" 2>/dev/null || true
+fi
+
+exit "${status}"

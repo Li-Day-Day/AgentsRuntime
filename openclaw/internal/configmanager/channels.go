@@ -84,6 +84,7 @@ func applyChannelOverrides(cfg map[string]any, opts channelOverrides) error {
 		sanitized[id] = value
 	}
 	reconcileRedisTeamChannel(sanitized, supported)
+	reconcileRedisTeamPluginEntry(cfg, supported)
 	reconcileEnvManagedChannelPlugins(cfg, fromEnv)
 	cfg["channels"] = sanitized
 	return nil
@@ -163,6 +164,19 @@ func reconcileRedisTeamChannel(channels map[string]any, supported map[string]str
 				"fromEnv": true,
 			},
 		},
+	}
+}
+
+func reconcileRedisTeamPluginEntry(cfg map[string]any, supported map[string]struct{}) {
+	plugins := ensureObject(cfg, "plugins")
+	entries := ensureObject(plugins, "entries")
+	entry := ensureObject(entries, redisTeamChannelID)
+	if !teamEnabledFromEnv() {
+		entry["enabled"] = false
+		return
+	}
+	if _, ok := supported[redisTeamChannelID]; ok {
+		entry["enabled"] = true
 	}
 }
 

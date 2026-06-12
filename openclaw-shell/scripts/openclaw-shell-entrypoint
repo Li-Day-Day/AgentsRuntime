@@ -5,8 +5,10 @@ umask 0002
 
 AGENT_USER="${OPENCLAW_AGENT_DROP_USER_NAME:-abc}"
 AGENT_BIN="/usr/local/bin/openclaw-agent"
+RUNTIME_AGENT_BIN="/usr/local/bin/clawmanager-agent"
 PERSISTENT_DIR="${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}"
 AGENT_DATA_DIR="${OPENCLAW_AGENT_DATA_DIR:-$PERSISTENT_DIR/openclaw-shell-agent}"
+RUNTIME_AGENT_DATA_DIR="${RUNTIME_AGENT_DATA_DIR:-$PERSISTENT_DIR/clawmanager-agent}"
 AGENT_LOG_DIR="${AGENT_DATA_DIR}/logs"
 AGENT_CONFIG_DIR="/etc/openclaw-agent"
 AGENT_CONFIG_FILE="${OPENCLAW_AGENT_CONFIG_PATH:-$AGENT_CONFIG_DIR/config.yaml}"
@@ -16,6 +18,8 @@ export CLAWMANAGER_AGENT_PERSISTENT_DIR="$PERSISTENT_DIR"
 export OPENCLAW_AGENT_DATA_DIR="$AGENT_DATA_DIR"
 export OPENCLAW_AGENT_CONFIG_PATH="$AGENT_CONFIG_FILE"
 export OPENCLAW_AGENT_RUNTIME_TYPE="${OPENCLAW_AGENT_RUNTIME_TYPE:-openclaw-shell}"
+export CLAWMANAGER_RUNTIME_TYPE="${CLAWMANAGER_RUNTIME_TYPE:-openclaw-shell}"
+export RUNTIME_AGENT_DATA_DIR="$RUNTIME_AGENT_DATA_DIR"
 export OPENCLAW_AGENT_RUNTIME_NAME="${OPENCLAW_AGENT_RUNTIME_NAME:-OpenClaw Shell}"
 export OPENCLAW_AGENT_DESKTOP_BASE="${OPENCLAW_AGENT_DESKTOP_BASE:-none}"
 export OPENCLAW_AGENT_RUNTIME_PORT="${OPENCLAW_AGENT_RUNTIME_PORT:-18789}"
@@ -50,6 +54,7 @@ repair_team_shared_dir() {
 mkdir -p \
   "$PERSISTENT_DIR" \
   "$AGENT_DATA_DIR" \
+  "$RUNTIME_AGENT_DATA_DIR" \
   "$AGENT_LOG_DIR" \
   "$AGENT_DATA_DIR/history" \
   "$AGENT_CONFIG_DIR" \
@@ -72,6 +77,7 @@ if [ "$(id -u)" = "0" ] && id "$AGENT_USER" >/dev/null 2>&1; then
   chown -R "$AGENT_USER:$AGENT_GROUP" \
     "$PERSISTENT_DIR" \
     "$AGENT_DATA_DIR" \
+    "$RUNTIME_AGENT_DATA_DIR" \
     "$AGENT_LOG_DIR" \
     "$AGENT_CONFIG_DIR" \
     "$HOME" \
@@ -79,6 +85,10 @@ if [ "$(id -u)" = "0" ] && id "$AGENT_USER" >/dev/null 2>&1; then
     "$XDG_CONFIG_HOME" \
     "$XDG_DATA_HOME" \
     /config/.openclaw || true
+fi
+
+if [ -x "$RUNTIME_AGENT_BIN" ] && { [ -n "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ] || [ -n "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]; }; then
+  "$RUNTIME_AGENT_BIN" &
 fi
 
 exec "$AGENT_BIN"

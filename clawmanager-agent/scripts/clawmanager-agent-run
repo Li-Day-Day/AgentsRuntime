@@ -1,0 +1,12 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+if [ -z "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ] && [ -z "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]; then
+  echo "ClawManager shared runtime agent disabled"
+  sleep infinity
+fi
+
+AGENT_DATA_DIR="${RUNTIME_AGENT_DATA_DIR:-/var/lib/clawmanager-agent}"
+mkdir -p "$AGENT_DATA_DIR"
+
+exec /usr/local/bin/clawmanager-agent

@@ -1,16 +1,18 @@
 FROM golang:1.26-bookworm AS agent-builder
 
-WORKDIR /src
-
-COPY go.mod go.sum ./
-RUN go mod download
-
-COPY cmd ./cmd
-COPY internal ./internal
-
-# BuildKit 多架构构建时注入 TARGET*；与最终镜像架构一致（勿写死 amd64）
 ARG TARGETOS=linux
 ARG TARGETARCH
+
+WORKDIR /src/clawmanager-agent
+COPY clawmanager-agent ./
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/clawmanager-agent ./cmd/clawmanager-agent
+
+WORKDIR /src/openclaw
+COPY openclaw/go.mod openclaw/go.sum ./
+RUN go mod download
+COPY openclaw/cmd ./cmd
+COPY openclaw/internal ./internal
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/openclaw-agent ./cmd/openclaw-agent
 
 FROM node:22-bookworm-slim AS node-runtime
@@ -20,6 +22,7 @@ FROM lscr.io/linuxserver/webtop:ubuntu-kde
 ENV PUID=1000
 ENV PGID=1000
 ENV TZ=Asia/Shanghai
+ENV CLAWMANAGER_RUNTIME_TYPE=openclaw
 
 LABEL shm_size="1gb"
 
@@ -33,25 +36,30 @@ COPY --from=node-runtime /usr/local /usr/local
 
 RUN npm install -g openclaw@v2026.5.4
 
-COPY vendor-plugins/openclaw-redis-team.tgz /tmp/openclaw-redis-team.tgz
-COPY defaults-template/.config /defaults/.config
+COPY openclaw/vendor-plugins/openclaw-redis-team.tgz /tmp/openclaw-redis-team.tgz
+COPY openclaw/defaults-template/.config /defaults/.config
 # Seed the runtime template under /defaults so the first /config sync gets the
 # tracked OpenClaw config plus any files the image expects to manage.
-COPY defaults-template/.openclaw /defaults/.openclaw
-COPY config/openclaw-agent /defaults/openclaw-agent
+COPY openclaw/defaults-template/.openclaw /defaults/.openclaw
+COPY openclaw/config/openclaw-agent /defaults/openclaw-agent
 COPY --from=agent-builder /out/openclaw-agent /usr/local/bin/openclaw-agent
-COPY scripts/wrapped-chromium /usr/local/bin/wrapped-chromium
-COPY scripts/openclaw-agent-run /etc/services.d/openclaw-agent/run
-COPY scripts/openclaw-agent-finish /etc/services.d/openclaw-agent/finish
+COPY --from=agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+COPY openclaw/scripts/wrapped-chromium /usr/local/bin/wrapped-chromium
+COPY openclaw/scripts/openclaw-agent-run /etc/services.d/openclaw-agent/run
+COPY openclaw/scripts/openclaw-agent-finish /etc/services.d/openclaw-agent/finish
+COPY clawmanager-agent/scripts/clawmanager-agent-run /etc/services.d/clawmanager-agent/run
 
 # Preinstall the DingTalk channel so its channel id validates before the
 # agent's first startup reconciliation.
 RUN sed -i 's/\r$//' /etc/services.d/openclaw-agent/run \
   && sed -i 's/\r$//' /etc/services.d/openclaw-agent/finish \
+  && sed -i 's/\r$//' /etc/services.d/clawmanager-agent/run \
   && sed -i 's/\r$//' /usr/local/bin/wrapped-chromium \
   && chmod +x /etc/services.d/openclaw-agent/run \
   && chmod +x /etc/services.d/openclaw-agent/finish \
+  && chmod +x /etc/services.d/clawmanager-agent/run \
   && chmod +x /usr/local/bin/openclaw-agent \
+  && chmod +x /usr/local/bin/clawmanager-agent \
   && chmod +x /usr/local/bin/wrapped-chromium \
   && HOME=/defaults openclaw plugins install /tmp/openclaw-redis-team.tgz \
   && HOME=/defaults openclaw plugins install @dingtalk-real-ai/dingtalk-connector \
@@ -60,6 +68,6 @@ RUN sed -i 's/\r$//' /etc/services.d/openclaw-agent/run \
   && rm -f /tmp/openclaw-redis-team.tgz \
   && chown -R abc:abc /defaults/.openclaw \
   && chown -R abc:abc /defaults/.config \
-  && mkdir -p /var/lib/openclaw-agent /var/log/openclaw-agent /etc/openclaw-agent
+  && mkdir -p /var/lib/openclaw-agent /var/lib/clawmanager-agent /var/log/openclaw-agent /etc/openclaw-agent
 
 EXPOSE 3000 3001

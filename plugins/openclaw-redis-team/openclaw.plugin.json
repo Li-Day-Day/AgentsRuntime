@@ -46,6 +46,18 @@
       "consumerGroup": {
         "type": "string"
       },
+      "inboxKey": {
+        "type": "string"
+      },
+      "eventsKey": {
+        "type": "string"
+      },
+      "presenceKey": {
+        "type": "string"
+      },
+      "dlqKey": {
+        "type": "string"
+      },
       "embeddedTimeoutSeconds": {
         "type": "number",
         "minimum": 1,

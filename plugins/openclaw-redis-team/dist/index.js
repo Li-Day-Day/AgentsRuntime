@@ -14,6 +14,15 @@ const DEFAULT_EMBEDDED_TIMEOUT_SECONDS = 1800;
 const STATUS_INTERVAL_MS = 15000;
 const READ_BLOCK_MS = 15000;
 const SCHEMA_VERSION = 1;
+const SYSTEM_REPLY_TARGETS = new Set([
+  "clawmanager",
+  "manager",
+  "admin",
+  "user",
+  "requester",
+  "caller",
+  "system",
+]);
 
 function trim(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -35,11 +44,86 @@ function intFrom(value, fallback) {
 function safeName(value) {
   return String(value || "unknown").replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 160);
 }
+function taskIdAliases(value) {
+  const raw = trim(value);
+  if (!raw) return [];
+  const aliases = new Set([raw]);
+  const teamTask = raw.match(/^team-[^-]+-task-(.+)$/);
+  if (teamTask?.[1]) {
+    aliases.add(teamTask[1]);
+    aliases.add("task-" + teamTask[1]);
+  }
+  const shortTask = raw.match(/^task-(.+)$/);
+  if (shortTask?.[1]) aliases.add(shortTask[1]);
+  return Array.from(aliases);
+}
+function taskIdsMatch(left, right) {
+  if (!left || !right) return false;
+  const rightAliases = new Set(taskIdAliases(right));
+  return taskIdAliases(left).some((alias) => rightAliases.has(alias));
+}
 function nowIso() {
   return new Date().toISOString();
 }
 function redisClientName(cfg, purpose) {
   return ["redis-team", safeName(cfg.teamId), safeName(cfg.memberId), purpose].join(":").slice(0, 512);
+}
+function deriveTeamIdFromKey(value) {
+  const raw = trim(value);
+  const match = raw.match(/^claw:team:([^:]+):/);
+  return match ? match[1] : "";
+}
+function isTeamBroadcastTarget(value, cfg = {}) {
+  const raw = trim(value) || "broadcast";
+  const lower = raw.toLowerCase();
+  const teamId = trim(cfg.teamId).toLowerCase();
+  if (lower === "broadcast" || lower === "team") return true;
+  if (!teamId) return /^team[-_:][a-z0-9_.-]+$/i.test(raw);
+  return (
+    lower === "team-" + teamId ||
+    lower === "team:" + teamId ||
+    lower === "team_" + teamId ||
+    lower === "claw:team:" + teamId
+  );
+}
+function isActiveCompletionTarget(value, cfg = {}) {
+  const raw = trim(value) || "broadcast";
+  const lower = raw.toLowerCase();
+  return SYSTEM_REPLY_TARGETS.has(lower) || isTeamBroadcastTarget(raw, cfg);
+}
+function normalizeRedisTeamTarget(value, cfg = {}) {
+  const raw = trim(value) || "broadcast";
+  const lower = raw.toLowerCase();
+  const system = SYSTEM_REPLY_TARGETS.has(lower);
+  const group = !system && isTeamBroadcastTarget(raw, cfg);
+  return {
+    to: system || group ? "broadcast" : raw,
+    originalTo: raw,
+    system,
+    group,
+    completion: system || group,
+  };
+}
+function isSafeMemberTarget(value) {
+  const raw = trim(value);
+  return !!raw && /^[A-Za-z0-9_.@-]{1,160}$/.test(raw);
+}
+async function resolveRedisTeamTarget(cfg, value) {
+  const target = normalizeRedisTeamTarget(value, cfg);
+  if (target.completion) return Object.assign(target, { route: "completion" });
+  if (!isSafeMemberTarget(target.to)) {
+    return Object.assign(target, { route: "unknown", error: "unknown Redis Team target: " + target.originalTo });
+  }
+  const statuses = await readStatuses(cfg);
+  if (!statuses.length || target.to === cfg.memberId) {
+    return Object.assign(target, { route: "member" });
+  }
+  const known = statuses.some((status) => {
+    const memberId = trim(status?.memberId);
+    return memberId === target.to || safeName(memberId) === target.to;
+  });
+  if (known) return Object.assign(target, { route: "member" });
+  return Object.assign(target, { route: "unknown", error: "unknown Redis Team target: " + target.originalTo });
 }
 
 // ============ Redis Transport ============
@@ -187,7 +271,12 @@ function readChannelConfig(cfg, accountId = "default") {
     enabled: boolFrom(account.enabled ?? (fromEnv ? env.CLAWMANAGER_TEAM_ENABLED : undefined), false),
     redisUrl:
       trim(account.redisUrl) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_REDIS_URL) : ""),
-    teamId: trim(account.teamId) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_ID) : ""),
+    teamId:
+      trim(account.teamId) ||
+      (fromEnv ? trim(env.CLAWMANAGER_TEAM_ID) : "") ||
+      deriveTeamIdFromKey(trim(account.inboxKey) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_INBOX_KEY) : "")) ||
+      deriveTeamIdFromKey(trim(account.eventsKey) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_EVENTS_KEY) : "")) ||
+      deriveTeamIdFromKey(trim(account.presenceKey) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_PRESENCE_KEY) : "")),
     memberId:
       trim(account.memberId) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_MEMBER_ID) : ""),
     role: trim(account.role) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_ROLE) : "") || "member",
@@ -202,6 +291,14 @@ function readChannelConfig(cfg, accountId = "default") {
       ),
     consumerGroup:
       trim(account.consumerGroup) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_CONSUMER_GROUP) : "") || DEFAULT_GROUP,
+    inboxKey:
+      trim(account.inboxKey) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_INBOX_KEY) : ""),
+    eventsKey:
+      trim(account.eventsKey) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_EVENTS_KEY) : ""),
+    presenceKey:
+      trim(account.presenceKey) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_PRESENCE_KEY) : ""),
+    dlqKey:
+      trim(account.dlqKey) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_DLQ_KEY) : ""),
     embeddedTimeoutSeconds:
       intFrom(
         account.embeddedTimeoutSeconds ??
@@ -215,16 +312,27 @@ function keyPrefix(cfg) {
   return "claw:team:" + cfg.teamId;
 }
 function inboxKey(cfg, memberId = cfg.memberId) {
+  if (memberId === cfg.memberId && cfg.inboxKey) return cfg.inboxKey;
   return keyPrefix(cfg) + ":inbox:" + memberId;
 }
 function eventsKey(cfg) {
+  if (cfg.eventsKey) return cfg.eventsKey;
   return keyPrefix(cfg) + ":events";
 }
 function presenceKey(cfg) {
+  if (cfg.presenceKey) return cfg.presenceKey;
   return keyPrefix(cfg) + ":presence";
 }
 function dlqKey(cfg) {
+  if (cfg.dlqKey) return cfg.dlqKey;
   return keyPrefix(cfg) + ":dlq";
+}
+function hasRequiredRedisTeamKeys(cfg) {
+  return !!(
+    (cfg.teamId || cfg.inboxKey) &&
+    (cfg.teamId || cfg.eventsKey) &&
+    (cfg.teamId || cfg.presenceKey)
+  );
 }
 
 // ============ Helpers ============
@@ -260,7 +368,8 @@ async function writeLocalStatus(cfg, patch = {}) {
       memberId: cfg.memberId,
       role: cfg.role,
       liveness: "online",
-      runtime: "running",
+      runtime: "openclaw",
+      runtimeStatus: "running",
       availability: "idle",
       lastSeenAt: nowIso(),
     },
@@ -296,6 +405,25 @@ async function readStatuses(cfg, memberId) {
   return out;
 }
 
+async function writeTaskEnvelope(cfg, envelope) {
+  if (!envelope?.taskId) return;
+  await ensureDirs(cfg);
+  const aliases = new Set(taskIdAliases(envelope.taskId));
+  aliases.add(envelope.taskId);
+  for (const alias of aliases) {
+    await writeJson(path.join(cfg.sharedDir, "tasks", safeName(alias) + ".json"), envelope);
+  }
+}
+
+async function readTaskEnvelope(cfg, taskId) {
+  await ensureDirs(cfg);
+  for (const alias of taskIdAliases(taskId)) {
+    const envelope = await readJson(path.join(cfg.sharedDir, "tasks", safeName(alias) + ".json"));
+    if (envelope) return envelope;
+  }
+  return null;
+}
+
 function fieldsToObject(fields) {
   const out = {};
   if (!Array.isArray(fields)) return out;
@@ -306,11 +434,13 @@ function fieldsToObject(fields) {
 
 function parseStreamMessage(id, fields) {
   const obj = fieldsToObject(fields);
+  const flat = Object.assign({}, obj);
+  delete flat.payload;
   if (typeof obj.payload === "string") {
     try {
-      return Object.assign({ redisId: id }, JSON.parse(obj.payload));
+      return Object.assign({ redisId: id }, flat, JSON.parse(obj.payload));
     } catch {
-      return { redisId: id, rawPayload: obj.payload };
+      return Object.assign({ redisId: id, rawPayload: obj.payload }, flat);
     }
   }
   return Object.assign({ redisId: id }, obj);
@@ -328,13 +458,74 @@ function parseReadGroupResponse(value) {
 }
 
 async function xaddJson(redis, stream, event) {
-  await redis.command("XADD", stream, "*", "payload", JSON.stringify(event));
+  const fields = ["payload", JSON.stringify(event)];
+  for (const key of [
+    "event",
+    "type",
+    "messageId",
+    "message_id",
+    "completionMessageId",
+    "completion_message_id",
+    "memberId",
+    "member_id",
+    "taskId",
+    "task_id",
+    "availability",
+    "runtimeStatus",
+    "summary",
+    "error",
+    "status",
+    "to",
+    "text",
+    "result",
+    "resultMarkdown",
+    "replyTo",
+    "inReplyTo",
+    "conversationId",
+    "originalTo",
+  ]) {
+    if (event[key] !== undefined && event[key] !== null) {
+      fields.push(key, String(event[key]));
+    }
+  }
+  await redis.command("XADD", stream, "*", ...fields);
 }
 
 function eventFor(cfg, event, extra = {}) {
   return Object.assign(
-    { v: SCHEMA_VERSION, event, teamId: cfg.teamId, memberId: cfg.memberId, role: cfg.role, at: nowIso() },
+    {
+      v: SCHEMA_VERSION,
+      event,
+      type: event,
+      teamId: cfg.teamId,
+      team_id: cfg.teamId,
+      memberId: cfg.memberId,
+      member_id: cfg.memberId,
+      role: cfg.role,
+      runtime: "openclaw",
+      runtimeStatus: "running",
+      availability: "idle",
+      at: nowIso(),
+    },
     extra,
+  );
+}
+function taskEvent(cfg, event, envelope, extra = {}) {
+  return eventFor(
+    cfg,
+    event,
+    Object.assign(
+      {
+        messageId: envelope.messageId,
+        message_id: envelope.messageId,
+        taskId: envelope.taskId,
+        task_id: envelope.taskId,
+        availability: "busy",
+        runtimeStatus: "running",
+        summary: event,
+      },
+      extra,
+    ),
   );
 }
 
@@ -343,10 +534,10 @@ function normalizeEnvelope(raw) {
   if (!raw || typeof raw !== "object") return null;
   const envelope = {
     schemaVersion: raw.v || raw.schemaVersion || SCHEMA_VERSION,
-    messageId: raw.messageId || raw.id || ("msg_" + randomUUID()),
+    messageId: raw.messageId || raw.message_id || raw.id || ("msg_" + randomUUID()),
     taskId: raw.taskId || raw.task_id || ("task_" + randomUUID()),
-    teamId: raw.teamId,
-    from: raw.from || raw.sender || "unknown",
+    teamId: raw.teamId || raw.team_id,
+    from: raw.from || raw.sender || raw.memberId || raw.member_id || "unknown",
     to: raw.to || raw.recipient || "",
     conversationId: raw.conversationId || raw.conversation_id || raw.taskId || raw.task_id,
     type: raw.type || "message",
@@ -380,40 +571,316 @@ function dedup(key) {
 // ============ Runtime Operations ============
 function createRuntime(api) {
   let runtimeApi = api;
+  let activeEnvelope = null;
+  let activeTaskCompleted = false;
+  let lastOutbound = null;
+
+  async function withRedis(cfg, existingRedis, fn) {
+    if (existingRedis) return fn(existingRedis);
+    const redis = new RedisClient(cfg.redisUrl);
+    await redis.connect();
+    try {
+      return await fn(redis);
+    } finally {
+      redis.close();
+    }
+  }
+
+  function activeTaskMatches(taskId) {
+    if (!activeEnvelope) return false;
+    if (!taskId) return true;
+    return taskIdsMatch(taskId, activeEnvelope.taskId);
+  }
+
+  function taskMatchesEnvelope(envelope, taskId) {
+    if (!envelope) return false;
+    if (!taskId) return true;
+    return taskIdsMatch(taskId, envelope.taskId);
+  }
+
+  function firstText(...values) {
+    for (const value of values) {
+      if (typeof value === "string" && value.trim()) return value.trim();
+      if (value && typeof value === "object") {
+        const nested = firstText(value.text, value.content, value.result, value.resultMarkdown, value.summary);
+        if (nested) return nested;
+      }
+    }
+    return "";
+  }
+
+  function textFromDispatchResult(activeResult) {
+    return firstText(
+      activeResult?.outbound?.message?.text,
+      activeResult?.result?.text,
+      activeResult?.result?.message?.text,
+      activeResult?.result?.response?.text,
+      activeResult?.result?.content,
+      activeResult?.result?.result,
+      activeResult?.result?.resultMarkdown,
+    );
+  }
+
+  function summarizeText(text, fallback = "Redis Team task completed") {
+    const firstLine = String(text || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean);
+    return (firstLine || fallback).slice(0, 160);
+  }
+
+  async function completeActiveTaskFromText(text, meta = {}) {
+    const cfg = meta.cfg || readChannelConfig(runtimeApi.config || {}, meta.accountId || "default");
+    const envelope = meta.envelope || activeEnvelope;
+    const result = firstText(text, meta.resultMarkdown, meta.result, meta.summary);
+    if (!envelope || !taskMatchesEnvelope(envelope, meta.taskId || envelope.taskId) || !result) return false;
+    const taskId = trim(meta.taskId) || envelope.taskId;
+    const completionMessageId = trim(meta.messageId);
+    const messageId = trim(meta.eventMessageId) || envelope.messageId || completionMessageId || ("msg_" + randomUUID());
+    const inReplyTo = trim(meta.inReplyTo) || envelope.messageId;
+    const resultMarkdown = typeof meta.resultMarkdown === "string" && meta.resultMarkdown.trim()
+      ? meta.resultMarkdown
+      : result;
+    const summary = trim(meta.summary) || summarizeText(result);
+    const artifactRefs = Array.isArray(meta.artifactRefs) ? meta.artifactRefs : [];
+
+    await ensureDirs(cfg);
+    await writeLocalStatus(cfg, {
+      availability: "idle",
+      runtimeStatus: "succeeded",
+      currentTaskId: taskId,
+      progress: 100,
+      lastSummary: summary,
+      artifactRefs,
+    });
+    await withRedis(cfg, meta.redis, async (redis) => {
+      await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "task_completed", envelope, {
+        messageId,
+        message_id: messageId,
+        completionMessageId: completionMessageId || undefined,
+        completion_message_id: completionMessageId || undefined,
+        sourceMessageId: envelope.messageId,
+        source_message_id: envelope.messageId,
+        taskId,
+        task_id: taskId,
+        inReplyTo,
+        replyTo: inReplyTo,
+        to: trim(meta.to) || undefined,
+        availability: "idle",
+        runtimeStatus: "succeeded",
+        status: "succeeded",
+        summary,
+        result,
+        resultMarkdown,
+        artifactRefs,
+      }));
+    });
+    if (!activeEnvelope || taskMatchesEnvelope(activeEnvelope, taskId)) activeTaskCompleted = true;
+    return true;
+  }
+
+  async function failActiveTask(error, meta = {}) {
+    const cfg = meta.cfg || readChannelConfig(runtimeApi.config || {}, meta.accountId || "default");
+    const envelope = meta.envelope || activeEnvelope;
+    const errorText = trim(error?.message) || trim(error) || "Redis Team task failed";
+    const messageId = trim(meta.messageId) || envelope?.messageId || ("msg_" + randomUUID());
+    const taskId = trim(meta.taskId) || envelope?.taskId || "";
+    const inReplyTo = trim(meta.inReplyTo) || envelope?.messageId || undefined;
+    const summary = trim(meta.summary) || errorText;
+    const base = {
+      messageId,
+      message_id: messageId,
+      sourceMessageId: envelope?.messageId,
+      source_message_id: envelope?.messageId,
+      taskId,
+      task_id: taskId,
+      inReplyTo,
+      replyTo: inReplyTo,
+      to: trim(meta.to) || undefined,
+      availability: "blocked",
+      runtimeStatus: "failed",
+      status: "failed",
+      summary,
+      error: errorText,
+    };
+
+    await ensureDirs(cfg);
+    if (envelope) {
+      await writeLocalStatus(cfg, {
+        availability: "blocked",
+        runtimeStatus: "failed",
+        currentTaskId: taskId || envelope.taskId,
+        lastSummary: summary,
+      });
+    }
+
+    await withRedis(cfg, meta.redis, async (redis) => {
+      if (meta.eventName === "message_failed") {
+        await xaddJson(
+          redis,
+          eventsKey(cfg),
+          envelope ? taskEvent(cfg, "message_failed", envelope, base) : eventFor(cfg, "message_failed", base),
+        );
+      }
+      await xaddJson(
+        redis,
+        eventsKey(cfg),
+        envelope ? taskEvent(cfg, "task_failed", envelope, base) : eventFor(cfg, "task_failed", base),
+      );
+    });
+    if (envelope && activeTaskMatches(taskId || envelope.taskId)) activeTaskCompleted = true;
+    return false;
+  }
+
+  async function sendWithConfig(cfg, params) {
+    params = params || {};
+    if (!cfg.enabled) throw new Error("Redis Team channel is disabled");
+    if (!cfg.redisUrl || !cfg.memberId || !hasRequiredRedisTeamKeys(cfg))
+      throw new Error("Redis Team env is incomplete");
+    await ensureDirs(cfg);
+
+    const target = await resolveRedisTeamTarget(cfg, params.to);
+    const status = await readStatuses(cfg, cfg.memberId);
+    const requestedTaskId = trim(params.taskId);
+    const statusIsActive =
+      String(status?.availability || "").toLowerCase() === "busy" ||
+      String(status?.runtimeStatus || "").toLowerCase() === "running";
+    const inferredTaskId = requestedTaskId || (statusIsActive ? (status?.currentTaskId || status?.runtimeTaskId) : "") || "";
+    const inferredEnvelope =
+      activeTaskMatches(inferredTaskId)
+        ? activeEnvelope
+        : await readTaskEnvelope(cfg, inferredTaskId);
+    const message = {
+      v: SCHEMA_VERSION,
+      messageId: "msg_" + randomUUID(),
+      teamId: cfg.teamId,
+      from: cfg.memberId,
+      to: target.to,
+      originalTo: target.originalTo,
+      intent: trim(params.intent) || "send",
+      taskId: requestedTaskId || inferredEnvelope?.taskId || activeEnvelope?.taskId || "task_" + randomUUID(),
+      conversationId:
+        inferredEnvelope?.conversationId ||
+        inferredEnvelope?.taskId ||
+        activeEnvelope?.conversationId ||
+        activeEnvelope?.taskId ||
+        undefined,
+      title: trim(params.title) || "Team Message",
+      text: trim(params.text) || trim(params.prompt) || "",
+      contextRefs: Array.isArray(params.contextRefs) ? params.contextRefs.filter(Boolean) : [],
+      ttlSeconds: typeof params.ttlSeconds === "number" ? params.ttlSeconds : 3600,
+      priority: trim(params.priority) || "normal",
+      metadata: params.metadata || {},
+      createdAt: nowIso(),
+    };
+
+    const redis = new RedisClient(cfg.redisUrl);
+    await redis.connect();
+    try {
+      if (target.route === "unknown") {
+        await failActiveTask(target.error, {
+          cfg,
+          redis,
+          envelope: inferredEnvelope,
+          eventName: "message_failed",
+          messageId: message.messageId,
+          taskId: message.taskId,
+          to: target.originalTo,
+          summary: target.error,
+        });
+        lastOutbound = { message, target, failed: true, error: target.error };
+        return Object.assign({}, message, { failed: true, error: target.error });
+      }
+
+      await xaddJson(redis, inboxKey(cfg, message.to), message);
+      const outbound = {
+        messageId: message.messageId,
+        taskId: message.taskId,
+        conversationId: message.conversationId,
+        to: message.to,
+        originalTo: message.originalTo,
+        text: message.text,
+        summary: message.title,
+      };
+      const completesActiveTask =
+        !!inferredEnvelope &&
+        taskMatchesEnvelope(inferredEnvelope, message.taskId) &&
+        isActiveCompletionTarget(target.originalTo, cfg);
+      const eventName = completesActiveTask || target.system ? "reply" : "outbound";
+      await xaddJson(redis, eventsKey(cfg), eventFor(cfg, eventName, Object.assign({}, outbound, {
+        to: target.originalTo,
+        inReplyTo: inferredEnvelope?.messageId || activeEnvelope?.messageId,
+      })));
+      if (completesActiveTask) {
+        if (message.text) {
+          await completeActiveTaskFromText(message.text, {
+            cfg,
+            redis,
+            envelope: inferredEnvelope,
+            messageId: message.messageId,
+            taskId: message.taskId,
+            inReplyTo: inferredEnvelope?.messageId,
+            summary: message.title,
+            to: target.originalTo,
+          });
+        } else {
+          await failActiveTask("completion target received empty text", {
+            cfg,
+            redis,
+            envelope: inferredEnvelope,
+            eventName: "message_failed",
+            messageId: message.messageId,
+            taskId: message.taskId,
+            to: target.originalTo,
+          });
+        }
+      }
+      lastOutbound = { message, target };
+    } finally {
+      redis.close();
+    }
+    return message;
+  }
+
+  async function isTaskTerminal(cfg, envelope) {
+    const status = await readStatuses(cfg, cfg.memberId);
+    if (!status || !envelope?.taskId) return false;
+    const statusTaskId = status.currentTaskId || status.runtimeTaskId;
+    if (!taskIdsMatch(statusTaskId, envelope.taskId)) return false;
+    return ["succeeded", "failed"].includes(String(status.runtimeStatus || "").toLowerCase());
+  }
 
   return {
+    async withActiveEnvelope(envelope, fn) {
+      const prevEnvelope = activeEnvelope;
+      const prevCompleted = activeTaskCompleted;
+      const prevOutbound = lastOutbound;
+      activeEnvelope = envelope;
+      activeTaskCompleted = false;
+      lastOutbound = null;
+      try {
+        const result = await fn();
+        return { result, completed: activeTaskCompleted, outbound: lastOutbound };
+      } finally {
+        activeEnvelope = prevEnvelope;
+        activeTaskCompleted = prevCompleted;
+        lastOutbound = prevOutbound;
+      }
+    },
+
     async send(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
-      if (!cfg.enabled) throw new Error("Redis Team channel is disabled");
-      if (!cfg.redisUrl || !cfg.teamId || !cfg.memberId)
-        throw new Error("Redis Team env is incomplete");
+      return sendWithConfig(cfg, params);
+    },
 
-      const message = {
-        v: SCHEMA_VERSION,
-        messageId: "msg_" + randomUUID(),
-        teamId: cfg.teamId,
-        from: cfg.memberId,
-        to: trim(params.to) || "broadcast",
-        intent: trim(params.intent) || "send",
-        taskId: trim(params.taskId) || "task_" + randomUUID(),
-        title: trim(params.title) || "Team Message",
-        text: trim(params.text) || trim(params.prompt) || "",
-        contextRefs: Array.isArray(params.contextRefs) ? params.contextRefs.filter(Boolean) : [],
-        ttlSeconds: typeof params.ttlSeconds === "number" ? params.ttlSeconds : 3600,
-        priority: trim(params.priority) || "normal",
-        metadata: params.metadata || {},
-        createdAt: nowIso(),
-      };
-
-      const redis = new RedisClient(cfg.redisUrl);
-      await redis.connect();
-      try {
-        await xaddJson(redis, inboxKey(cfg, message.to), message);
-        await xaddJson(redis, eventsKey(cfg), eventFor(cfg, "outbound", { messageId: message.messageId, to: message.to }));
-      } finally {
-        redis.close();
-      }
-      return message;
+    async sendChannelText({ cfg, accountId, to, text }) {
+      const config = readChannelConfig(cfg, accountId || "default");
+      return sendWithConfig(config, {
+        to,
+        text,
+        intent: "message",
+        title: "Team Message",
+      });
     },
 
     async status(memberId) {
@@ -433,7 +900,7 @@ function createRuntime(api) {
         artifactRefs: Array.isArray(params.artifactRefs) ? params.artifactRefs : [],
       });
 
-      if (cfg.enabled && cfg.redisUrl && cfg.teamId && cfg.memberId) {
+      if (cfg.enabled && cfg.redisUrl && cfg.memberId && hasRequiredRedisTeamKeys(cfg)) {
         const redis = new RedisClient(cfg.redisUrl);
         await redis.connect();
         try {
@@ -459,26 +926,62 @@ function createRuntime(api) {
         path.join(resultDir, "result.json"),
         Object.assign({}, params, { artifactRefs, completedAt: nowIso() }),
       );
+      const runtimeStatus = params.status === "succeeded" ? "succeeded" : "failed";
       const status = await writeLocalStatus(cfg, {
         availability: params.status === "succeeded" ? "idle" : "blocked",
+        runtimeStatus,
         currentTaskId: params.taskId,
         progress: params.status === "succeeded" ? 100 : undefined,
         lastSummary: params.summary,
         artifactRefs,
       });
 
-      if (cfg.enabled && cfg.redisUrl && cfg.teamId && cfg.memberId) {
+      if (cfg.enabled && cfg.redisUrl && cfg.memberId && hasRequiredRedisTeamKeys(cfg)) {
         const redis = new RedisClient(cfg.redisUrl);
         await redis.connect();
         try {
           const eventName = params.status === "succeeded" ? "task_completed" : "task_failed";
-          await xaddJson(redis, eventsKey(cfg), eventFor(cfg, eventName, Object.assign({}, params, { artifactRefs })));
+          const terminalEnvelope = activeTaskMatches(params.taskId)
+            ? activeEnvelope
+            : await readTaskEnvelope(cfg, params.taskId);
+          if (terminalEnvelope && taskMatchesEnvelope(terminalEnvelope, params.taskId)) {
+            if (params.status === "succeeded") {
+              await completeActiveTaskFromText(params.resultMarkdown || params.summary, {
+                cfg,
+                redis,
+                envelope: terminalEnvelope,
+                taskId: params.taskId,
+                summary: params.summary,
+                resultMarkdown: params.resultMarkdown || params.summary,
+                artifactRefs,
+              });
+            } else {
+              await failActiveTask(params.summary || "Redis Team task failed", {
+                cfg,
+                redis,
+                envelope: terminalEnvelope,
+                taskId: params.taskId,
+                summary: params.summary,
+              });
+            }
+          } else {
+            await xaddJson(redis, eventsKey(cfg), eventFor(cfg, eventName, Object.assign({}, params, {
+              artifactRefs,
+              availability: params.status === "succeeded" ? "idle" : "blocked",
+              runtimeStatus,
+            })));
+          }
         } finally {
           redis.close();
         }
       }
       return { status, artifactRefs };
     },
+
+    completeActiveTaskFromText,
+    failActiveTask,
+    isTaskTerminal,
+    textFromDispatchResult,
   };
 }
 
@@ -488,8 +991,8 @@ async function startConsumer(cfg, onMessage, log) {
     log.info("redis-team: disabled; skipping consumer");
     return null;
   }
-  if (!cfg.redisUrl || !cfg.teamId || !cfg.memberId) {
-    log.warn("redis-team: missing redisUrl/teamId/memberId; consumer will not start");
+  if (!cfg.redisUrl || !cfg.memberId || !hasRequiredRedisTeamKeys(cfg)) {
+    log.warn("redis-team: missing redisUrl/memberId or Redis Team stream keys; consumer will not start");
     return null;
   }
 
@@ -536,6 +1039,8 @@ async function startConsumer(cfg, onMessage, log) {
   await emitPresence();
 
   async function loop() {
+    let readID = "0";
+    let pendingDrainBatches = 3;
     while (running) {
       try {
         const response = await redis.command(
@@ -549,9 +1054,20 @@ async function startConsumer(cfg, onMessage, log) {
           READ_BLOCK_MS,
           "STREAMS",
           inboxKey(cfg),
-          ">",
+          readID,
         );
         const messages = parseReadGroupResponse(response);
+        if (readID !== ">") {
+          if (messages.length === 0) {
+            readID = ">";
+            log.info("redis-team: pending/history drain complete; switching to new messages");
+          } else if (--pendingDrainBatches <= 0) {
+            readID = ">";
+            log.warn(
+              "redis-team: pending/history drain limit reached; switching to new messages to avoid stale pending blocking the inbox",
+            );
+          }
+        }
         for (const msg of messages) {
           try {
             const envelope = normalizeEnvelope(msg);
@@ -561,11 +1077,32 @@ async function startConsumer(cfg, onMessage, log) {
               await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
               continue;
             }
+            await writeTaskEnvelope(cfg, envelope);
+            await xaddJson(
+              redis,
+              eventsKey(cfg),
+              taskEvent(cfg, "task_received", envelope, {
+                availability: "busy",
+                runtimeStatus: "running",
+                summary: "Redis Team task received",
+              }),
+            );
             await onMessage(envelope);
             await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
           } catch (err) {
             const error = err instanceof Error ? err.message : String(err);
             log.error("redis-team: message processing failed: " + error);
+            const envelope = normalizeEnvelope(msg) || {};
+            await xaddJson(
+              redis,
+              eventsKey(cfg),
+              taskEvent(cfg, "task_failed", envelope, {
+                availability: "blocked",
+                runtimeStatus: "failed",
+                summary: error,
+                error,
+              }),
+            );
             await xaddJson(redis, dlqKey(cfg), eventFor(cfg, "dlq", { redisId: msg.redisId, error, message: msg }));
             try {
               await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
@@ -675,6 +1212,10 @@ export default definePluginEntry({
       sharedDir: { type: "string" },
       autoRun: { type: "boolean" },
       consumerGroup: { type: "string" },
+      inboxKey: { type: "string" },
+      eventsKey: { type: "string" },
+      presenceKey: { type: "string" },
+      dlqKey: { type: "string" },
       embeddedTimeoutSeconds: { type: "number", minimum: 1, default: 1800 },
       managerUrl: { type: "string" },
     },
@@ -682,6 +1223,41 @@ export default definePluginEntry({
   register(api) {
     const runtime = createRuntime(api);
     const consumerHandles = new Map();
+
+    function createConsumerEntry() {
+      let resolveStopped = () => {};
+      const stopped = new Promise((resolve) => {
+        resolveStopped = resolve;
+      });
+      return { handle: null, starting: null, stopped, resolveStopped };
+    }
+
+    function resolveConsumerStopped(entry) {
+      try {
+        entry?.resolveStopped?.();
+      } catch {}
+    }
+
+    async function waitForConsumerStop(accountId, entry, abortSignal) {
+      if (abortSignal?.aborted) {
+        await stopConsumer(accountId);
+        return;
+      }
+      await new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          abortSignal?.removeEventListener?.("abort", onAbort);
+          resolve();
+        };
+        const onAbort = () => {
+          void stopConsumer(accountId).finally(finish);
+        };
+        abortSignal?.addEventListener?.("abort", onAbort, { once: true });
+        entry.stopped.then(finish, finish);
+      });
+    }
 
     async function stopConsumer(accountId) {
       const key = accountId || "default";
@@ -692,6 +1268,9 @@ export default definePluginEntry({
         const handle = entry.starting ? await entry.starting : entry.handle;
         if (handle) await handle.stop();
       } catch {}
+      finally {
+        resolveConsumerStopped(entry);
+      }
     }
 
     // --- Register Tools (backward compatible) ---
@@ -771,7 +1350,7 @@ export default definePluginEntry({
           },
           defaultAccountId: () => "default",
           isEnabled: (account) => account?.enabled ?? false,
-          isConfigured: (account) => !!(account?.redisUrl && account?.teamId && account?.memberId),
+          isConfigured: (account) => !!(account?.redisUrl && account?.memberId && hasRequiredRedisTeamKeys(account)),
           describeAccount: (account) => ({
             accountId: account?.accountId || "default",
             name: account?.teamId + "/" + account?.memberId,
@@ -796,6 +1375,10 @@ export default definePluginEntry({
                   sharedDir: { type: "string", default: "/team" },
                   autoRun: { type: "boolean", default: true },
                   consumerGroup: { type: "string", default: "team-members" },
+                  inboxKey: { type: "string" },
+                  eventsKey: { type: "string" },
+                  presenceKey: { type: "string" },
+                  dlqKey: { type: "string" },
                   embeddedTimeoutSeconds: { type: "number", minimum: 1, default: 1800 },
                   fromEnv: { type: "boolean", default: true },
                 },
@@ -820,6 +1403,10 @@ export default definePluginEntry({
               sharedDir: input.sharedDir || existing.sharedDir || "/team",
               autoRun: input.autoRun !== undefined ? input.autoRun : (existing.autoRun !== undefined ? existing.autoRun : true),
               consumerGroup: input.consumerGroup || existing.consumerGroup || "team-members",
+              inboxKey: input.inboxKey || existing.inboxKey || "",
+              eventsKey: input.eventsKey || existing.eventsKey || "",
+              presenceKey: input.presenceKey || existing.presenceKey || "",
+              dlqKey: input.dlqKey || existing.dlqKey || "",
               embeddedTimeoutSeconds: input.embeddedTimeoutSeconds || existing.embeddedTimeoutSeconds || 1800,
               fromEnv: input.fromEnv !== undefined ? input.fromEnv : (existing.fromEnv !== undefined ? existing.fromEnv : true),
             };
@@ -835,7 +1422,7 @@ export default definePluginEntry({
               ctx.log?.info?.("redis-team: channel disabled");
               return;
             }
-            if (!cfg.redisUrl || !cfg.teamId || !cfg.memberId) {
+            if (!cfg.redisUrl || !cfg.memberId || !hasRequiredRedisTeamKeys(cfg)) {
               ctx.log?.warn?.("redis-team: missing configuration");
               return;
             }
@@ -857,6 +1444,7 @@ export default definePluginEntry({
                 lastConnectedAt: Date.now(),
                 statusState: "online",
               });
+              await waitForConsumerStop(accountId, existing, ctx.abortSignal);
               return;
             }
             if (existing?.starting) {
@@ -869,10 +1457,11 @@ export default definePluginEntry({
                 lastConnectedAt: Date.now(),
                 statusState: "online",
               });
+              await waitForConsumerStop(accountId, existing, ctx.abortSignal);
               return;
             }
 
-            const entry = { handle: null, starting: null };
+            const entry = createConsumerEntry();
             consumerHandles.set(accountId, entry);
             try {
               entry.starting = startConsumer(
@@ -881,17 +1470,33 @@ export default definePluginEntry({
                   ctx.log?.info?.(
                     "redis-team: received message " + envelope.messageId + " type=" + envelope.type,
                   );
+                  const emitTaskEvent = async (event, extra = {}) => {
+                    const r = new RedisClient(cfg.redisUrl);
+                    await r.connect();
+                    try {
+                      await xaddJson(r, eventsKey(cfg), taskEvent(cfg, event, envelope, extra));
+                    } finally {
+                      r.close();
+                    }
+                  };
 
                   if (!ctx.channelRuntime) {
                     ctx.log?.warn?.(
                       "redis-team: channelRuntime unavailable; start gateway with plugin runtime or open Web UI node",
                     );
                     await writeLocalStatus(cfg, {
-                      availability: "busy",
+                      availability: "blocked",
+                      runtimeStatus: "failed",
                       currentTaskId: envelope.taskId,
                       lastSummary:
                         "Received (no channel runtime): " +
                         String(envelope.text || "").slice(0, 100),
+                    });
+                    await emitTaskEvent("task_failed", {
+                      availability: "blocked",
+                      runtimeStatus: "failed",
+                      summary: "Redis Team task failed: channel runtime unavailable",
+                      error: "channelRuntime unavailable",
                     });
                     return;
                   }
@@ -899,9 +1504,16 @@ export default definePluginEntry({
                   if (!cfg.autoRun) {
                     ctx.log?.info?.("redis-team: autoRun disabled; skipping agent dispatch");
                     await writeLocalStatus(cfg, {
-                      availability: "idle",
+                      availability: "blocked",
+                      runtimeStatus: "failed",
                       currentTaskId: envelope.taskId,
                       lastSummary: "Received (autoRun off): " + String(envelope.text || "").slice(0, 120),
+                    });
+                    await emitTaskEvent("task_failed", {
+                      availability: "blocked",
+                      runtimeStatus: "failed",
+                      summary: "Redis Team task failed: autorun disabled",
+                      error: "CLAWMANAGER_TEAM_AUTORUN is disabled",
                     });
                     return;
                   }
@@ -913,7 +1525,22 @@ export default definePluginEntry({
                   const taskId = String(envelope.taskId || "");
                   const conversationId = String(envelope.conversationId || cfg.teamId || "");
 
-                  await dispatchInboundDirectDmWithRuntime({
+                  await writeLocalStatus(cfg, {
+                    availability: "busy",
+                    runtimeStatus: "running",
+                    currentTaskId: taskId,
+                    lastSummary: "Redis Team task started",
+                  });
+                  await emitTaskEvent("task_started", {
+                    availability: "busy",
+                    runtimeStatus: "running",
+                    summary: "Redis Team task started",
+                  });
+
+                  let deliveredReply = false;
+                  let dispatchFailed = false;
+                  const activeResult = await runtime.withActiveEnvelope(envelope, async () => {
+                    await dispatchInboundDirectDmWithRuntime({
                     cfg: ctx.cfg,
                     runtime: { channel: ctx.channelRuntime },
                     channel: CHANNEL_ID,
@@ -947,24 +1574,44 @@ export default definePluginEntry({
                       ],
                     },
                     deliver: async (payload) => {
+                      deliveredReply = true;
                       ctx.log?.info?.("redis-team: delivering reply for " + envelope.messageId);
+                      const replyText = payload?.text || "";
+                      const replyMessageId = "msg_" + randomUUID();
                       const r = new RedisClient(cfg.redisUrl);
                       await r.connect();
                       try {
                         await xaddJson(r, eventsKey(cfg), eventFor(cfg, "reply", {
+                          messageId: replyMessageId,
+                          message_id: replyMessageId,
                           inReplyTo: envelope.messageId,
                           taskId: envelope.taskId,
+                          task_id: envelope.taskId,
                           text: payload?.text || "",
                           mediaUrls: payload?.mediaUrls,
                           mediaUrl: payload?.mediaUrl,
                         }));
-                        await xaddJson(r, eventsKey(cfg), eventFor(cfg, "task_completed", {
-                          messageId: envelope.messageId,
-                          taskId: envelope.taskId,
-                          result: payload?.text || "",
-                          mediaUrls: payload?.mediaUrls,
-                          mediaUrl: payload?.mediaUrl,
-                        }));
+                        if (replyText) {
+                          await runtime.completeActiveTaskFromText(replyText, {
+                            cfg,
+                            redis: r,
+                            envelope,
+                            messageId: replyMessageId,
+                            taskId: envelope.taskId,
+                            inReplyTo: envelope.messageId,
+                            summary: "Redis Team task completed",
+                          });
+                        } else {
+                          await runtime.failActiveTask("dispatch delivered an empty reply", {
+                            cfg,
+                            redis: r,
+                            envelope,
+                            eventName: "message_failed",
+                            messageId: replyMessageId,
+                            taskId: envelope.taskId,
+                            inReplyTo: envelope.messageId,
+                          });
+                        }
                       } finally {
                         r.close();
                       }
@@ -975,14 +1622,57 @@ export default definePluginEntry({
                       );
                     },
                     onDispatchError: (err, info) => {
+                      dispatchFailed = true;
                       ctx.log?.error?.(
                         "redis-team: agent dispatch failed (" +
                           info.kind +
                           "): " +
                           (err?.message || String(err)),
                       );
+                      void runtime.failActiveTask(err?.message || String(err), {
+                        cfg,
+                        envelope,
+                        taskId: envelope.taskId,
+                        summary: "Redis Team task dispatch failed",
+                      }).catch((emitErr) => {
+                        ctx.log?.warn?.(
+                          "redis-team: failed to emit task_failed: " +
+                            (emitErr?.message || String(emitErr)),
+                        );
+                      });
                     },
+                    });
                   });
+
+                  if (!deliveredReply && !dispatchFailed && !activeResult?.completed) {
+                    if (await runtime.isTaskTerminal(cfg, envelope)) {
+                      ctx.log?.info?.(
+                        "redis-team: task " + envelope.taskId + " already terminal after dispatch",
+                      );
+                    } else {
+                      const result = runtime.textFromDispatchResult(activeResult);
+                      if (result) {
+                        await runtime.completeActiveTaskFromText(result, {
+                          cfg,
+                          envelope,
+                          taskId: envelope.taskId,
+                          inReplyTo: envelope.messageId,
+                          summary: "Redis Team task completed",
+                        });
+                      } else {
+                        const error = "dispatch finished without reply/completion";
+                        ctx.log?.warn?.(
+                          "redis-team: " + error + " for " + envelope.messageId + "; marking task failed",
+                        );
+                        await runtime.failActiveTask(error, {
+                          cfg,
+                          envelope,
+                          taskId: envelope.taskId,
+                          summary: "Redis Team task failed",
+                        });
+                      }
+                    }
+                  }
 
                   ctx.setStatus({
                     accountId: ctx.accountId,
@@ -1009,8 +1699,10 @@ export default definePluginEntry({
                 lastConnectedAt: Date.now(),
                 statusState: "online",
               });
+              await waitForConsumerStop(accountId, entry, ctx.abortSignal);
             } catch (err) {
               consumerHandles.delete(accountId);
+              resolveConsumerStopped(entry);
               ctx.log?.error?.("redis-team: failed to start consumer: " + (err.message || String(err)));
               ctx.setStatus({
                 accountId: ctx.accountId,
@@ -1059,7 +1751,7 @@ export default definePluginEntry({
           buildAccountSnapshot: ({ account, cfg }) => {
             const accountId = account?.accountId || "default";
             const config = readChannelConfig(cfg, accountId);
-            const configured = !!(config.redisUrl && config.teamId && config.memberId);
+            const configured = !!(config.redisUrl && config.memberId && hasRequiredRedisTeamKeys(config));
             const consumer = consumerHandles.get(accountId);
             const active = !!(consumer?.handle || consumer?.starting);
             return {
@@ -1089,30 +1781,49 @@ export default definePluginEntry({
             await stopConsumer(accountId);
           },
         },
+        outbound: {
+          deliveryMode: "direct",
+          chunker: null,
+          textChunkLimit: 20000,
+          sendText: async ({ cfg, accountId, to, text }) => {
+            const sent = await runtime.sendChannelText({ cfg, accountId, to, text });
+            return {
+              channel: CHANNEL_ID,
+              messageId: sent.messageId,
+              chatId: sent.conversationId || sent.to,
+              conversationId: sent.conversationId,
+              meta: {
+                taskId: sent.taskId,
+                to: sent.to,
+                originalTo: sent.originalTo,
+                failed: sent.failed,
+                error: sent.error,
+              },
+            };
+          },
+          base: {
+            deliveryMode: "direct",
+            chunker: null,
+            textChunkLimit: 20000,
+          },
+          attachedResults: {
+            channel: CHANNEL_ID,
+            sendText: async ({ cfg, accountId, to, text }) => {
+              return await runtime.sendChannelText({ cfg, accountId, to, text });
+            },
+          },
+        },
         // Message adapter for standardized inbound/outbound
         message: {
           durableFinal: false,
           send: {
             text: async ({ cfg, accountId, to, text }) => {
-              const config = readChannelConfig(cfg, accountId);
-              const message = {
-                v: SCHEMA_VERSION,
-                messageId: "msg_" + randomUUID(),
-                teamId: config.teamId,
-                from: config.memberId,
-                to,
-                type: "message",
-                text,
-                createdAt: nowIso(),
+              const sent = await runtime.sendChannelText({ cfg, accountId, to, text });
+              return {
+                messageId: sent.messageId,
+                failed: sent.failed,
+                error: sent.error,
               };
-              const redis = new RedisClient(config.redisUrl);
-              await redis.connect();
-              try {
-                await xaddJson(redis, inboxKey(config, to), message);
-                return { messageId: message.messageId };
-              } finally {
-                redis.close();
-              }
             },
           },
           receive: {
@@ -1121,16 +1832,62 @@ export default definePluginEntry({
           },
         },
         messaging: {
-          resolveOutboundSessionRoute: ({ cfg, accountId, to }) => {
+          inferTargetChatType: ({ to }) => {
+            const target = normalizeRedisTeamTarget(to);
+            return target.completion ? "group" : "direct";
+          },
+          resolveOutboundSessionRoute: ({ cfg, accountId, target, resolvedTarget }) => {
+            const config = readChannelConfig(cfg, accountId || "default");
+            const normalized = normalizeRedisTeamTarget(target || resolvedTarget?.to, config);
+            const chatType = resolvedTarget?.kind === "user" ? "direct" : "group";
+            const peer = {
+              kind: chatType,
+              id: normalized.to,
+            };
+            const baseSessionKey = [
+              "redis-team",
+              safeName(accountId || "default"),
+              safeName(chatType),
+              safeName(normalized.to),
+            ].join(":");
             return {
-              sessionKey: "redis-team:" + to,
-              target: to,
+              sessionKey: baseSessionKey,
+              baseSessionKey,
+              peer,
+              chatType,
+              from: chatType === "direct" ? "redis-team:" + normalized.to : "redis-team:group:" + normalized.to,
+              to: chatType === "direct" ? "user:" + normalized.to : "channel:" + normalized.to,
             };
           },
-          normalizeTarget: ({ target }) => ({
-            target: target || "broadcast",
-            threadId: null,
-          }),
+          normalizeTarget: (target) => {
+            return normalizeRedisTeamTarget(target).to;
+          },
+          targetResolver: {
+            looksLikeId: (raw, normalized) => {
+              const value = trim(normalized) || trim(raw);
+              return isActiveCompletionTarget(value) || isSafeMemberTarget(value);
+            },
+            hint: "<clawmanager|broadcast|team|member>",
+            resolveTarget: async ({ cfg, accountId, input, normalized }) => {
+              const config = readChannelConfig(cfg, accountId || "default");
+              const target = normalizeRedisTeamTarget(normalized || input, config);
+              if (target.completion) {
+                return {
+                  to: target.to,
+                  kind: "group",
+                  display: target.originalTo,
+                  source: "normalized",
+                };
+              }
+              if (!isSafeMemberTarget(target.to)) return null;
+              return {
+                to: target.to,
+                kind: "user",
+                display: target.to,
+                source: "normalized",
+              };
+            },
+          },
         },
       },
     });

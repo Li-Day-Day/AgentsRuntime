@@ -1,24 +1,21 @@
 # syntax=docker/dockerfile:1.7
 
-FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS hermes-agent-builder
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
 
-WORKDIR /src
+WORKDIR /src/clawmanager-agent
 
 ARG TARGETOS=linux
 ARG TARGETARCH
 ARG AGENT_VERSION=dev
 
-COPY go.mod go.sum ./
+COPY clawmanager-agent ./
 RUN go mod download
-
-COPY cmd/ cmd/
-COPY internal/ internal/
 
 RUN set -eux; \
     arch="${TARGETARCH:-amd64}"; \
     CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
         go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
-        -o /out/hermes-agent ./cmd/hermes-agent
+        -o /out/clawmanager-agent ./cmd/clawmanager-agent
 
 FROM lscr.io/linuxserver/webtop:ubuntu-kde
 
@@ -29,6 +26,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 ENV HERMES_HOME=/config/.hermes \
     HERMES_SKILL_DIRS=/config/hermes/skills:/config/.hermes/skills \
+    CLAWMANAGER_RUNTIME_TYPE=hermes \
     PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/ms-playwright \
     PUID=1000 \
     PGID=1000 \
@@ -91,17 +89,24 @@ RUN set -eux; \
     curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
         | bash -s -- --branch "${HERMES_BRANCH}" --hermes-home "${HERMES_HOME}" --skip-setup; \
     /usr/local/lib/hermes-agent/venv/bin/python -m ensurepip --upgrade; \
-    /usr/local/lib/hermes-agent/venv/bin/python -m pip install --no-cache-dir "hermes-agent[dingtalk]"; \
+    /usr/local/lib/hermes-agent/venv/bin/python -m pip install --no-cache-dir "hermes-agent[dingtalk,messaging,matrix,wecom]"; \
+    cd /usr/local/lib/hermes-agent; \
+    npm install --workspace web; \
+    npm install --workspace ui-tui; \
+    npm run build -w web; \
+    npm run build -w ui-tui; \
+    test -d /usr/local/lib/hermes-agent/hermes_cli/web_dist; \
+    test -f /usr/local/lib/hermes-agent/ui-tui/dist/entry.js; \
     chmod -R a+rX /usr/local/lib/hermes-agent "${PLAYWRIGHT_BROWSERS_PATH}"; \
     chown -R abc:abc "${HERMES_HOME}" || true; \
     hermes --help >/dev/null; \
-    rm -rf /root/.cache /tmp/*
+    rm -rf /root/.cache /root/.npm /tmp/*
 
-COPY --from=hermes-agent-builder /out/hermes-agent /usr/local/bin/hermes-agent
-# Canonical source lives at ../plugins/hermes-redis-team. This vendor copy keeps
-# the existing hermes/ Docker build context self-contained.
-COPY vendor-plugins/redis_team/ /tmp/hermes-vendor-plugins/redis_team/
-COPY rootfs/ /
+COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+# Canonical source lives at plugins/hermes-redis-team. This vendor copy keeps
+# the Hermes image build independent from plugin workspace layout changes.
+COPY hermes/vendor-plugins/redis_team/ /tmp/hermes-vendor-plugins/redis_team/
+COPY hermes/rootfs/ /
 
 ENV SHELL=/bin/bash
 
@@ -118,9 +123,11 @@ RUN set -eux; \
     cp -a /tmp/hermes-vendor-plugins/redis_team/. /usr/local/lib/hermes-agent/plugins/platforms/redis_team/; \
     chmod -R a+rX /usr/local/lib/hermes-agent/plugins/platforms/redis_team; \
     rm -rf /tmp/hermes-vendor-plugins; \
+    find /etc/s6-overlay/s6-rc.d -type f -exec sed -i 's/\r$//' {} +; \
     sed -i 's/\r$//' \
         /usr/local/bin/wrapped-chromium \
         /usr/local/bin/hermes-apply-runtime-config \
+        /usr/local/bin/start-hermes-dashboard-gateway \
         /usr/local/bin/start-hermes-terminal \
         /usr/local/bin/start-hermes-gateway \
         /custom-cont-init.d/99-hermes-config \
@@ -128,8 +135,9 @@ RUN set -eux; \
         /etc/s6-overlay/s6-rc.d/hermes-gateway/run; \
     chmod 755 \
         /usr/local/bin/wrapped-chromium \
-        /usr/local/bin/hermes-agent \
+        /usr/local/bin/clawmanager-agent \
         /usr/local/bin/hermes-apply-runtime-config \
+        /usr/local/bin/start-hermes-dashboard-gateway \
         /usr/local/bin/start-hermes-terminal \
         /usr/local/bin/start-hermes-gateway \
         /custom-cont-init.d/99-hermes-config \

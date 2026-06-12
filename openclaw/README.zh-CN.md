@@ -35,8 +35,10 @@
 
 **Bash**
 
+请在仓库根目录执行，这样 Docker 才能包含公共的 `clawmanager-agent/` 组件。
+
 ```
-docker build -f Dockerfile.openclaw -t openclaw:local .
+docker build -f openclaw/Dockerfile.openclaw -t openclaw:local .
 ```
 
 ### 运行
@@ -159,7 +161,7 @@ docker commit webtop-running openclaw:v1.0
 ## 说明
 
 * **权限**：agent 会在降权前对 `/config/.openclaw` 与 `/config/.config/autostart` 执行 `chown -R abc:abc`，保证默认用户可读写持久化配置。
-* **Docker Compose**：将 `image` 指向您构建的标签，或使用 `build` 且指定 `dockerfile: Dockerfile.openclaw`。不要仅依赖官方 `webtop` 镜像，其中不包含本仓库的模板与 agent 服务。
+* **Docker Compose**：将 `image` 指向您构建的标签，或在仓库根目录使用 `build`，设置 `context: .` 和 `dockerfile: openclaw/Dockerfile.openclaw`。不要仅依赖官方 `webtop` 镜像，其中不包含本仓库的模板与 agent 服务。
 * **单独使用 WebTop**：若不使用 ClawManager 批量能力，可跳过进阶流程中与 ClawManager 相关的步骤。
 
 ---

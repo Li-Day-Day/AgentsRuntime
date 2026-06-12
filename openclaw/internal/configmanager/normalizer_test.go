@@ -487,6 +487,49 @@ func TestRedisTeamChannelAddedWhenTeamEnvEnabled(t *testing.T) {
 	}
 }
 
+func TestRedisTeamPluginEnabledWhenTeamEnvEnabled(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "openclaw.json")
+	userDir := filepath.Join(root, "extensions")
+	if err := os.MkdirAll(filepath.Join(userDir, "redis-team"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(userDir, "redis-team", "openclaw.plugin.json"), []byte(`{"channels":["redis-team"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{
+		"channels": {},
+		"plugins": {
+			"entries": {
+				"redis-team": {"enabled": false}
+			}
+		}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("CLAWMANAGER_TEAM_ENABLED", "true")
+	t.Setenv("CLAWMANAGER_LLM_MODEL", "")
+	t.Setenv("CLAWMANAGER_LLM_BASE_URL", "")
+	unsetEnvForTest(t, "CLAWMANAGER_LLM_API_KEY")
+	unsetEnvForTest(t, "OPENAI_API_KEY")
+
+	manager := New(appconfig.Config{
+		OpenClawConfigPath:           configPath,
+		OpenClawBundledExtensionsDir: t.TempDir(),
+		OpenClawExtensionsDir:        userDir,
+	}, nil, nil)
+	if err := manager.NormalizeActiveConfig(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := readConfigForTest(t, configPath)
+	entry := nestedMapForTest(t, cfg, "plugins", "entries", "redis-team")
+	if got := entry["enabled"]; got != true {
+		t.Fatalf("expected redis-team plugin enabled from Team env, got %#v", got)
+	}
+}
+
 func TestChannelEnvControlsManagedChannelPluginEntries(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "openclaw.json")

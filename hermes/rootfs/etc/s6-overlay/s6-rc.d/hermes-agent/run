@@ -1,9 +1,15 @@
 #!/usr/bin/with-contenv bash
 set -euo pipefail
 
+if [ -n "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ] || [ -n "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]; then
+    runtime_agent_data_dir="${RUNTIME_AGENT_DATA_DIR:-/var/lib/clawmanager-agent}"
+    mkdir -p "${runtime_agent_data_dir}"
+    exec /usr/local/bin/clawmanager-agent
+fi
+
 if [ "${CLAWMANAGER_AGENT_ENABLED:-false}" != "true" ]; then
-    echo "ClawManager Hermes agent disabled"
-    sleep infinity
+    echo "ClawManager Hermes instance agent disabled"
+    exec sleep infinity
 fi
 
 export HOME="${HOME:-/config}"
@@ -50,7 +56,7 @@ if command -v s6-setuidgid >/dev/null 2>&1 && id abc >/dev/null 2>&1; then
             /*) chown -R abc:abc "${team_dir}" || true ;;
         esac
     fi
-    exec s6-setuidgid abc /usr/local/bin/hermes-agent
+    exec s6-setuidgid abc /usr/local/bin/clawmanager-agent
 fi
 
-exec /usr/local/bin/hermes-agent
+exec /usr/local/bin/clawmanager-agent

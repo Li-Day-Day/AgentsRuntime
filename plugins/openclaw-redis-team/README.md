@@ -27,6 +27,10 @@ Optional:
 ```text
 CLAWMANAGER_TEAM_AUTORUN=true
 CLAWMANAGER_TEAM_CONSUMER_GROUP=team-members
+CLAWMANAGER_TEAM_INBOX_KEY=claw:team:<teamId>:inbox:<memberId>
+CLAWMANAGER_TEAM_EVENTS_KEY=claw:team:<teamId>:events
+CLAWMANAGER_TEAM_PRESENCE_KEY=claw:team:<teamId>:presence
+CLAWMANAGER_TEAM_DLQ_KEY=claw:team:<teamId>:dlq
 CLAWMANAGER_TEAM_EMBEDDED_TIMEOUT_SECONDS=1800
 CLAWMANAGER_TEAM_MANAGER_URL=http://clawmanager:8080
 CLAWMANAGER_TEAM_TOKEN=...
@@ -42,6 +46,10 @@ passes that config into `runEmbeddedAgent`, so embedded auth sees the same
 The plugin emits `task_failed` if the helper is unavailable or does not return
 before `CLAWMANAGER_TEAM_EMBEDDED_TIMEOUT_SECONDS`, so ClawManager does not leave
 the task in `running` forever.
+When ClawManager provides explicit stream keys, the plugin uses those keys
+instead of deriving them from `CLAWMANAGER_TEAM_ID`. Events include
+`task_received`, `task_started`, and a final `task_completed` or `task_failed`
+with both camelCase and snake_case id fields.
 
 ## Redis keys
 
