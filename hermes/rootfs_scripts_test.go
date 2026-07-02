@@ -26,3 +26,54 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 		}
 	}
 }
+
+func TestRedisTeamProtocolUsesExplicitCompletionAndCanonicalBuildInputs(t *testing.T) {
+	adapterData, err := os.ReadFile(filepath.Join("..", "plugins", "hermes-redis-team", "adapter.py"))
+	if err != nil {
+		t.Fatalf("read canonical Hermes Redis Team adapter: %v", err)
+	}
+	adapter := string(adapterData)
+	for _, want := range []string{
+		"WIRE_SCHEMA_VERSION = 1",
+		"PROTOCOL_VERSION = 2",
+		"Agent turn finished; waiting for explicit team_complete_task",
+		"\"task_progress\"",
+		"\"completionSource\": COMPLETION_SOURCE",
+		"\"explicitCompletion\": True",
+		"xadd_terminal_once",
+		"completion_key",
+		"processed_message_key",
+		"_stable_assignment_id",
+		"assignment-",
+		"validate_artifact_refs",
+		"write_task_envelope",
+		"_atomic_write_text(result_md, result_markdown)",
+		"if task_result_is_terminal(self.settings, task_id):",
+	} {
+		if !strings.Contains(adapter, want) {
+			t.Fatalf("canonical Hermes Redis Team adapter missing %q", want)
+		}
+	}
+	if strings.Contains(adapter, "self._seen_ids") {
+		t.Fatal("Hermes Redis Team adapter must use Redis-backed message idempotency instead of process memory")
+	}
+
+	dockerData, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatalf("read Hermes Dockerfile: %v", err)
+	}
+	if !strings.Contains(string(dockerData), "COPY plugins/hermes-redis-team/ /tmp/hermes-vendor-plugins/redis_team/") {
+		t.Fatal("Hermes image must package the canonical Redis Team plugin source")
+	}
+
+	migrationData, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "hermes-apply-runtime-config"))
+	if err != nil {
+		t.Fatalf("read Hermes runtime config migration: %v", err)
+	}
+	migration := string(migrationData)
+	for _, want := range []string{"hashlib.sha256", "source_sha256", "previous_sha256"} {
+		if !strings.Contains(migration, want) {
+			t.Fatalf("Hermes Skill migration missing hash-based refresh token %q", want)
+		}
+	}
+}

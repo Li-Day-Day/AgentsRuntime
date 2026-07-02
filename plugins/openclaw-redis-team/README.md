@@ -48,8 +48,23 @@ before `CLAWMANAGER_TEAM_EMBEDDED_TIMEOUT_SECONDS`, so ClawManager does not leav
 the task in `running` forever.
 When ClawManager provides explicit stream keys, the plugin uses those keys
 instead of deriving them from `CLAWMANAGER_TEAM_ID`. Events include
-`task_received`, `task_started`, and a final `task_completed` or `task_failed`
-with both camelCase and snake_case id fields.
+`task_received`, `task_started`, and structured progress events with both
+camelCase and snake_case id fields.
+
+## Completion protocol
+
+Redis Team protocol v2 keeps the original wire schema (`v: 1`) for older
+ClawManager releases and adds `protocolVersion: 2`. A normal assistant reply or
+successful agent turn is progress, not task completion. Only an explicit
+`team_complete_task` call emits a successful `task_completed` event. Runtime
+errors emit a structured `task_failed` event.
+
+Every explicit completion atomically writes `results/<taskId>/result.json` and
+`results/<taskId>/result.md`, even when the caller only provides a summary. The
+event carries a deterministic `completionId`, `completionSource`,
+`explicitCompletion`, and canonical `/team/...` artifact references. These
+additive fields allow new ClawManager releases to enforce idempotent completion
+while old releases continue to consume the familiar event names and fields.
 
 ## Redis keys
 
@@ -62,14 +77,7 @@ claw:team:<teamId>:dlq
 
 ## Packaging for AgentsRuntime
 
-```bash
-npm run build
-npm pack --pack-destination ../../openclaw/vendor-plugins
-```
-
-Dockerfile install:
-
-```dockerfile
-COPY vendor-plugins/openclaw-redis-team.tgz /tmp/openclaw-redis-team.tgz
-RUN HOME=/defaults openclaw plugins install /tmp/openclaw-redis-team.tgz
-```
+`plugins/openclaw-redis-team` is the canonical source. The image copies this
+directory into its build context, runs `npm pack`, and installs the generated
+archive. Prepacked archives under `openclaw/vendor-plugins` remain only for
+older build consumers and are not authoritative.

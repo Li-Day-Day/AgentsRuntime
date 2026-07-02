@@ -36,7 +36,7 @@ COPY --from=node-runtime /usr/local /usr/local
 
 RUN npm install -g openclaw@v2026.5.4
 
-COPY openclaw/vendor-plugins/openclaw-redis-team.tgz /tmp/openclaw-redis-team.tgz
+COPY plugins/openclaw-redis-team/ /tmp/openclaw-redis-team/
 COPY openclaw/defaults-template/.config /defaults/.config
 # Seed the runtime template under /defaults so the first /config sync gets the
 # tracked OpenClaw config plus any files the image expects to manage.
@@ -61,11 +61,16 @@ RUN sed -i 's/\r$//' /etc/services.d/openclaw-agent/run \
   && chmod +x /usr/local/bin/openclaw-agent \
   && chmod +x /usr/local/bin/clawmanager-agent \
   && chmod +x /usr/local/bin/wrapped-chromium \
-  && HOME=/defaults openclaw plugins install /tmp/openclaw-redis-team.tgz \
+  && mkdir -p /tmp/openclaw-plugin-pack \
+  && cd /tmp/openclaw-redis-team \
+  && npm pack --pack-destination /tmp/openclaw-plugin-pack \
+  && redis_team_tgz="$(find /tmp/openclaw-plugin-pack -maxdepth 1 -name '*.tgz' -print -quit)" \
+  && test -n "${redis_team_tgz}" \
+  && HOME=/defaults openclaw plugins install "${redis_team_tgz}" \
   && HOME=/defaults openclaw plugins install @dingtalk-real-ai/dingtalk-connector \
   && HOME=/defaults openclaw plugins install @wecom/wecom-openclaw-plugin@beta \
   && HOME=/defaults openclaw plugins install @openclaw/feishu@2026.5.4 \
-  && rm -f /tmp/openclaw-redis-team.tgz \
+  && rm -rf /tmp/openclaw-redis-team /tmp/openclaw-plugin-pack \
   && chown -R abc:abc /defaults/.openclaw \
   && chown -R abc:abc /defaults/.config \
   && mkdir -p /var/lib/openclaw-agent /var/lib/clawmanager-agent /var/log/openclaw-agent /etc/openclaw-agent

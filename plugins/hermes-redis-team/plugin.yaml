@@ -1,7 +1,7 @@
 name: redis-team-platform
 label: Redis Team
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
   Redis Streams Team Bus gateway adapter for Hermes Agent. Connects a
   ClawManager-managed Hermes runtime to the shared Redis Team inbox/events

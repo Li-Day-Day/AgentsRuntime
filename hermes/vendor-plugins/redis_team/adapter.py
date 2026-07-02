@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -28,7 +29,9 @@ from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+WIRE_SCHEMA_VERSION = 1
+PROTOCOL_VERSION = 2
+COMPLETION_SOURCE = "team_complete_task"
 DEFAULT_SHARED_DIR = "/team"
 DEFAULT_CONSUMER_GROUP = "team-members"
 READ_BLOCK_MS = 5000
@@ -53,6 +56,11 @@ def _trim(value: Any) -> str:
     return str(value).strip() if value is not None else ""
 
 
+def processed_message_key(settings: "RedisTeamSettings", key: str) -> str:
+    digest = hashlib.sha256(str(key or "").encode("utf-8")).hexdigest()
+    return f"claw:team:{settings.team_id}:processed:{settings.member_id}:{digest}"
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -60,6 +68,12 @@ def _now_iso() -> str:
 def _safe_name(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
     return safe or "unknown"
+
+
+def _stable_assignment_id(settings: "RedisTeamSettings", *, task_id: str, root_task_id: str, to: str, title: str, text: str) -> str:
+    seed = "\n".join([settings.team_id, settings.member_id, root_task_id, task_id, to, title, text])
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+    return f"assignment-{_safe_name(to)}-{digest}"
 
 
 def _redis_client_name(settings: "RedisTeamSettings", purpose: str) -> str:
@@ -77,6 +91,13 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _atomic_write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(value.rstrip() + "\n", encoding="utf-8")
     tmp.replace(path)
 
 
@@ -173,7 +194,9 @@ def dlq_key(settings: RedisTeamSettings) -> str:
 
 def event_for(settings: RedisTeamSettings, event: str, extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     payload = {
-        "v": SCHEMA_VERSION,
+        "v": WIRE_SCHEMA_VERSION,
+        "protocolVersion": PROTOCOL_VERSION,
+        "eventId": f"evt_{uuid.uuid4().hex}",
         "event": event,
         "teamId": settings.team_id,
         "memberId": settings.member_id,
@@ -246,16 +269,17 @@ def write_task_result(
     result_dir = settings.shared_path / "results" / _safe_name(task_id)
     result_dir.mkdir(parents=True, exist_ok=True)
 
-    refs = list(artifact_refs or [])
-    if result_markdown:
-        result_md = result_dir / "result.md"
-        result_md.write_text(result_markdown, encoding="utf-8")
-        refs.append(str(result_md))
+    refs = validate_artifact_refs(settings, artifact_refs)
+    result_markdown = result_markdown.strip() or summary
+    result_md = result_dir / "result.md"
+    _atomic_write_text(result_md, result_markdown)
+    refs.append(canonical_artifact_ref(settings, result_md))
 
     payload = {
         "taskId": task_id,
         "status": status,
         "summary": summary,
+        "resultMarkdown": result_markdown,
         "artifactRefs": refs,
         "completedAt": _now_iso(),
     }
@@ -264,6 +288,7 @@ def write_task_result(
         settings,
         {
             "availability": "idle" if status == "succeeded" else "blocked",
+            "runtimeStatus": "succeeded" if status == "succeeded" else "failed",
             "currentTaskId": task_id,
             "progress": 100 if status == "succeeded" else None,
             "lastSummary": summary,
@@ -273,13 +298,56 @@ def write_task_result(
     return payload
 
 
+def task_result_is_terminal(settings: RedisTeamSettings, task_id: str) -> bool:
+    result = _read_json(settings.shared_path / "results" / _safe_name(task_id) / "result.json")
+    if not isinstance(result, dict):
+        return False
+    return _trim(result.get("status")).lower() in {"succeeded", "failed", "cancelled"}
+
+
+def canonical_artifact_ref(settings: RedisTeamSettings, path: Path) -> str:
+    shared = settings.shared_path.resolve()
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(shared)
+    except ValueError as exc:
+        raise ValueError(f"artifact path escaped Redis Team shared directory: {path}") from exc
+    return "/team/" + relative.as_posix()
+
+
+def validate_artifact_refs(settings: RedisTeamSettings, refs: Optional[list[str]]) -> list[str]:
+    shared = settings.shared_path.resolve()
+    validated: list[str] = []
+    for raw in refs or []:
+        ref = _trim(raw)
+        if not ref:
+            continue
+        candidate = (shared / ref[len("/team/"):]).resolve() if ref.startswith("/team/") else Path(ref).resolve()
+        try:
+            candidate.relative_to(shared)
+        except ValueError as exc:
+            raise ValueError(f"artifact reference escaped Redis Team shared directory: {ref}") from exc
+        if not candidate.is_file():
+            raise ValueError(f"artifact reference is not a readable file: {ref}")
+        canonical = canonical_artifact_ref(settings, candidate)
+        if canonical not in validated:
+            validated.append(canonical)
+    return validated
+
+
 def normalize_envelope(raw: Any) -> Optional[dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
     return {
-        "schemaVersion": raw.get("v") or raw.get("schemaVersion") or SCHEMA_VERSION,
+        "schemaVersion": raw.get("v") or raw.get("schemaVersion") or WIRE_SCHEMA_VERSION,
+        "protocolVersion": raw.get("protocolVersion") or raw.get("protocol_version") or raw.get("v") or WIRE_SCHEMA_VERSION,
         "messageId": raw.get("messageId") or raw.get("id") or f"msg_{uuid.uuid4().hex}",
         "taskId": raw.get("taskId") or raw.get("task_id") or f"task_{uuid.uuid4().hex}",
+        "rootTaskId": raw.get("rootTaskId") or raw.get("root_task_id") or raw.get("taskId") or raw.get("task_id"),
+        "rootMessageId": raw.get("rootMessageId") or raw.get("root_message_id") or raw.get("messageId") or raw.get("message_id"),
+        "workId": raw.get("workId") or raw.get("work_id") or raw.get("assignmentId") or raw.get("assignment_id"),
+        "assignmentId": raw.get("assignmentId") or raw.get("assignment_id") or raw.get("workId") or raw.get("work_id"),
+        "dependsOn": raw.get("dependsOn") if isinstance(raw.get("dependsOn"), list) else [],
         "teamId": raw.get("teamId"),
         "from": raw.get("from") or raw.get("sender") or "unknown",
         "to": raw.get("to") or raw.get("recipient") or "",
@@ -294,6 +362,9 @@ def normalize_envelope(raw: Any) -> Optional[dict[str, Any]]:
         "contextRefs": [x for x in raw.get("contextRefs", []) if x] if isinstance(raw.get("contextRefs"), list) else [],
         "artifacts": raw.get("artifacts") or [],
         "metadata": raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {},
+        "requiresCompletion": raw.get("requiresCompletion", True),
+        "completionTool": raw.get("completionTool") or "team_complete_task",
+        "resultSink": raw.get("resultSink") if isinstance(raw.get("resultSink"), dict) else {},
         "sessionKey": raw.get("sessionKey") or raw.get("approvalSessionKey") or "",
         "approval": raw.get("approval") if isinstance(raw.get("approval"), dict) else {},
         "idempotencyKey": raw.get("idempotencyKey") or raw.get("messageId") or raw.get("id"),
@@ -366,11 +437,28 @@ def _completion_event_for_status(status: str) -> str:
     return "task_failed"
 
 
-_COMPLETED_TASK_KEYS: set[str] = set()
+def _completion_id(settings: RedisTeamSettings, task_id: str) -> str:
+    return f"completion:{_safe_name(settings.team_id)}:{_safe_name(task_id)}:{_safe_name(settings.member_id)}"
 
 
-def _completion_key(team_id: str, task_id: str) -> str:
-    return f"{_trim(team_id)}:{_trim(task_id)}"
+def completion_key(settings: RedisTeamSettings, completion_id: str) -> str:
+    return f"{_key_prefix(settings)}:completions:{_safe_name(completion_id)}"
+
+
+def task_envelope_path(settings: RedisTeamSettings, task_id: str) -> Path:
+    return settings.shared_path / "tasks" / f"{_safe_name(task_id)}.json"
+
+
+def write_task_envelope(settings: RedisTeamSettings, envelope: dict[str, Any]) -> None:
+    task_id = _trim(envelope.get("taskId"))
+    if not task_id:
+        raise ValueError("Redis Team envelope is missing taskId")
+    _atomic_write_json(task_envelope_path(settings, task_id), envelope)
+
+
+def read_task_envelope(settings: RedisTeamSettings, task_id: str) -> Optional[dict[str, Any]]:
+    value = _read_json(task_envelope_path(settings, task_id))
+    return value if isinstance(value, dict) else None
 
 
 class RespError(RuntimeError):
@@ -486,6 +574,35 @@ async def xadd_json(redis: AsyncRedisClient, stream: str, event: dict[str, Any])
     return await redis.command("XADD", stream, "*", "payload", json.dumps(event, ensure_ascii=False))
 
 
+async def xadd_terminal_once(
+    redis: AsyncRedisClient,
+    settings: RedisTeamSettings,
+    completion_id: str,
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    script = "\n".join(
+        (
+            "local existing = redis.call('GET', KEYS[1])",
+            "if existing then return {0, existing} end",
+            "local streamId = redis.call('XADD', KEYS[2], '*', 'payload', ARGV[1])",
+            "redis.call('SET', KEYS[1], streamId)",
+            "return {1, streamId}",
+        )
+    )
+    result = await redis.command(
+        "EVAL",
+        script,
+        2,
+        completion_key(settings, completion_id),
+        events_key(settings),
+        json.dumps(event, ensure_ascii=False),
+    )
+    return {
+        "published": isinstance(result, list) and int(result[0]) == 1,
+        "streamId": str(result[1]) if isinstance(result, list) and len(result) > 1 else "",
+    }
+
+
 async def _publish_event(settings: RedisTeamSettings, event: str, payload: dict[str, Any]) -> None:
     if not settings.valid:
         return
@@ -493,6 +610,24 @@ async def _publish_event(settings: RedisTeamSettings, event: str, payload: dict[
     try:
         await redis.connect()
         await xadd_json(redis, events_key(settings), event_for(settings, event, payload))
+    finally:
+        redis.close()
+
+
+async def _publish_terminal_event(
+    settings: RedisTeamSettings,
+    event: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if not settings.valid:
+        return {"published": False, "streamId": ""}
+    completion_id = _trim(payload.get("completionId"))
+    if not completion_id:
+        raise ValueError("terminal Redis Team event requires completionId")
+    redis = AsyncRedisClient(settings.redis_url)
+    try:
+        await redis.connect()
+        return await xadd_terminal_once(redis, settings, completion_id, event_for(settings, event, payload))
     finally:
         redis.close()
 
@@ -505,15 +640,34 @@ async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
     text = _trim(args.get("text") or args.get("prompt"))
     if not to or not text:
         return json.dumps({"error": "to and text are required"}, ensure_ascii=False)
+    task_id = _trim(args.get("taskId")) or f"task_{uuid.uuid4().hex}"
+    parent_envelope = read_task_envelope(settings, task_id) or {}
+    root_task_id = parent_envelope.get("rootTaskId") or parent_envelope.get("taskId") or task_id
+    title = _trim(args.get("title")) or "Team Message"
+    explicit_work_id = _trim(args.get("workId")) or _trim(args.get("assignmentId"))
+    work_id = explicit_work_id or _stable_assignment_id(
+        settings,
+        task_id=task_id,
+        root_task_id=root_task_id,
+        to=to,
+        title=title,
+        text=text,
+    )
     message = {
-        "v": SCHEMA_VERSION,
+        "v": WIRE_SCHEMA_VERSION,
+        "protocolVersion": PROTOCOL_VERSION,
         "messageId": f"msg_{uuid.uuid4().hex}",
         "teamId": settings.team_id,
         "from": settings.member_id,
         "to": to,
         "intent": _trim(args.get("intent")) or "send",
-        "taskId": _trim(args.get("taskId")) or f"task_{uuid.uuid4().hex}",
-        "title": _trim(args.get("title")) or "Team Message",
+        "taskId": task_id,
+        "rootTaskId": root_task_id,
+        "rootMessageId": parent_envelope.get("rootMessageId") or parent_envelope.get("messageId"),
+        "workId": work_id,
+        "assignmentId": _trim(args.get("assignmentId")) or _trim(args.get("workId")) or work_id,
+        "dependsOn": args.get("dependsOn") if isinstance(args.get("dependsOn"), list) else [],
+        "title": title,
         "text": text,
         "contextRefs": args.get("contextRefs") if isinstance(args.get("contextRefs"), list) else [],
         "ttlSeconds": args.get("ttlSeconds") if isinstance(args.get("ttlSeconds"), int) else 3600,
@@ -555,19 +709,24 @@ async def _tool_team_update_progress(args: dict[str, Any], **_kwargs) -> str:
     summary = _trim(args.get("summary"))
     if not task_id or not status_text:
         return json.dumps({"error": "taskId and status are required"}, ensure_ascii=False)
+    if status_text not in {"idle", "busy", "running", "blocked", "waiting_review", "waiting_completion"}:
+        return json.dumps({"error": "terminal status must use team_complete_task"}, ensure_ascii=False)
     progress = args.get("progress")
+    if isinstance(progress, (int, float)):
+        progress = min(99, max(0, progress))
+    else:
+        progress = None
+    progress_payload = {**dict(args), "taskId": task_id, "status": status_text, "progress": progress}
     status = write_local_status(
         settings,
         {
             "availability": "idle" if status_text == "idle" else status_text,
             "currentTaskId": task_id,
-            "progress": progress if isinstance(progress, (int, float)) else None,
+            "progress": progress,
             "lastSummary": summary or status_text,
             "artifactRefs": args.get("artifactRefs") if isinstance(args.get("artifactRefs"), list) else [],
         },
     )
-    progress_payload = dict(args)
-    await _publish_event(settings, "progress", progress_payload)
     await _publish_event(settings, "task_progress", progress_payload)
     return json.dumps({"ok": True, "status": status}, ensure_ascii=False)
 
@@ -577,10 +736,15 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
     if not settings.enabled:
         return json.dumps({"error": "Redis Team is disabled"}, ensure_ascii=False)
     task_id = _trim(args.get("taskId"))
-    status_text = _trim(args.get("status"))
+    status_text = _trim(args.get("status")).lower()
     summary = _trim(args.get("summary"))
     if not task_id or not status_text or not summary:
         return json.dumps({"error": "taskId, status and summary are required"}, ensure_ascii=False)
+    if status_text not in {"succeeded", "failed", "cancelled"}:
+        return json.dumps({"error": "status must be succeeded, failed or cancelled"}, ensure_ascii=False)
+    envelope = read_task_envelope(settings, task_id)
+    if not envelope:
+        return json.dumps({"error": f"team_complete_task could not resolve the task envelope: {task_id}"}, ensure_ascii=False)
     result = write_task_result(
         settings,
         task_id,
@@ -589,11 +753,25 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
         result_markdown=_trim(args.get("resultMarkdown")),
         artifact_refs=args.get("artifactRefs") if isinstance(args.get("artifactRefs"), list) else [],
     )
-    completion_payload = {**dict(args), "artifactRefs": result["artifactRefs"]}
-    await _publish_event(settings, "completion", completion_payload)
-    await _publish_event(settings, _completion_event_for_status(status_text), completion_payload)
-    _COMPLETED_TASK_KEYS.add(_completion_key(settings.team_id, task_id))
-    return json.dumps({"ok": True, **result}, ensure_ascii=False)
+    completion_id = _trim(args.get("completionId")) or _completion_id(settings, task_id)
+    completion_payload = {
+        **dict(args),
+        "messageId": envelope.get("messageId"),
+        "taskId": task_id,
+        "rootTaskId": envelope.get("rootTaskId") or task_id,
+        "rootMessageId": envelope.get("rootMessageId") or envelope.get("messageId"),
+        "workId": envelope.get("workId") or envelope.get("assignmentId"),
+        "assignmentId": envelope.get("assignmentId") or envelope.get("workId"),
+        "status": status_text,
+        "summary": summary,
+        "resultMarkdown": result["resultMarkdown"],
+        "artifactRefs": result["artifactRefs"],
+        "completionId": completion_id,
+        "completionSource": COMPLETION_SOURCE,
+        "explicitCompletion": True,
+    }
+    terminal = await _publish_terminal_event(settings, _completion_event_for_status(status_text), completion_payload)
+    return json.dumps({"ok": True, **result, **terminal, "completionId": completion_id}, ensure_ascii=False)
 
 
 class RedisTeamAdapter(BasePlatformAdapter):
@@ -605,7 +783,6 @@ class RedisTeamAdapter(BasePlatformAdapter):
         self._consumer_task: Optional[asyncio.Task] = None
         self._presence_task: Optional[asyncio.Task] = None
         self._lifecycle_lock = asyncio.Lock()
-        self._seen_ids: set[str] = set()
         self._redis_reply_metadata: Dict[str, Dict[str, Any]] = {}
         self._approval_session_by_key: Dict[str, str] = {}
         self._latest_approval_session_key = ""
@@ -763,7 +940,8 @@ class RedisTeamAdapter(BasePlatformAdapter):
                         self._redis,
                         inbox_key(self.settings, target),
                         {
-                            "v": SCHEMA_VERSION,
+                            "v": WIRE_SCHEMA_VERSION,
+                            "protocolVersion": PROTOCOL_VERSION,
                             "messageId": message_id,
                             "teamId": self.settings.team_id,
                             "from": self.settings.member_id,
@@ -806,7 +984,8 @@ class RedisTeamAdapter(BasePlatformAdapter):
             "reply does not reuse the original taskId and conversationId."
         )
         approval_payload = {
-            "v": SCHEMA_VERSION,
+            "v": WIRE_SCHEMA_VERSION,
+            "protocolVersion": PROTOCOL_VERSION,
             "messageId": approval_id,
             "teamId": self.settings.team_id,
             "from": self.settings.member_id,
@@ -919,65 +1098,65 @@ class RedisTeamAdapter(BasePlatformAdapter):
         envelope = event.raw_message if isinstance(event.raw_message, dict) else {}
         task_id = str(envelope.get("taskId") or event.source.chat_id)
         message_id = str(envelope.get("messageId") or event.message_id or "")
-        completion_key = _completion_key(self.settings.team_id, task_id)
         if outcome == ProcessingOutcome.SUCCESS:
+            if task_result_is_terminal(self.settings, task_id):
+                self._redis_reply_metadata.pop(task_id, None)
+                return
+            summary = "Agent turn finished; waiting for explicit team_complete_task"
             write_local_status(
                 self.settings,
                 {
-                    "availability": "idle",
+                    "availability": "waiting_completion",
+                    "runtimeStatus": "waiting_completion",
                     "currentTaskId": task_id,
-                    "lastSummary": "Redis Team task processing completed",
+                    "lastSummary": summary,
                 },
             )
-            if self._redis and completion_key not in _COMPLETED_TASK_KEYS:
-                summary = "Redis Team task processing completed"
-                await xadd_json(
-                    self._redis,
-                    events_key(self.settings),
-                    event_for(
-                        self.settings,
-                        "task_completed",
-                        {
-                            "messageId": message_id,
-                            "taskId": task_id,
-                            "status": "succeeded",
-                            "summary": summary,
-                        },
-                    ),
-                )
-                _COMPLETED_TASK_KEYS.add(completion_key)
-        else:
-            status = "cancelled" if outcome == ProcessingOutcome.CANCELLED else "failed"
-            summary = f"Redis Team task {status}"
-            write_task_result(self.settings, task_id, status=status, summary=summary)
             if self._redis:
                 await xadd_json(
                     self._redis,
                     events_key(self.settings),
                     event_for(
                         self.settings,
-                        "completion",
+                        "task_progress",
                         {
+                            "messageId": message_id,
                             "taskId": task_id,
-                            "status": status,
+                            "status": "waiting_completion",
+                            "availability": "waiting_completion",
+                            "runtimeStatus": "waiting_completion",
                             "summary": summary,
+                            "completionRequired": True,
                         },
                     ),
                 )
-                await xadd_json(
+        else:
+            status = "cancelled" if outcome == ProcessingOutcome.CANCELLED else "failed"
+            summary = f"Redis Team task {status}"
+            result = write_task_result(self.settings, task_id, status=status, summary=summary)
+            if self._redis:
+                completion_id = _completion_id(self.settings, task_id)
+                await xadd_terminal_once(
                     self._redis,
-                    events_key(self.settings),
+                    self.settings,
+                    completion_id,
                     event_for(
                         self.settings,
                         _completion_event_for_status(status),
                         {
                             "taskId": task_id,
+                            "rootTaskId": envelope.get("rootTaskId") or task_id,
+                            "rootMessageId": envelope.get("rootMessageId") or message_id,
+                            "workId": envelope.get("workId") or envelope.get("assignmentId"),
                             "status": status,
                             "summary": summary,
+                            "artifactRefs": result["artifactRefs"],
+                            "completionId": completion_id,
+                            "completionSource": "runtime_processing",
+                            "explicitCompletion": False,
                         },
                     ),
                 )
-                _COMPLETED_TASK_KEYS.add(completion_key)
         self._redis_reply_metadata.pop(task_id, None)
 
     async def _presence_loop(self) -> None:
@@ -1030,13 +1209,11 @@ class RedisTeamAdapter(BasePlatformAdapter):
         if not envelope:
             return
         dedup_key = envelope.get("idempotencyKey") or envelope["messageId"]
-        if dedup_key in self._seen_ids:
+        processed_key = processed_message_key(self.settings, dedup_key)
+        if await self._redis.command("GET", processed_key):
             if redis_id:
                 await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
             return
-        self._seen_ids.add(dedup_key)
-        if len(self._seen_ids) > 10000:
-            self._seen_ids = set(list(self._seen_ids)[-9000:])
 
         try:
             await xadd_json(
@@ -1053,6 +1230,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 ),
             )
             if await self._try_resolve_approval_response(envelope):
+                await self._redis.command("SET", processed_key, envelope["messageId"], "EX", 604800)
                 if redis_id:
                     await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
                 return
@@ -1067,6 +1245,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
                         "lastSummary": "Redis Team task received; autorun is disabled",
                     },
                 )
+            await self._redis.command("SET", processed_key, envelope["messageId"], "EX", 604800)
             if redis_id:
                 await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
         except Exception as exc:
@@ -1077,11 +1256,34 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 dlq_key(self.settings),
                 event_for(self.settings, "dlq", {"redisId": redis_id, "error": error, "message": raw}),
             )
-            write_task_result(
+            result = write_task_result(
                 self.settings,
                 envelope["taskId"],
                 status="failed",
                 summary=error,
+            )
+            completion_id = _completion_id(self.settings, envelope["taskId"])
+            await xadd_terminal_once(
+                self._redis,
+                self.settings,
+                completion_id,
+                event_for(
+                    self.settings,
+                    "task_failed",
+                    {
+                        "messageId": envelope["messageId"],
+                        "taskId": envelope["taskId"],
+                        "rootTaskId": envelope.get("rootTaskId") or envelope["taskId"],
+                        "rootMessageId": envelope.get("rootMessageId") or envelope["messageId"],
+                        "workId": envelope.get("workId") or envelope.get("assignmentId"),
+                        "status": "failed",
+                        "summary": error,
+                        "artifactRefs": result["artifactRefs"],
+                        "completionId": completion_id,
+                        "completionSource": "runtime_error",
+                        "explicitCompletion": False,
+                    },
+                ),
             )
             if redis_id:
                 await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
@@ -1156,6 +1358,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
         return True
 
     async def _dispatch_envelope(self, envelope: dict[str, Any]) -> None:
+        write_task_envelope(self.settings, envelope)
         source = SessionSource(
             platform=Platform("redis_team"),
             chat_id=str(envelope["taskId"]),
@@ -1272,7 +1475,8 @@ async def _standalone_send(
         return {"error": "Redis Team standalone send: CLAWMANAGER_TEAM_* env is incomplete"}
     target = chat_id or settings.member_id
     payload = {
-        "v": SCHEMA_VERSION,
+        "v": WIRE_SCHEMA_VERSION,
+        "protocolVersion": PROTOCOL_VERSION,
         "messageId": f"msg_{uuid.uuid4().hex}",
         "teamId": settings.team_id,
         "from": settings.member_id,
@@ -1313,6 +1517,9 @@ def register(ctx) -> None:
                     "text": {"type": "string", "description": "Task or message text"},
                     "intent": {"type": "string"},
                     "taskId": {"type": "string"},
+                    "workId": {"type": "string", "description": "Stable business work item ID within the root task"},
+                    "assignmentId": {"type": "string"},
+                    "dependsOn": {"type": "array", "items": {"type": "string"}},
                     "title": {"type": "string"},
                     "contextRefs": {"type": "array", "items": {"type": "string"}},
                     "ttlSeconds": {"type": "integer"},
@@ -1357,9 +1564,12 @@ def register(ctx) -> None:
                 "required": ["taskId", "status"],
                 "properties": {
                     "taskId": {"type": "string"},
-                    "status": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["idle", "busy", "running", "blocked", "waiting_review", "waiting_completion"],
+                    },
                     "summary": {"type": "string"},
-                    "progress": {"type": "number"},
+                    "progress": {"type": "number", "minimum": 0, "maximum": 99},
                     "artifactRefs": {"type": "array", "items": {"type": "string"}},
                 },
             },
@@ -1382,10 +1592,11 @@ def register(ctx) -> None:
                 "required": ["taskId", "status", "summary"],
                 "properties": {
                     "taskId": {"type": "string"},
-                    "status": {"type": "string"},
+                    "status": {"type": "string", "enum": ["succeeded", "failed", "cancelled"]},
                     "summary": {"type": "string"},
                     "resultMarkdown": {"type": "string"},
                     "artifactRefs": {"type": "array", "items": {"type": "string"}},
+                    "completionId": {"type": "string"},
                 },
             },
         },

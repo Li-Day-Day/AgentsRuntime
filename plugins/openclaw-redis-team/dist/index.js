@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -13,7 +13,9 @@ const DEFAULT_GROUP = "team-members";
 const DEFAULT_EMBEDDED_TIMEOUT_SECONDS = 1800;
 const STATUS_INTERVAL_MS = 15000;
 const READ_BLOCK_MS = 15000;
-const SCHEMA_VERSION = 1;
+const WIRE_SCHEMA_VERSION = 1;
+const PROTOCOL_VERSION = 2;
+const COMPLETION_SOURCE = "team_complete_task";
 const SYSTEM_REPLY_TARGETS = new Set([
   "clawmanager",
   "manager",
@@ -44,6 +46,20 @@ function intFrom(value, fallback) {
 function safeName(value) {
   return String(value || "unknown").replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 160);
 }
+function stableAssignmentId(cfg, params) {
+  const target = safeName(params?.to || "member");
+  const seed = [
+    cfg?.teamId || "",
+    cfg?.memberId || "",
+    params?.rootTaskId || "",
+    params?.taskId || "",
+    params?.to || "",
+    params?.title || "",
+    params?.text || "",
+  ].join("\n");
+  const digest = createHash("sha256").update(seed).digest("hex").slice(0, 12);
+  return `assignment-${target}-${digest}`;
+}
 function taskIdAliases(value) {
   const raw = trim(value);
   if (!raw) return [];
@@ -67,6 +83,12 @@ function nowIso() {
 }
 function redisClientName(cfg, purpose) {
   return ["redis-team", safeName(cfg.teamId), safeName(cfg.memberId), purpose].join(":").slice(0, 512);
+}
+function completionIdFor(cfg, taskId) {
+  return ["completion", safeName(cfg.teamId), safeName(taskId), safeName(cfg.memberId)].join(":");
+}
+function completionKey(cfg, completionId) {
+  return keyPrefix(cfg) + ":completions:" + safeName(completionId);
 }
 function deriveTeamIdFromKey(value) {
   const raw = trim(value);
@@ -351,6 +373,42 @@ async function writeJson(file, value) {
   await fs.rename(tmp, file);
 }
 
+async function writeText(file, value) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const tmp = file + "." + process.pid + "." + Date.now() + "." + randomUUID() + ".tmp";
+  await fs.writeFile(tmp, value, "utf8");
+  await fs.rename(tmp, file);
+}
+
+function canonicalArtifactRef(cfg, file) {
+  const relative = path.relative(path.resolve(cfg.sharedDir), path.resolve(file));
+  if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
+    throw new Error("artifact path escaped Redis Team shared directory: " + file);
+  }
+  return "/team/" + relative.split(path.sep).join("/");
+}
+
+async function validateArtifactRefs(cfg, refs) {
+  const root = path.resolve(cfg.sharedDir);
+  const validated = [];
+  for (const raw of Array.isArray(refs) ? refs : []) {
+    const ref = trim(raw);
+    if (!ref) continue;
+    const candidate = ref.startsWith("/team/")
+      ? path.resolve(root, ref.slice("/team/".length))
+      : path.resolve(ref);
+    const relative = path.relative(root, candidate);
+    if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
+      throw new Error("artifact reference escaped Redis Team shared directory: " + ref);
+    }
+    const stat = await fs.stat(candidate);
+    if (!stat.isFile()) throw new Error("artifact reference is not a file: " + ref);
+    const canonical = canonicalArtifactRef(cfg, candidate);
+    if (!validated.includes(canonical)) validated.push(canonical);
+  }
+  return validated;
+}
+
 async function readJson(file) {
   try {
     return JSON.parse(await fs.readFile(file, "utf8"));
@@ -457,7 +515,7 @@ function parseReadGroupResponse(value) {
   return out;
 }
 
-async function xaddJson(redis, stream, event) {
+function eventStreamFields(event) {
   const fields = ["payload", JSON.stringify(event)];
   for (const key of [
     "event",
@@ -488,13 +546,41 @@ async function xaddJson(redis, stream, event) {
       fields.push(key, String(event[key]));
     }
   }
-  await redis.command("XADD", stream, "*", ...fields);
+  return fields;
+}
+
+async function xaddJson(redis, stream, event) {
+  return redis.command("XADD", stream, "*", ...eventStreamFields(event));
+}
+
+async function xaddTerminalOnce(redis, cfg, completionId, event) {
+  const script = [
+    "local existing = redis.call('GET', KEYS[1])",
+    "if existing then return {0, existing} end",
+    "local streamId = redis.call('XADD', KEYS[2], '*', unpack(ARGV))",
+    "redis.call('SET', KEYS[1], streamId)",
+    "return {1, streamId}",
+  ].join("\n");
+  const result = await redis.command(
+    "EVAL",
+    script,
+    2,
+    completionKey(cfg, completionId),
+    eventsKey(cfg),
+    ...eventStreamFields(event),
+  );
+  return {
+    published: Array.isArray(result) ? Number(result[0]) === 1 : false,
+    streamId: Array.isArray(result) ? String(result[1] || "") : "",
+  };
 }
 
 function eventFor(cfg, event, extra = {}) {
   return Object.assign(
     {
-      v: SCHEMA_VERSION,
+      v: WIRE_SCHEMA_VERSION,
+      protocolVersion: PROTOCOL_VERSION,
+      eventId: "evt_" + randomUUID(),
       event,
       type: event,
       teamId: cfg.teamId,
@@ -520,6 +606,11 @@ function taskEvent(cfg, event, envelope, extra = {}) {
         message_id: envelope.messageId,
         taskId: envelope.taskId,
         task_id: envelope.taskId,
+        rootTaskId: envelope.rootTaskId || envelope.taskId,
+        rootMessageId: envelope.rootMessageId || envelope.messageId,
+        workId: envelope.workId || envelope.assignmentId,
+        assignmentId: envelope.assignmentId || envelope.workId,
+        dependsOn: envelope.dependsOn || [],
         availability: "busy",
         runtimeStatus: "running",
         summary: event,
@@ -533,9 +624,15 @@ function taskEvent(cfg, event, envelope, extra = {}) {
 function normalizeEnvelope(raw) {
   if (!raw || typeof raw !== "object") return null;
   const envelope = {
-    schemaVersion: raw.v || raw.schemaVersion || SCHEMA_VERSION,
+    schemaVersion: raw.v || raw.schemaVersion || WIRE_SCHEMA_VERSION,
+    protocolVersion: raw.protocolVersion || raw.protocol_version || raw.v || WIRE_SCHEMA_VERSION,
     messageId: raw.messageId || raw.message_id || raw.id || ("msg_" + randomUUID()),
     taskId: raw.taskId || raw.task_id || ("task_" + randomUUID()),
+    rootTaskId: raw.rootTaskId || raw.root_task_id || raw.taskId || raw.task_id,
+    rootMessageId: raw.rootMessageId || raw.root_message_id || raw.messageId || raw.message_id,
+    workId: raw.workId || raw.work_id || raw.assignmentId || raw.assignment_id,
+    assignmentId: raw.assignmentId || raw.assignment_id || raw.workId || raw.work_id,
+    dependsOn: Array.isArray(raw.dependsOn) ? raw.dependsOn.filter(Boolean) : [],
     teamId: raw.teamId || raw.team_id,
     from: raw.from || raw.sender || raw.memberId || raw.member_id || "unknown",
     to: raw.to || raw.recipient || "",
@@ -549,23 +646,17 @@ function normalizeEnvelope(raw) {
     contextRefs: Array.isArray(raw.contextRefs) ? raw.contextRefs.filter(Boolean) : [],
     artifacts: raw.artifacts || [],
     metadata: raw.metadata || {},
+    requiresCompletion: raw.requiresCompletion !== false,
+    completionTool: raw.completionTool || "team_complete_task",
+    resultSink: raw.resultSink || {},
     idempotencyKey: raw.idempotencyKey || raw.messageId,
   };
   return envelope;
 }
 
-const seenMessageIds = new Set();
-function dedup(key) {
-  if (seenMessageIds.has(key)) return true;
-  seenMessageIds.add(key);
-  if (seenMessageIds.size > 10000) {
-    const iter = seenMessageIds.values();
-    for (let i = 0; i < 1000; i++) {
-      const v = iter.next();
-      if (!v.done) seenMessageIds.delete(v.value);
-    }
-  }
-  return false;
+function processedMessageKey(cfg, key) {
+  const digest = createHash("sha256").update(String(key || "")).digest("hex");
+  return `claw:team:${cfg.teamId}:processed:${cfg.memberId}:${digest}`;
 }
 
 // ============ Runtime Operations ============
@@ -609,18 +700,6 @@ function createRuntime(api) {
     return "";
   }
 
-  function textFromDispatchResult(activeResult) {
-    return firstText(
-      activeResult?.outbound?.message?.text,
-      activeResult?.result?.text,
-      activeResult?.result?.message?.text,
-      activeResult?.result?.response?.text,
-      activeResult?.result?.content,
-      activeResult?.result?.result,
-      activeResult?.result?.resultMarkdown,
-    );
-  }
-
   function summarizeText(text, fallback = "Redis Team task completed") {
     const firstLine = String(text || "")
       .split(/\r?\n/)
@@ -629,13 +708,14 @@ function createRuntime(api) {
     return (firstLine || fallback).slice(0, 160);
   }
 
-  async function completeActiveTaskFromText(text, meta = {}) {
+  async function completeActiveTask(text, meta = {}) {
     const cfg = meta.cfg || readChannelConfig(runtimeApi.config || {}, meta.accountId || "default");
     const envelope = meta.envelope || activeEnvelope;
     const result = firstText(text, meta.resultMarkdown, meta.result, meta.summary);
     if (!envelope || !taskMatchesEnvelope(envelope, meta.taskId || envelope.taskId) || !result) return false;
     const taskId = trim(meta.taskId) || envelope.taskId;
-    const completionMessageId = trim(meta.messageId);
+    const completionId = trim(meta.completionId) || completionIdFor(cfg, taskId);
+    const completionMessageId = trim(meta.messageId) || completionId;
     const messageId = trim(meta.eventMessageId) || envelope.messageId || completionMessageId || ("msg_" + randomUUID());
     const inReplyTo = trim(meta.inReplyTo) || envelope.messageId;
     const resultMarkdown = typeof meta.resultMarkdown === "string" && meta.resultMarkdown.trim()
@@ -653,12 +733,15 @@ function createRuntime(api) {
       lastSummary: summary,
       artifactRefs,
     });
-    await withRedis(cfg, meta.redis, async (redis) => {
-      await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "task_completed", envelope, {
+    const terminal = await withRedis(cfg, meta.redis, async (redis) => {
+      return xaddTerminalOnce(redis, cfg, completionId, taskEvent(cfg, "task_completed", envelope, {
         messageId,
         message_id: messageId,
         completionMessageId: completionMessageId || undefined,
         completion_message_id: completionMessageId || undefined,
+        completionId,
+        completionSource: COMPLETION_SOURCE,
+        explicitCompletion: true,
         sourceMessageId: envelope.messageId,
         source_message_id: envelope.messageId,
         taskId,
@@ -676,7 +759,7 @@ function createRuntime(api) {
       }));
     });
     if (!activeEnvelope || taskMatchesEnvelope(activeEnvelope, taskId)) activeTaskCompleted = true;
-    return true;
+    return terminal?.published !== false;
   }
 
   async function failActiveTask(error, meta = {}) {
@@ -687,6 +770,25 @@ function createRuntime(api) {
     const taskId = trim(meta.taskId) || envelope?.taskId || "";
     const inReplyTo = trim(meta.inReplyTo) || envelope?.messageId || undefined;
     const summary = trim(meta.summary) || errorText;
+    const completionSource = trim(meta.completionSource) || "runtime_error";
+    const completionId = trim(meta.completionId) || completionIdFor(cfg, taskId || messageId);
+    await ensureDirs(cfg);
+    let artifactRefs = await validateArtifactRefs(cfg, meta.artifactRefs);
+    let resultMarkdown = trim(meta.resultMarkdown) || summary;
+    if (taskId && artifactRefs.length === 0) {
+      const resultDir = path.join(cfg.sharedDir, "results", safeName(taskId));
+      const resultMarkdownPath = path.join(resultDir, "result.md");
+      await writeText(resultMarkdownPath, resultMarkdown);
+      artifactRefs = [canonicalArtifactRef(cfg, resultMarkdownPath)];
+      await writeJson(path.join(resultDir, "result.json"), {
+        taskId,
+        status: "failed",
+        summary,
+        resultMarkdown,
+        artifactRefs,
+        completedAt: nowIso(),
+      });
+    }
     const base = {
       messageId,
       message_id: messageId,
@@ -700,11 +802,15 @@ function createRuntime(api) {
       availability: "blocked",
       runtimeStatus: "failed",
       status: "failed",
+      completionId,
+      completionSource,
+      explicitCompletion: completionSource === COMPLETION_SOURCE,
       summary,
       error: errorText,
+      resultMarkdown,
+      artifactRefs,
     };
 
-    await ensureDirs(cfg);
     if (envelope) {
       await writeLocalStatus(cfg, {
         availability: "blocked",
@@ -722,9 +828,10 @@ function createRuntime(api) {
           envelope ? taskEvent(cfg, "message_failed", envelope, base) : eventFor(cfg, "message_failed", base),
         );
       }
-      await xaddJson(
+      await xaddTerminalOnce(
         redis,
-        eventsKey(cfg),
+        cfg,
+        completionId,
         envelope ? taskEvent(cfg, "task_failed", envelope, base) : eventFor(cfg, "task_failed", base),
       );
     });
@@ -750,23 +857,41 @@ function createRuntime(api) {
       activeTaskMatches(inferredTaskId)
         ? activeEnvelope
         : await readTaskEnvelope(cfg, inferredTaskId);
+    const taskId = requestedTaskId || inferredEnvelope?.taskId || activeEnvelope?.taskId || "task_" + randomUUID();
+    const rootTaskId = inferredEnvelope?.rootTaskId || inferredEnvelope?.taskId || activeEnvelope?.rootTaskId || activeEnvelope?.taskId || taskId;
+    const title = trim(params.title) || "Team Message";
+    const text = trim(params.text) || trim(params.prompt) || "";
+    const explicitWorkId = trim(params.workId) || trim(params.assignmentId);
+    const workId = explicitWorkId || stableAssignmentId(cfg, {
+      taskId,
+      rootTaskId,
+      to: target.to,
+      title,
+      text,
+    });
     const message = {
-      v: SCHEMA_VERSION,
+      v: WIRE_SCHEMA_VERSION,
+      protocolVersion: PROTOCOL_VERSION,
       messageId: "msg_" + randomUUID(),
       teamId: cfg.teamId,
       from: cfg.memberId,
       to: target.to,
       originalTo: target.originalTo,
       intent: trim(params.intent) || "send",
-      taskId: requestedTaskId || inferredEnvelope?.taskId || activeEnvelope?.taskId || "task_" + randomUUID(),
+      taskId,
+      rootTaskId,
+      rootMessageId: inferredEnvelope?.rootMessageId || inferredEnvelope?.messageId || activeEnvelope?.rootMessageId || activeEnvelope?.messageId,
+      workId,
+      assignmentId: trim(params.assignmentId) || trim(params.workId) || workId,
+      dependsOn: Array.isArray(params.dependsOn) ? params.dependsOn.filter(Boolean) : [],
       conversationId:
         inferredEnvelope?.conversationId ||
         inferredEnvelope?.taskId ||
         activeEnvelope?.conversationId ||
         activeEnvelope?.taskId ||
         undefined,
-      title: trim(params.title) || "Team Message",
-      text: trim(params.text) || trim(params.prompt) || "",
+      title,
+      text,
       contextRefs: Array.isArray(params.contextRefs) ? params.contextRefs.filter(Boolean) : [],
       ttlSeconds: typeof params.ttlSeconds === "number" ? params.ttlSeconds : 3600,
       priority: trim(params.priority) || "normal",
@@ -802,39 +927,11 @@ function createRuntime(api) {
         text: message.text,
         summary: message.title,
       };
-      const completesActiveTask =
-        !!inferredEnvelope &&
-        taskMatchesEnvelope(inferredEnvelope, message.taskId) &&
-        isActiveCompletionTarget(target.originalTo, cfg);
-      const eventName = completesActiveTask || target.system ? "reply" : "outbound";
+      const eventName = target.system || target.group ? "reply" : "outbound";
       await xaddJson(redis, eventsKey(cfg), eventFor(cfg, eventName, Object.assign({}, outbound, {
         to: target.originalTo,
         inReplyTo: inferredEnvelope?.messageId || activeEnvelope?.messageId,
       })));
-      if (completesActiveTask) {
-        if (message.text) {
-          await completeActiveTaskFromText(message.text, {
-            cfg,
-            redis,
-            envelope: inferredEnvelope,
-            messageId: message.messageId,
-            taskId: message.taskId,
-            inReplyTo: inferredEnvelope?.messageId,
-            summary: message.title,
-            to: target.originalTo,
-          });
-        } else {
-          await failActiveTask("completion target received empty text", {
-            cfg,
-            redis,
-            envelope: inferredEnvelope,
-            eventName: "message_failed",
-            messageId: message.messageId,
-            taskId: message.taskId,
-            to: target.originalTo,
-          });
-        }
-      }
       lastOutbound = { message, target };
     } finally {
       redis.close();
@@ -891,11 +988,23 @@ function createRuntime(api) {
 
     async updateProgress(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
+      const taskId = trim(params?.taskId);
+      const progressStatus = trim(params?.status).toLowerCase();
+      if (!taskId || !progressStatus) {
+        throw new Error("team_update_progress requires taskId and status");
+      }
+      if (!["idle", "busy", "running", "blocked", "waiting_review", "waiting_completion"].includes(progressStatus)) {
+        throw new Error("terminal status must use team_complete_task");
+      }
+      const progress = typeof params.progress === "number"
+        ? Math.min(99, Math.max(0, params.progress))
+        : undefined;
+      params = Object.assign({}, params, { taskId, status: progressStatus, progress });
       await ensureDirs(cfg);
       const status = await writeLocalStatus(cfg, {
-        availability: params.status === "idle" ? "idle" : params.status,
-        currentTaskId: params.taskId,
-        progress: typeof params.progress === "number" ? params.progress : undefined,
+        availability: progressStatus === "idle" ? "idle" : progressStatus,
+        currentTaskId: taskId,
+        progress,
         lastSummary: params.summary || params.status,
         artifactRefs: Array.isArray(params.artifactRefs) ? params.artifactRefs : [],
       });
@@ -904,7 +1013,7 @@ function createRuntime(api) {
         const redis = new RedisClient(cfg.redisUrl);
         await redis.connect();
         try {
-          await xaddJson(redis, eventsKey(cfg), eventFor(cfg, "progress", params));
+          await xaddJson(redis, eventsKey(cfg), eventFor(cfg, "task_progress", params));
         } finally {
           redis.close();
         }
@@ -914,17 +1023,27 @@ function createRuntime(api) {
 
     async completeTask(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
+      const taskId = trim(params?.taskId);
+      const completionStatus = trim(params?.status).toLowerCase();
+      const summary = trim(params?.summary);
+      if (!taskId || !completionStatus || !summary) {
+        throw new Error("team_complete_task requires taskId, status and summary");
+      }
+      if (!["succeeded", "failed", "cancelled"].includes(completionStatus)) {
+        throw new Error("team_complete_task status must be succeeded, failed or cancelled");
+      }
+      params = Object.assign({}, params, { taskId, status: completionStatus, summary });
       await ensureDirs(cfg);
       const resultDir = path.join(cfg.sharedDir, "results", safeName(params.taskId));
       await fs.mkdir(resultDir, { recursive: true });
-      const artifactRefs = Array.isArray(params.artifactRefs) ? params.artifactRefs.slice() : [];
-      if (params.resultMarkdown) {
-        await fs.writeFile(path.join(resultDir, "result.md"), params.resultMarkdown, "utf8");
-        artifactRefs.push(path.join(resultDir, "result.md"));
-      }
+      const artifactRefs = await validateArtifactRefs(cfg, params.artifactRefs);
+      const resultMarkdown = trim(params.resultMarkdown) || params.summary;
+      const resultMarkdownPath = path.join(resultDir, "result.md");
+      await writeText(resultMarkdownPath, resultMarkdown);
+      artifactRefs.push(canonicalArtifactRef(cfg, resultMarkdownPath));
       await writeJson(
         path.join(resultDir, "result.json"),
-        Object.assign({}, params, { artifactRefs, completedAt: nowIso() }),
+        Object.assign({}, params, { resultMarkdown, artifactRefs, completedAt: nowIso() }),
       );
       const runtimeStatus = params.status === "succeeded" ? "succeeded" : "failed";
       const status = await writeLocalStatus(cfg, {
@@ -940,19 +1059,19 @@ function createRuntime(api) {
         const redis = new RedisClient(cfg.redisUrl);
         await redis.connect();
         try {
-          const eventName = params.status === "succeeded" ? "task_completed" : "task_failed";
           const terminalEnvelope = activeTaskMatches(params.taskId)
             ? activeEnvelope
             : await readTaskEnvelope(cfg, params.taskId);
           if (terminalEnvelope && taskMatchesEnvelope(terminalEnvelope, params.taskId)) {
             if (params.status === "succeeded") {
-              await completeActiveTaskFromText(params.resultMarkdown || params.summary, {
+              await completeActiveTask(resultMarkdown, {
                 cfg,
                 redis,
                 envelope: terminalEnvelope,
                 taskId: params.taskId,
+                completionId: params.completionId,
                 summary: params.summary,
-                resultMarkdown: params.resultMarkdown || params.summary,
+                resultMarkdown,
                 artifactRefs,
               });
             } else {
@@ -961,15 +1080,15 @@ function createRuntime(api) {
                 redis,
                 envelope: terminalEnvelope,
                 taskId: params.taskId,
+                completionId: params.completionId,
+                completionSource: COMPLETION_SOURCE,
                 summary: params.summary,
+                resultMarkdown,
+                artifactRefs,
               });
             }
           } else {
-            await xaddJson(redis, eventsKey(cfg), eventFor(cfg, eventName, Object.assign({}, params, {
-              artifactRefs,
-              availability: params.status === "succeeded" ? "idle" : "blocked",
-              runtimeStatus,
-            })));
+            throw new Error("team_complete_task could not resolve the active task envelope: " + params.taskId);
           }
         } finally {
           redis.close();
@@ -978,15 +1097,14 @@ function createRuntime(api) {
       return { status, artifactRefs };
     },
 
-    completeActiveTaskFromText,
+    completeActiveTask,
     failActiveTask,
     isTaskTerminal,
-    textFromDispatchResult,
   };
 }
 
 // ============ Consumer Logic ============
-async function startConsumer(cfg, onMessage, log) {
+async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
   if (!cfg.enabled) {
     log.info("redis-team: disabled; skipping consumer");
     return null;
@@ -1072,7 +1190,8 @@ async function startConsumer(cfg, onMessage, log) {
           try {
             const envelope = normalizeEnvelope(msg);
             if (!envelope) continue;
-            if (dedup(envelope.idempotencyKey)) {
+            const processedKey = processedMessageKey(cfg, envelope.idempotencyKey);
+            if (await redis.command("GET", processedKey)) {
               log.info("redis-team: dedup skipped " + envelope.messageId);
               await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
               continue;
@@ -1088,21 +1207,17 @@ async function startConsumer(cfg, onMessage, log) {
               }),
             );
             await onMessage(envelope);
+            await redis.command("SET", processedKey, envelope.messageId, "EX", 604800);
             await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
           } catch (err) {
             const error = err instanceof Error ? err.message : String(err);
             log.error("redis-team: message processing failed: " + error);
             const envelope = normalizeEnvelope(msg) || {};
-            await xaddJson(
-              redis,
-              eventsKey(cfg),
-              taskEvent(cfg, "task_failed", envelope, {
-                availability: "blocked",
-                runtimeStatus: "failed",
-                summary: error,
-                error,
-              }),
-            );
+            if (typeof onProcessingFailure === "function") {
+              await onProcessingFailure(envelope, error);
+            } else {
+              log.warn("redis-team: no structured failure handler is registered; leaving task non-terminal");
+            }
             await xaddJson(redis, dlqKey(cfg), eventFor(cfg, "dlq", { redisId: msg.redisId, error, message: msg }));
             try {
               await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
@@ -1149,6 +1264,9 @@ const teamSendParameters = {
     text: { type: "string", description: "Message content" },
     intent: { type: "string", description: "Message intent" },
     taskId: { type: "string" },
+    workId: { type: "string", description: "Stable business work item ID within the root task" },
+    assignmentId: { type: "string", description: "Stable assignment ID; defaults to workId" },
+    dependsOn: { type: "array", items: { type: "string" } },
     title: { type: "string" },
     contextRefs: { type: "array", items: { type: "string" } },
     ttlSeconds: { type: "number", minimum: 1 },
@@ -1173,9 +1291,9 @@ const progressParameters = {
     taskId: { type: "string" },
     status: {
       type: "string",
-      enum: ["idle", "busy", "blocked", "waiting_review", "succeeded", "failed"],
+      enum: ["idle", "busy", "running", "blocked", "waiting_review", "waiting_completion"],
     },
-    progress: { type: "number", minimum: 0, maximum: 100 },
+    progress: { type: "number", minimum: 0, maximum: 99 },
     summary: { type: "string" },
     artifactRefs: { type: "array", items: { type: "string" } },
   },
@@ -1187,10 +1305,11 @@ const completeParameters = {
   required: ["taskId", "status", "summary"],
   properties: {
     taskId: { type: "string" },
-    status: { type: "string", enum: ["succeeded", "failed", "blocked"] },
+    status: { type: "string", enum: ["succeeded", "failed", "cancelled"] },
     summary: { type: "string" },
     resultMarkdown: { type: "string" },
     artifactRefs: { type: "array", items: { type: "string" } },
+    completionId: { type: "string" },
   },
 };
 
@@ -1537,7 +1656,6 @@ export default definePluginEntry({
                     summary: "Redis Team task started",
                   });
 
-                  let deliveredReply = false;
                   let dispatchFailed = false;
                   const activeResult = await runtime.withActiveEnvelope(envelope, async () => {
                     await dispatchInboundDirectDmWithRuntime({
@@ -1574,9 +1692,7 @@ export default definePluginEntry({
                       ],
                     },
                     deliver: async (payload) => {
-                      deliveredReply = true;
                       ctx.log?.info?.("redis-team: delivering reply for " + envelope.messageId);
-                      const replyText = payload?.text || "";
                       const replyMessageId = "msg_" + randomUUID();
                       const r = new RedisClient(cfg.redisUrl);
                       await r.connect();
@@ -1591,27 +1707,6 @@ export default definePluginEntry({
                           mediaUrls: payload?.mediaUrls,
                           mediaUrl: payload?.mediaUrl,
                         }));
-                        if (replyText) {
-                          await runtime.completeActiveTaskFromText(replyText, {
-                            cfg,
-                            redis: r,
-                            envelope,
-                            messageId: replyMessageId,
-                            taskId: envelope.taskId,
-                            inReplyTo: envelope.messageId,
-                            summary: "Redis Team task completed",
-                          });
-                        } else {
-                          await runtime.failActiveTask("dispatch delivered an empty reply", {
-                            cfg,
-                            redis: r,
-                            envelope,
-                            eventName: "message_failed",
-                            messageId: replyMessageId,
-                            taskId: envelope.taskId,
-                            inReplyTo: envelope.messageId,
-                          });
-                        }
                       } finally {
                         r.close();
                       }
@@ -1644,32 +1739,31 @@ export default definePluginEntry({
                     });
                   });
 
-                  if (!deliveredReply && !dispatchFailed && !activeResult?.completed) {
+                  if (!dispatchFailed && !activeResult?.completed) {
                     if (await runtime.isTaskTerminal(cfg, envelope)) {
                       ctx.log?.info?.(
                         "redis-team: task " + envelope.taskId + " already terminal after dispatch",
                       );
                     } else {
-                      const result = runtime.textFromDispatchResult(activeResult);
-                      if (result) {
-                        await runtime.completeActiveTaskFromText(result, {
-                          cfg,
-                          envelope,
-                          taskId: envelope.taskId,
-                          inReplyTo: envelope.messageId,
-                          summary: "Redis Team task completed",
-                        });
-                      } else {
-                        const error = "dispatch finished without reply/completion";
-                        ctx.log?.warn?.(
-                          "redis-team: " + error + " for " + envelope.messageId + "; marking task failed",
-                        );
-                        await runtime.failActiveTask(error, {
-                          cfg,
-                          envelope,
-                          taskId: envelope.taskId,
-                          summary: "Redis Team task failed",
-                        });
+                      const summary = "Agent turn finished; waiting for explicit team_complete_task";
+                      await writeLocalStatus(cfg, {
+                        availability: "waiting_completion",
+                        runtimeStatus: "waiting_completion",
+                        currentTaskId: envelope.taskId,
+                        lastSummary: summary,
+                      });
+                      const r = new RedisClient(cfg.redisUrl);
+                      await r.connect();
+                      try {
+                        await xaddJson(r, eventsKey(cfg), taskEvent(cfg, "task_progress", envelope, {
+                          status: "waiting_completion",
+                          availability: "waiting_completion",
+                          runtimeStatus: "waiting_completion",
+                          summary,
+                          completionRequired: true,
+                        }));
+                      } finally {
+                        r.close();
                       }
                     }
                   }
@@ -1680,6 +1774,14 @@ export default definePluginEntry({
                     connected: true,
                     lastConnectedAt: Date.now(),
                     statusState: "online",
+                  });
+                },
+                async (envelope, error) => {
+                  await runtime.failActiveTask(error, {
+                    cfg,
+                    envelope,
+                    taskId: envelope?.taskId,
+                    summary: "Redis Team message processing failed",
                   });
                 },
                 ctx.log || console,

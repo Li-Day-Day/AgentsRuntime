@@ -43,9 +43,25 @@ claw:team:<teamId>:presence
 claw:team:<teamId>:dlq
 ```
 
+## Completion protocol
+
+Redis Team protocol v2 retains the original `v: 1` wire envelope and adds
+`protocolVersion: 2`, so older ClawManager releases can continue consuming the
+same stream. A successful Hermes processing turn publishes
+`task_progress(status=waiting_completion)` and never closes the task by itself.
+Only `team_complete_task` publishes a successful `task_completed`; runtime
+errors publish structured `task_failed` events.
+
+Explicit completion atomically creates both `result.json` and `result.md` under
+`results/<taskId>/`, includes deterministic completion metadata, and reports
+canonical `/team/...` artifact references. This gives newer ClawManager
+versions strict, idempotent completion without removing fields used by older
+versions.
+
 ## AgentsRuntime packaging
 
-`plugins/hermes-redis-team` is the canonical source. The Hermes image currently
-builds with `hermes/` as its Docker context, so `hermes/vendor-plugins/redis_team`
-is a build-context mirror of this directory.
+`plugins/hermes-redis-team` is the canonical source and is copied directly by
+the repository-root Docker build. `hermes/vendor-plugins/redis_team` is retained
+as a compatibility mirror for older external build scripts, but is not the
+authoritative image input.
 
