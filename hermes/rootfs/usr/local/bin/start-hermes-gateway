@@ -98,7 +98,7 @@ if [ "$(id -u)" = "0" ]; then
         fi
     fi
     if command -v s6-setuidgid >/dev/null 2>&1 && id abc >/dev/null 2>&1; then
-        exec s6-setuidgid abc /bin/bash -lc 'cd /config && exec hermes gateway'
+        exec s6-setuidgid abc /bin/bash -lc 'cd /config && exec hermes gateway run --accept-hooks --no-supervise'
     fi
 fi
 

@@ -116,6 +116,7 @@ class RedisTeamSettings:
     member_id: str
     role: str = "member"
     shared_dir: str = DEFAULT_SHARED_DIR
+    team_config_path: str = ""
     auto_run: bool = True
     consumer_group: str = DEFAULT_CONSUMER_GROUP
     embedded_timeout_seconds: int = 1800
@@ -164,6 +165,7 @@ def load_settings(config: PlatformConfig | None = None) -> RedisTeamSettings:
         role=_trim(pick("role", "CLAWMANAGER_TEAM_ROLE", "member")) or "member",
         shared_dir=_trim(pick("shared_dir", "CLAWMANAGER_TEAM_SHARED_DIR", DEFAULT_SHARED_DIR, "sharedDir"))
         or DEFAULT_SHARED_DIR,
+        team_config_path=_trim(pick("team_config_path", "CLAWMANAGER_TEAM_CONFIG_PATH", "", "teamConfigPath")),
         auto_run=_truthy(pick("auto_run", "CLAWMANAGER_TEAM_AUTORUN", True, "autoRun"), True),
         consumer_group=_trim(pick("consumer_group", "CLAWMANAGER_TEAM_CONSUMER_GROUP", DEFAULT_CONSUMER_GROUP, "consumerGroup"))
         or DEFAULT_CONSUMER_GROUP,
@@ -241,7 +243,125 @@ def write_local_status(settings: RedisTeamSettings, patch: Optional[dict[str, An
     return status
 
 
-def read_team_statuses(settings: RedisTeamSettings, member_id: str = "") -> Any:
+def _team_config_candidates(settings: RedisTeamSettings) -> list[Path]:
+    candidates = [
+        _trim(settings.team_config_path),
+        _trim(os.getenv("CLAWMANAGER_TEAM_CONFIG_PATH")),
+        "/etc/clawmanager/team/team.json",
+        str(settings.shared_path / "team.json"),
+    ]
+    seen: set[str] = set()
+    out: list[Path] = []
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        out.append(Path(candidate))
+    return out
+
+
+def _normalize_roster_member(raw: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    member_id = _trim(raw.get("memberId") or raw.get("memberID") or raw.get("memberKey") or raw.get("id") or raw.get("key"))
+    if not member_id:
+        return None
+    role = _trim(raw.get("role") or raw.get("effectiveRole") or raw.get("profileName") or "member") or "member"
+    aliases = [member_id, _safe_name(member_id)]
+    for value in (raw.get("displayName"), raw.get("name")):
+        text = _trim(value)
+        if text:
+            aliases.extend([text, _safe_name(text)])
+    return {
+        "teamId": _trim(raw.get("teamId")),
+        "memberId": member_id,
+        "role": role,
+        "effectiveRole": _trim(raw.get("effectiveRole")),
+        "profileKey": _trim(raw.get("profileKey")),
+        "profileName": _trim(raw.get("profileName")),
+        "displayName": _trim(raw.get("displayName") or raw.get("name")),
+        "runtime": _trim(raw.get("runtime") or raw.get("runtimeType")),
+        "runtimeType": _trim(raw.get("runtimeType") or raw.get("runtime")),
+        "instanceMode": _trim(raw.get("instanceMode")),
+        "isLeader": bool(raw.get("isLeader")),
+        "description": _trim(raw.get("description")),
+        "aliases": sorted({alias for alias in aliases if alias}),
+    }
+
+
+def read_team_roster(settings: RedisTeamSettings) -> dict[str, Any]:
+    for path in _team_config_candidates(settings):
+        raw = _read_json(path)
+        members_raw = []
+        if isinstance(raw, dict):
+            if isinstance(raw.get("members"), list):
+                members_raw = raw["members"]
+            elif isinstance(raw.get("team"), dict) and isinstance(raw["team"].get("members"), list):
+                members_raw = raw["team"]["members"]
+            elif isinstance(raw.get("roster"), dict) and isinstance(raw["roster"].get("members"), list):
+                members_raw = raw["roster"]["members"]
+        members = [member for member in (_normalize_roster_member(item) for item in members_raw) if member]
+        if members:
+            return {"source": str(path), "raw": raw, "members": members}
+    env_json = _trim(os.getenv("CLAWMANAGER_TEAM_CONFIG_JSON"))
+    if env_json:
+        try:
+            raw = json.loads(env_json)
+        except Exception:
+            raw = None
+        members_raw = raw.get("members", []) if isinstance(raw, dict) and isinstance(raw.get("members"), list) else []
+        members = [member for member in (_normalize_roster_member(item) for item in members_raw) if member]
+        if members:
+            return {"source": "CLAWMANAGER_TEAM_CONFIG_JSON", "raw": raw, "members": members}
+    return {"source": "", "raw": None, "members": []}
+
+
+def _status_matches_target(status: dict[str, Any], target: str) -> bool:
+    raw = _trim(target)
+    safe = _safe_name(raw)
+    for value in (
+        status.get("memberId"),
+        status.get("memberID"),
+        status.get("memberKey"),
+        status.get("displayName"),
+        status.get("name"),
+    ):
+        text = _trim(value)
+        if text and (text == raw or _safe_name(text) == raw or _safe_name(text) == safe):
+            return True
+    return False
+
+
+def _roster_member_matches(member: dict[str, Any], target: str) -> bool:
+    raw = _trim(target)
+    safe = _safe_name(raw)
+    aliases = member.get("aliases") if isinstance(member.get("aliases"), list) else []
+    return raw in aliases or safe in aliases
+
+
+def _roster_status_stub(settings: RedisTeamSettings, member: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "teamId": settings.team_id or member.get("teamId"),
+        "memberId": member.get("memberId"),
+        "role": member.get("effectiveRole") or member.get("role"),
+        "rosterRole": member.get("role"),
+        "effectiveRole": member.get("effectiveRole") or None,
+        "profileKey": member.get("profileKey") or None,
+        "profileName": member.get("profileName") or None,
+        "displayName": member.get("displayName") or None,
+        "runtime": member.get("runtime") or member.get("runtimeType") or None,
+        "runtimeType": member.get("runtimeType") or member.get("runtime") or None,
+        "instanceMode": member.get("instanceMode") or None,
+        "isLeader": bool(member.get("isLeader")),
+        "description": member.get("description") or None,
+        "liveness": "unknown",
+        "runtimeStatus": "unknown",
+        "availability": "unknown",
+        "lastSeenAt": "",
+    }
+
+
+def _read_raw_team_statuses(settings: RedisTeamSettings, member_id: str = "") -> Any:
     ensure_team_dirs(settings)
     status_dir = settings.shared_path / "status"
     if member_id:
@@ -253,6 +373,62 @@ def read_team_statuses(settings: RedisTeamSettings, member_id: str = "") -> Any:
             statuses.append(value)
     statuses.sort(key=lambda item: str(item.get("memberId", "")))
     return statuses
+
+
+def read_team_statuses(settings: RedisTeamSettings, member_id: str = "") -> Any:
+    raw_statuses = _read_raw_team_statuses(settings)
+    roster = read_team_roster(settings)
+    members = roster.get("members") if isinstance(roster.get("members"), list) else []
+    if member_id:
+        for status in raw_statuses if isinstance(raw_statuses, list) else []:
+            if isinstance(status, dict) and _status_matches_target(status, member_id):
+                return status
+        for member in members:
+            if _roster_member_matches(member, member_id):
+                return _roster_status_stub(settings, member)
+        return None
+    if not members:
+        return raw_statuses
+    merged: list[dict[str, Any]] = []
+    for member in members:
+        status = next(
+            (
+                item
+                for item in raw_statuses
+                if isinstance(item, dict) and _status_matches_target(item, str(member.get("memberId") or ""))
+            ),
+            None,
+        )
+        stub = _roster_status_stub(settings, member)
+        if status:
+            stub.update(status)
+        merged.append(stub)
+    known = {_safe_name(str(item.get("memberId") or "")) for item in merged}
+    for status in raw_statuses:
+        if isinstance(status, dict) and _safe_name(str(status.get("memberId") or "")) not in known:
+            merged.append(status)
+    merged.sort(key=lambda item: str(item.get("memberId", "")))
+    return merged
+
+
+def _resolve_team_target_error(settings: RedisTeamSettings, to: str) -> str:
+    target = _trim(to)
+    if not target:
+        return "to is required"
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,160}", target):
+        return f"unknown Redis Team target: {to}"
+    if target.lower() in {"broadcast", "team", "all"}:
+        return ""
+    if target == settings.member_id or _safe_name(target) == _safe_name(settings.member_id):
+        return ""
+    roster = read_team_roster(settings)
+    members = roster.get("members") if isinstance(roster.get("members"), list) else []
+    if members:
+        return "" if any(_roster_member_matches(member, target) for member in members) else f"unknown Redis Team target: {to}"
+    statuses = _read_raw_team_statuses(settings)
+    if not statuses:
+        return ""
+    return "" if any(isinstance(status, dict) and _status_matches_target(status, target) for status in statuses) else f"unknown Redis Team target: {to}"
 
 
 def write_task_result(
@@ -678,6 +854,29 @@ async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
     redis = AsyncRedisClient(settings.redis_url)
     try:
         await redis.connect()
+        target_error = _resolve_team_target_error(settings, to)
+        if target_error:
+            await xadd_json(
+                redis,
+                events_key(settings),
+                event_for(
+                    settings,
+                    "message_failed",
+                    {
+                        "messageId": message["messageId"],
+                        "taskId": message["taskId"],
+                        "rootTaskId": message["rootTaskId"],
+                        "rootMessageId": message.get("rootMessageId"),
+                        "workId": message.get("workId"),
+                        "assignmentId": message.get("assignmentId"),
+                        "to": to,
+                        "status": "message_failed",
+                        "summary": target_error,
+                        "error": target_error,
+                    },
+                ),
+            )
+            return json.dumps({"ok": False, "sent": message, "failed": True, "error": target_error}, ensure_ascii=False)
         redis_id = await xadd_json(redis, inbox_key(settings, to), message)
         await xadd_json(
             redis,
@@ -791,7 +990,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "Redis Team"
 
-    async def connect(self) -> bool:
+    async def connect(self, is_reconnect: bool = False, **_kwargs: Any) -> bool:
         async with self._lifecycle_lock:
             if not self.settings.enabled:
                 logger.info("Redis Team: disabled")
@@ -851,10 +1050,11 @@ class RedisTeamAdapter(BasePlatformAdapter):
             self._presence_task = asyncio.create_task(self._presence_loop())
             self._consumer_task = asyncio.create_task(self._consumer_loop())
             logger.info(
-                "Redis Team: connected team=%s member=%s group=%s",
+                "Redis Team: connected team=%s member=%s group=%s reconnect=%s",
                 self.settings.team_id,
                 self.settings.member_id,
                 self.settings.consumer_group,
+                is_reconnect,
             )
             return True
 
@@ -1450,6 +1650,7 @@ def _env_enablement() -> Optional[dict[str, Any]]:
         "member_id": settings.member_id,
         "role": settings.role,
         "shared_dir": settings.shared_dir,
+        "team_config_path": settings.team_config_path,
         "auto_run": settings.auto_run,
         "consumer_group": settings.consumer_group,
         "embedded_timeout_seconds": settings.embedded_timeout_seconds,

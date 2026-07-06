@@ -19,11 +19,32 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 		"CLAWMANAGER_TEAM_REDIS_URL",
 		"CLAWMANAGER_TEAM_ID",
 		"CLAWMANAGER_TEAM_MEMBER_ID",
+		"HERMES_TEAM_WORKER_HOME",
+		"CLAWMANAGER_TEAM_WORKER_PORT",
+		"hermes-apply-runtime-config",
 		"hermes gateway run --accept-hooks --no-supervise",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("start-hermes-dashboard-gateway missing %q", want)
 		}
+	}
+	if !strings.Contains(script, `export HOME="${team_worker_home}"`) ||
+		!strings.Contains(script, `export PORT="${team_worker_port}"`) {
+		t.Fatal("start-hermes-dashboard-gateway must isolate the Redis Team consumer from the dashboard HOME and port")
+	}
+}
+
+func TestHermesGatewayScriptUsesExplicitRunCommandForRootLaunch(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "start-hermes-gateway"))
+	if err != nil {
+		t.Fatalf("read start-hermes-gateway: %v", err)
+	}
+	script := string(data)
+	if !strings.Contains(script, "exec hermes gateway run --accept-hooks --no-supervise") {
+		t.Fatal("start-hermes-gateway must use explicit gateway run command so Redis Team-only Pro runtimes do not look for a default gateway profile")
+	}
+	if strings.Contains(script, "exec hermes gateway'\n") {
+		t.Fatal("start-hermes-gateway must not launch the bare default gateway profile in the root/s6 branch")
 	}
 }
 

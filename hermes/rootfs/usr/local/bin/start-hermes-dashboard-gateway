@@ -45,6 +45,14 @@ case "${port}" in
         ;;
 esac
 
+team_worker_port="${HERMES_TEAM_WORKER_PORT:-${CLAWMANAGER_TEAM_WORKER_PORT:-$((port + 10000))}}"
+case "${team_worker_port}" in
+    ''|*[!0-9]*)
+        echo "invalid Hermes Redis Team worker port: ${team_worker_port}" >&2
+        exit 64
+        ;;
+esac
+
 truthy() {
     case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
         1|true|yes|y|on|enabled) return 0 ;;
@@ -87,7 +95,24 @@ trap shutdown INT TERM
 if should_start_team_gateway; then
     echo "Starting Hermes Redis Team consumer for member ${CLAWMANAGER_TEAM_MEMBER_ID}"
     (
-        cd "${HOME}"
+        team_worker_home="${HERMES_TEAM_WORKER_HOME:-${HOME}/.clawmanager-team-worker}"
+        export HOME="${team_worker_home}"
+        export HERMES_HOME="${team_worker_home}/.hermes"
+        export XDG_CACHE_HOME="${team_worker_home}/.cache"
+        export XDG_CONFIG_HOME="${team_worker_home}/.config"
+        export XDG_DATA_HOME="${team_worker_home}/.local/share"
+        export NPM_CONFIG_CACHE="${XDG_CACHE_HOME}/npm"
+        export UV_CACHE_DIR="${XDG_CACHE_HOME}/uv"
+        export CLAWMANAGER_GATEWAY_PORT="${team_worker_port}"
+        export PORT="${team_worker_port}"
+        mkdir -p \
+            "${HERMES_HOME}" \
+            "${NPM_CONFIG_CACHE}" \
+            "${UV_CACHE_DIR}" \
+            "${XDG_CONFIG_HOME}" \
+            "${XDG_DATA_HOME}"
+        /usr/local/bin/hermes-apply-runtime-config >/dev/null 2>&1 || true
+        cd "${team_worker_home}"
         exec hermes gateway run --accept-hooks --no-supervise
     ) &
     team_gateway_pid="$!"

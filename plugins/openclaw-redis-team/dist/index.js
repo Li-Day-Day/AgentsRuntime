@@ -136,15 +136,19 @@ async function resolveRedisTeamTarget(cfg, value) {
   if (!isSafeMemberTarget(target.to)) {
     return Object.assign(target, { route: "unknown", error: "unknown Redis Team target: " + target.originalTo });
   }
-  const statuses = await readStatuses(cfg);
-  if (!statuses.length || target.to === cfg.memberId) {
+  if (target.to === cfg.memberId || safeName(target.to) === safeName(cfg.memberId)) {
     return Object.assign(target, { route: "member" });
   }
-  const known = statuses.some((status) => {
-    const memberId = trim(status?.memberId);
-    return memberId === target.to || safeName(memberId) === target.to;
-  });
-  if (known) return Object.assign(target, { route: "member" });
+  const roster = await readTeamRoster(cfg);
+  if (roster.members.length) {
+    if (isKnownRosterTarget(roster, target.to)) return Object.assign(target, { route: "member" });
+    return Object.assign(target, { route: "unknown", error: "unknown Redis Team target: " + target.originalTo });
+  }
+  const statuses = await readRawStatuses(cfg);
+  if (!statuses.length) return Object.assign(target, { route: "member" });
+  if (statuses.some((status) => statusMatchesTarget(status, target.to))) {
+    return Object.assign(target, { route: "member" });
+  }
   return Object.assign(target, { route: "unknown", error: "unknown Redis Team target: " + target.originalTo });
 }
 
@@ -304,6 +308,8 @@ function readChannelConfig(cfg, accountId = "default") {
     role: trim(account.role) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_ROLE) : "") || "member",
     sharedDir:
       trim(account.sharedDir) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_SHARED_DIR) : "") || DEFAULT_SHARED_DIR,
+    teamConfigPath:
+      trim(account.teamConfigPath) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_CONFIG_PATH) : ""),
     managerUrl:
       trim(account.managerUrl) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_MANAGER_URL) : ""),
     autoRun:
@@ -417,6 +423,110 @@ async function readJson(file) {
   }
 }
 
+function teamConfigCandidates(cfg) {
+  const candidates = [
+    trim(cfg.teamConfigPath),
+    trim(process.env.CLAWMANAGER_TEAM_CONFIG_PATH),
+    "/etc/clawmanager/team/team.json",
+    path.join(cfg.sharedDir || DEFAULT_SHARED_DIR, "team.json"),
+  ];
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+function normalizeRosterMember(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const memberId = trim(raw.memberId || raw.memberID || raw.memberKey || raw.id || raw.key);
+  if (!memberId) return null;
+  const role = trim(raw.role || raw.effectiveRole || raw.profileName || "member") || "member";
+  const aliases = [memberId, safeName(memberId)];
+  for (const value of [raw.displayName, raw.name]) {
+    const text = trim(value);
+    if (text) aliases.push(text, safeName(text));
+  }
+  return {
+    teamId: trim(raw.teamId),
+    memberId,
+    role,
+    effectiveRole: trim(raw.effectiveRole),
+    profileKey: trim(raw.profileKey),
+    profileName: trim(raw.profileName),
+    displayName: trim(raw.displayName || raw.name),
+    runtime: trim(raw.runtime || raw.runtimeType),
+    runtimeType: trim(raw.runtimeType || raw.runtime),
+    instanceMode: trim(raw.instanceMode),
+    isLeader: !!raw.isLeader,
+    description: trim(raw.description),
+    aliases: [...new Set(aliases.filter(Boolean))],
+  };
+}
+
+function extractRosterMembers(raw) {
+  if (!raw || typeof raw !== "object") return [];
+  const members = Array.isArray(raw.members)
+    ? raw.members
+    : Array.isArray(raw.team?.members)
+      ? raw.team.members
+      : Array.isArray(raw.roster?.members)
+        ? raw.roster.members
+        : [];
+  return members.map(normalizeRosterMember).filter(Boolean);
+}
+
+async function readTeamRoster(cfg) {
+  for (const file of teamConfigCandidates(cfg)) {
+    const raw = await readJson(file);
+    const members = extractRosterMembers(raw);
+    if (members.length) return { source: file, raw, members };
+  }
+  const envJson = trim(process.env.CLAWMANAGER_TEAM_CONFIG_JSON);
+  if (envJson) {
+    try {
+      const raw = JSON.parse(envJson);
+      const members = extractRosterMembers(raw);
+      if (members.length) return { source: "CLAWMANAGER_TEAM_CONFIG_JSON", raw, members };
+    } catch {}
+  }
+  return { source: "", raw: null, members: [] };
+}
+
+function isKnownRosterTarget(roster, target) {
+  const raw = trim(target);
+  const safe = safeName(raw);
+  return roster.members.some((member) => member.aliases.includes(raw) || member.aliases.includes(safe));
+}
+
+function statusMatchesTarget(status, target) {
+  const raw = trim(target);
+  const safe = safeName(raw);
+  for (const value of [status?.memberId, status?.memberID, status?.memberKey, status?.displayName, status?.name]) {
+    const text = trim(value);
+    if (text && (text === raw || safeName(text) === raw || safeName(text) === safe)) return true;
+  }
+  return false;
+}
+
+function rosterStatusStub(cfg, member) {
+  return {
+    teamId: cfg.teamId || member.teamId,
+    memberId: member.memberId,
+    role: member.effectiveRole || member.role,
+    rosterRole: member.role,
+    effectiveRole: member.effectiveRole || undefined,
+    profileKey: member.profileKey || undefined,
+    profileName: member.profileName || undefined,
+    displayName: member.displayName || undefined,
+    runtime: member.runtime || member.runtimeType || undefined,
+    runtimeType: member.runtimeType || member.runtime || undefined,
+    instanceMode: member.instanceMode || undefined,
+    isLeader: member.isLeader,
+    description: member.description || undefined,
+    liveness: "unknown",
+    runtimeStatus: "unknown",
+    availability: "unknown",
+    lastSeenAt: "",
+  };
+}
+
 async function writeLocalStatus(cfg, patch = {}) {
   const file = path.join(cfg.sharedDir, "status", safeName(cfg.memberId) + ".json");
   const previous = (await readJson(file)) || {};
@@ -444,7 +554,7 @@ async function writeLocalStatus(cfg, patch = {}) {
   return status;
 }
 
-async function readStatuses(cfg, memberId) {
+async function readRawStatuses(cfg, memberId) {
   const dir = path.join(cfg.sharedDir, "status");
   if (memberId) return (await readJson(path.join(dir, safeName(memberId) + ".json"))) || null;
   let entries = [];
@@ -461,6 +571,29 @@ async function readStatuses(cfg, memberId) {
   }
   out.sort((a, b) => String(a.memberId).localeCompare(String(b.memberId)));
   return out;
+}
+
+async function readStatuses(cfg, memberId) {
+  const rawStatuses = await readRawStatuses(cfg);
+  const roster = await readTeamRoster(cfg);
+  if (memberId) {
+    const raw = rawStatuses.find((status) => statusMatchesTarget(status, memberId));
+    if (raw) return raw;
+    const member = roster.members.find((item) => isKnownRosterTarget({ members: [item] }, memberId));
+    return member ? rosterStatusStub(cfg, member) : null;
+  }
+  if (!roster.members.length) return rawStatuses;
+  const merged = [];
+  for (const member of roster.members) {
+    const status = rawStatuses.find((item) => statusMatchesTarget(item, member.memberId));
+    merged.push(Object.assign(rosterStatusStub(cfg, member), status || {}));
+  }
+  const known = new Set(merged.map((item) => safeName(item.memberId)));
+  for (const status of rawStatuses) {
+    if (!known.has(safeName(status.memberId))) merged.push(status);
+  }
+  merged.sort((a, b) => String(a.memberId).localeCompare(String(b.memberId)));
+  return merged;
 }
 
 async function writeTaskEnvelope(cfg, envelope) {
@@ -903,16 +1036,32 @@ function createRuntime(api) {
     await redis.connect();
     try {
       if (target.route === "unknown") {
-        await failActiveTask(target.error, {
-          cfg,
-          redis,
-          envelope: inferredEnvelope,
-          eventName: "message_failed",
-          messageId: message.messageId,
-          taskId: message.taskId,
-          to: target.originalTo,
-          summary: target.error,
-        });
+        const failureEvent = inferredEnvelope
+          ? taskEvent(cfg, "message_failed", inferredEnvelope, {
+              messageId: message.messageId,
+              message_id: message.messageId,
+              taskId: message.taskId,
+              task_id: message.taskId,
+              to: target.originalTo,
+              availability: "busy",
+              runtimeStatus: "running",
+              status: "message_failed",
+              summary: target.error,
+              error: target.error,
+            })
+          : eventFor(cfg, "message_failed", {
+              messageId: message.messageId,
+              message_id: message.messageId,
+              taskId: message.taskId,
+              task_id: message.taskId,
+              to: target.originalTo,
+              availability: "busy",
+              runtimeStatus: "running",
+              status: "message_failed",
+              summary: target.error,
+              error: target.error,
+            });
+        await xaddJson(redis, eventsKey(cfg), failureEvent);
         lastOutbound = { message, target, failed: true, error: target.error };
         return Object.assign({}, message, { failed: true, error: target.error });
       }
@@ -1329,6 +1478,7 @@ export default definePluginEntry({
       memberId: { type: "string" },
       role: { type: "string" },
       sharedDir: { type: "string" },
+      teamConfigPath: { type: "string" },
       autoRun: { type: "boolean" },
       consumerGroup: { type: "string" },
       inboxKey: { type: "string" },
