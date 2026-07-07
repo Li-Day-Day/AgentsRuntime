@@ -22,6 +22,10 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 		"HERMES_TEAM_WORKER_HOME",
 		"CLAWMANAGER_TEAM_WORKER_PORT",
 		"hermes-apply-runtime-config",
+		"dashboard_port=${port}",
+		"team_worker_port=${team_worker_port}",
+		"dashboard_pid=${dashboard_pid}",
+		"team_gateway_pid=${team_gateway_pid}",
 		"hermes gateway run --accept-hooks --no-supervise",
 	} {
 		if !strings.Contains(script, want) {
@@ -31,6 +35,11 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 	if !strings.Contains(script, `export HOME="${team_worker_home}"`) ||
 		!strings.Contains(script, `export PORT="${team_worker_port}"`) {
 		t.Fatal("start-hermes-dashboard-gateway must isolate the Redis Team consumer from the dashboard HOME and port")
+	}
+	dashboardIndex := strings.Index(script, "hermes dashboard")
+	teamIndex := strings.Index(script, "Starting Hermes Redis Team consumer")
+	if dashboardIndex < 0 || teamIndex < 0 || dashboardIndex > teamIndex {
+		t.Fatal("start-hermes-dashboard-gateway must bind the dashboard port before starting the Redis Team consumer")
 	}
 }
 
