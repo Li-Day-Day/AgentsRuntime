@@ -18,6 +18,7 @@ var teamSharedSubdirs = []string{
 	"tasks",
 	"results",
 	".openclaw-redis-team",
+	filepath.Join(".openclaw-redis-team", "tasks"),
 }
 
 const teamSharedDirMode fs.FileMode = fs.ModeSetgid | 0o775

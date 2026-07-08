@@ -16,6 +16,8 @@ const READ_BLOCK_MS = 15000;
 const WIRE_SCHEMA_VERSION = 1;
 const PROTOCOL_VERSION = 2;
 const COMPLETION_SOURCE = "team_complete_task";
+const TEAM_SHARED_DIR_MODE = 0o2775;
+const RUNTIME_PRIVATE_DIR_MODE = 0o700;
 const SYSTEM_REPLY_TARGETS = new Set([
   "clawmanager",
   "manager",
@@ -46,6 +48,14 @@ function intFrom(value, fallback) {
 function safeName(value) {
   return String(value || "unknown").replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 160);
 }
+const warnedRuntimePaths = new Set();
+
+function warnOnce(key, message) {
+  if (warnedRuntimePaths.has(key)) return;
+  warnedRuntimePaths.add(key);
+  console.warn("[redis-team] " + message);
+}
+
 function stableAssignmentId(cfg, params) {
   const target = safeName(params?.to || "member");
   const seed = [
@@ -364,13 +374,37 @@ function hasRequiredRedisTeamKeys(cfg) {
 }
 
 // ============ Helpers ============
+function runtimeStateDir(cfg) {
+  const home = trim(process.env.HOME);
+  const stateHome = trim(process.env.XDG_STATE_HOME);
+  const base = stateHome || (home ? path.join(home, ".openclaw", "redis-team") : path.join(process.cwd(), ".openclaw-redis-team"));
+  return path.join(base, "teams", safeName(cfg.teamId || "team"), safeName(cfg.memberId || "member"));
+}
+
+function privateTaskEnvelopePath(cfg, alias) {
+  return path.join(runtimeStateDir(cfg), "tasks", safeName(alias) + ".json");
+}
+
+async function mkdirBestEffort(dir, mode, label) {
+  try {
+    await fs.mkdir(dir, { recursive: true, mode });
+  } catch (err) {
+    warnOnce("mkdir:" + dir, `${label}: unable to create ${dir}: ${err?.message || String(err)}`);
+    return false;
+  }
+  try {
+    await fs.chmod(dir, mode);
+  } catch (err) {
+    warnOnce("chmod:" + dir, `${label}: unable to enforce permissions on ${dir}: ${err?.message || String(err)}`);
+  }
+  return true;
+}
+
 async function ensureDirs(cfg) {
-  await fs.mkdir(path.join(cfg.sharedDir, "inbox"), { recursive: true });
-  await fs.mkdir(path.join(cfg.sharedDir, "status"), { recursive: true });
-  await fs.mkdir(path.join(cfg.sharedDir, "tasks"), { recursive: true });
-  await fs.mkdir(path.join(cfg.sharedDir, "results"), { recursive: true });
-  await fs.mkdir(path.join(cfg.sharedDir, ".openclaw-redis-team"), { recursive: true });
-  await fs.mkdir(path.join(cfg.sharedDir, ".openclaw-redis-team", "tasks", safeName(cfg.memberId || "member")), { recursive: true });
+  for (const name of ["inbox", "status", "tasks", "results"]) {
+    await mkdirBestEffort(path.join(cfg.sharedDir, name), TEAM_SHARED_DIR_MODE, "shared workspace");
+  }
+  await mkdirBestEffort(path.join(runtimeStateDir(cfg), "tasks"), RUNTIME_PRIVATE_DIR_MODE, "runtime private state");
 }
 
 async function writeJson(file, value) {
@@ -378,6 +412,16 @@ async function writeJson(file, value) {
   const tmp = file + "." + process.pid + "." + Date.now() + "." + randomUUID() + ".tmp";
   await fs.writeFile(tmp, JSON.stringify(value, null, 2) + "\n", "utf8");
   await fs.rename(tmp, file);
+}
+
+async function writeJsonBestEffort(file, value, label) {
+  try {
+    await writeJson(file, value);
+    return true;
+  } catch (err) {
+    warnOnce("write:" + file, `${label}: unable to write ${file}: ${err?.message || String(err)}`);
+    return false;
+  }
 }
 
 async function writeText(file, value) {
@@ -597,7 +641,7 @@ async function writeLocalStatus(cfg, patch = {}) {
     },
     patch,
   );
-  await writeJson(file, status);
+  await writeJsonBestEffort(file, status, "shared status");
   return status;
 }
 
@@ -649,16 +693,16 @@ async function writeTaskEnvelope(cfg, envelope) {
   const aliases = new Set(taskIdAliases(envelope.taskId));
   aliases.add(envelope.taskId);
   for (const alias of aliases) {
-    await writeJson(path.join(cfg.sharedDir, ".openclaw-redis-team", "tasks", safeName(cfg.memberId || "member"), safeName(alias) + ".json"), envelope);
-    await writeJson(path.join(cfg.sharedDir, "tasks", safeName(alias) + ".json"), envelope);
+    await writeJsonBestEffort(privateTaskEnvelopePath(cfg, alias), envelope, "runtime private task envelope");
+    await writeJsonBestEffort(path.join(cfg.sharedDir, "tasks", safeName(alias) + ".json"), envelope, "legacy shared task envelope");
   }
 }
 
 async function readTaskEnvelope(cfg, taskId) {
   await ensureDirs(cfg);
   for (const alias of taskIdAliases(taskId)) {
-    const memberScoped = await readJson(path.join(cfg.sharedDir, ".openclaw-redis-team", "tasks", safeName(cfg.memberId || "member"), safeName(alias) + ".json"));
-    if (memberScoped) return memberScoped;
+    const privateEnvelope = await readJson(privateTaskEnvelopePath(cfg, alias));
+    if (privateEnvelope) return privateEnvelope;
     const envelope = await readJson(path.join(cfg.sharedDir, "tasks", safeName(alias) + ".json"));
     if (envelope) return envelope;
   }
@@ -1214,6 +1258,7 @@ function createRuntime(api) {
     if (taskId && artifactRefs.length === 0) {
       const resultDir = path.join(cfg.sharedDir, "results", safeName(taskId));
       const resultMarkdownPath = path.join(resultDir, "result.md");
+      await mkdirBestEffort(resultDir, TEAM_SHARED_DIR_MODE, "shared result directory");
       await writeText(resultMarkdownPath, resultMarkdown);
       artifactRefs = [canonicalArtifactRef(cfg, resultMarkdownPath)];
       await writeJson(path.join(resultDir, "result.json"), {
@@ -1502,7 +1547,7 @@ function createRuntime(api) {
       params = Object.assign({}, params, { taskId, status: completionStatus, summary });
       await ensureDirs(cfg);
       const resultDir = path.join(cfg.sharedDir, "results", safeName(params.taskId));
-      await fs.mkdir(resultDir, { recursive: true });
+      await mkdirBestEffort(resultDir, TEAM_SHARED_DIR_MODE, "shared result directory");
       const artifactRefs = await validateArtifactRefs(cfg, params.artifactRefs);
       const resultMarkdown = trim(params.resultMarkdown) || params.summary;
       const resultMarkdownPath = path.join(resultDir, "result.md");

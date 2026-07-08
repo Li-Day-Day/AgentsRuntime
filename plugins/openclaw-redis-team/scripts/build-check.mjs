@@ -38,6 +38,10 @@ for (const token of [
   "taskIdAliases",
   "writeTaskEnvelope",
   "readTaskEnvelope",
+  "runtimeStateDir",
+  "privateTaskEnvelopePath",
+  "writeJsonBestEffort",
+  "TEAM_SHARED_DIR_MODE = 0o2775",
   "isTaskTerminal",
   "statusIsActive",
   "pendingDrainBatches",
@@ -64,6 +68,9 @@ for (const token of [
 }
 if (dist.includes("params.taskId === activeEnvelope.taskId")) {
   throw new Error("dist/index.js must match active Redis Team task ids through aliases");
+}
+if (dist.includes('path.join(cfg.sharedDir, ".openclaw-redis-team", "tasks"')) {
+  throw new Error("member-scoped Redis Team envelopes must not require a shared NFS .openclaw-redis-team/tasks directory");
 }
 const deliverStart = dist.indexOf("deliver: async (payload) => {");
 const deliverEnd = dist.indexOf("onRecordError:", deliverStart);
