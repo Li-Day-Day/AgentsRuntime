@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+umask "${CLAWMANAGER_TEAM_UMASK:-0002}"
+
 export HOME="${HOME:-/config}"
 export HERMES_HOME="${HERMES_HOME:-${HOME}/.hermes}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"

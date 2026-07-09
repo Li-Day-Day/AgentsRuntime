@@ -13,10 +13,12 @@ import (
 )
 
 var teamSharedSubdirs = []string{
+	"artifacts",
 	"inbox",
 	"status",
 	"tasks",
 	"results",
+	"tmp",
 	".openclaw-redis-team",
 	filepath.Join(".openclaw-redis-team", "tasks"),
 }

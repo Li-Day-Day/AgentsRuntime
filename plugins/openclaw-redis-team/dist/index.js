@@ -832,7 +832,14 @@ async function shouldUseAssistantSessionFallback(cfg, envelope, text) {
   if (!fallbackText) return false;
   if (isSystemSender(envelope.from, cfg)) return true;
   const roster = await readTeamRoster(cfg);
-  if (roster.members.length && isKnownRosterTarget(roster, envelope.from)) return false;
+  if (roster.members.length && isKnownRosterTarget(roster, envelope.from)) {
+    const currentMember = currentRosterMember(cfg, roster);
+    const currentIsLeader = isLeaderRosterMember(currentMember) || isRosterLeaderTarget(roster, cfg.memberId);
+    if (isLeaderMediatedRoster(roster) && !currentIsLeader && isRosterLeaderTarget(roster, envelope.from)) {
+      return true;
+    }
+    return false;
+  }
   return false;
 }
 
