@@ -31,6 +31,9 @@ func NewHTTPGatewayHealthChecker(cfg Config) *HTTPGatewayHealthChecker {
 		cfg: cfg,
 		client: &http.Client{
 			Timeout: 2 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }

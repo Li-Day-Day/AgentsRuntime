@@ -19,7 +19,8 @@ RUN set -eux; \
 
 FROM lscr.io/linuxserver/webtop:ubuntu-kde
 
-ARG HERMES_BRANCH=main
+ARG HERMES_VERSION=0.16.0
+ARG HERMES_GIT_REF=v2026.6.5
 ARG NODE_MAJOR=22
 ARG TARGETARCH
 ARG DEBIAN_FRONTEND=noninteractive
@@ -86,10 +87,10 @@ RUN set -eux; \
 RUN set -eux; \
     mkdir -p "${HERMES_HOME}" "${PLAYWRIGHT_BROWSERS_PATH}"; \
     export HOME=/root; \
-    curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
-        | bash -s -- --branch "${HERMES_BRANCH}" --hermes-home "${HERMES_HOME}" --skip-setup; \
+    curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_GIT_REF}/scripts/install.sh" \
+        | bash -s -- --branch "${HERMES_GIT_REF}" --hermes-home "${HERMES_HOME}" --skip-setup; \
     /usr/local/lib/hermes-agent/venv/bin/python -m ensurepip --upgrade; \
-    /usr/local/lib/hermes-agent/venv/bin/python -m pip install --no-cache-dir "hermes-agent[dingtalk,messaging,matrix,wecom]"; \
+    /usr/local/lib/hermes-agent/venv/bin/python -m pip install --no-cache-dir "hermes-agent[dingtalk,messaging,matrix,wecom]==${HERMES_VERSION}"; \
     cd /usr/local/lib/hermes-agent; \
     npm install --workspace web; \
     npm install --workspace ui-tui; \

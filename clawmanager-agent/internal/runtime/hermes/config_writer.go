@@ -107,29 +107,37 @@ func buildManagedYAML(cfg gateway.Config) string {
 		builder.WriteString("  provider: clawmanager\n")
 		builder.WriteString("providers:\n")
 		builder.WriteString("  clawmanager:\n")
-		builder.WriteString("    name: ClawManager\n")
-		builder.WriteString("    base_url: ")
-		builder.WriteString(yamlScalar(cfg.LLMBaseURL))
-		builder.WriteString("\n")
-		if defaultModel != "" {
-			builder.WriteString("    default_model: ")
-			builder.WriteString(yamlScalar(defaultModel))
-			builder.WriteString("\n")
-		}
-		builder.WriteString("    transport: openai_chat\n")
-		builder.WriteString("    key_env: OPENAI_API_KEY\n")
-		if len(cfg.LLMModelIDs) > 0 {
-			builder.WriteString("    models:\n")
-			for _, modelID := range cfg.LLMModelIDs {
-				builder.WriteString("      ")
-				builder.WriteString(yamlScalar(modelID))
-				builder.WriteString(": {}\n")
-			}
-		}
+		writeManagedProviderYAML(&builder, "ClawManager", cfg.LLMBaseURL, defaultModel, cfg.LLMModelIDs)
+		builder.WriteString("  custom:\n")
+		writeManagedProviderYAML(&builder, "custom", cfg.LLMBaseURL, defaultModel, cfg.LLMModelIDs)
 	}
 	builder.WriteString(managedConfigEnd)
 	builder.WriteString("\n")
 	return builder.String()
+}
+
+func writeManagedProviderYAML(builder *strings.Builder, name, baseURL, defaultModel string, modelIDs []string) {
+	builder.WriteString("    name: ")
+	builder.WriteString(yamlScalar(name))
+	builder.WriteString("\n")
+	builder.WriteString("    base_url: ")
+	builder.WriteString(yamlScalar(baseURL))
+	builder.WriteString("\n")
+	if defaultModel != "" {
+		builder.WriteString("    default_model: ")
+		builder.WriteString(yamlScalar(defaultModel))
+		builder.WriteString("\n")
+	}
+	builder.WriteString("    transport: openai_chat\n")
+	builder.WriteString("    key_env: OPENAI_API_KEY\n")
+	if len(modelIDs) > 0 {
+		builder.WriteString("    models:\n")
+		for _, modelID := range modelIDs {
+			builder.WriteString("      ")
+			builder.WriteString(yamlScalar(modelID))
+			builder.WriteString(": {}\n")
+		}
+	}
 }
 
 func writeHermesEnv(path string, cfg gateway.Config) error {
