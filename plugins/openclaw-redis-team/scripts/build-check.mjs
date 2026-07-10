@@ -56,13 +56,30 @@ for (const token of [
   "completionSource",
   "explicitCompletion",
   "WIRE_SCHEMA_VERSION = 1",
-  "PROTOCOL_VERSION = 2",
+  "PROTOCOL_VERSION = 3",
+  "completion_proposed",
+  "waitForCompletionAcknowledgement",
+  "waitForTerminalCompletionState",
+  "completion-state:",
+  "artifact_changed",
+  "waivers",
+  "skippedAssignments",
+  "completion_pending",
   "waiting_completion",
   "resultMarkdown",
   "Math.min(99",
   "await writeText(resultMarkdownPath, resultMarkdown)",
   "message_failed",
   "assignment-",
+  "team_artifact_write",
+  "team_artifact_read",
+  "team_artifact_list",
+  "team_artifact_mkdir",
+  "assertNoArtifactSymlinkTraversal",
+  "assertTeamArtifactWriteScope",
+  "assertResponseLocale",
+  "sharedWorkspaceForTarget",
+  "suppressed duplicate reply after submitted completion",
 ]) {
   if (!dist.includes(token)) throw new Error(`dist/index.js missing Redis Team completion token: ${token}`);
 }
@@ -79,10 +96,18 @@ const deliverBody = dist.slice(deliverStart, deliverEnd);
 if (deliverBody.includes("completeActiveTask") || deliverBody.includes('"task_completed"')) {
   throw new Error("normal Redis Team replies must not complete the business task");
 }
+if (!deliverBody.includes("runtime.isActiveTaskCompleted")) {
+  throw new Error("normal Redis Team replies must be suppressed after explicit completion");
+}
+for (const tool of ["team_artifact_write", "team_artifact_read", "team_artifact_list", "team_artifact_mkdir"]) {
+  if (!manifest.contracts?.tools?.includes(tool)) {
+    throw new Error(`openclaw.plugin.json missing tool contract: ${tool}`);
+  }
+}
 if (dist.includes("seenMessageIds")) {
   throw new Error("dist/index.js must use Redis-backed message idempotency instead of process memory");
 }
-if (!dist.includes('const runtimeStatus = params.status === "succeeded" ? "succeeded" : "failed"')) {
-  throw new Error("dist/index.js must set runtimeStatus when completing Redis Team tasks");
+if (!dist.includes('const runtimeStatus = "completion_pending"')) {
+  throw new Error("dist/index.js must wait for backend acknowledgement before marking Redis Team tasks terminal");
 }
 console.log("openclaw-redis-team build check passed");

@@ -73,6 +73,9 @@ func PrepareWorkspace(root, runtimeType string, req CreateGatewayRequest) (strin
 	if err := ChownWorkspace(homePath, req.UID, req.GID); err != nil {
 		return "", fmt.Errorf("chown workspace home: %w", err)
 	}
+	if err := PrepareLiteTeamSharedWorkspace(root, req, workspacePath); err != nil {
+		return "", err
+	}
 	return workspacePath, nil
 }
 

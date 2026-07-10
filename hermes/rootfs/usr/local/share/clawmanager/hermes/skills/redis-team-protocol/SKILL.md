@@ -18,12 +18,15 @@ Streams carries events, while the shared workspace carries durable artifacts.
 
 - Read the shared root from `CLAWMANAGER_TEAM_SHARED_DIR`; do not assume its
   physical path is `/team`.
-- Write task artifacts below
-  `$CLAWMANAGER_TEAM_SHARED_DIR/results/<taskId>/`.
+- Prefer `team_artifact_write`, `team_artifact_read`, `team_artifact_list`, and
+  `team_artifact_mkdir`. They constrain paths to the current Team and enforce
+  cooperative file permissions.
+- Member deliverables belong below
+  `/team/artifacts/<rootTaskId>/members/<memberId>/`; only the Leader writes the
+  root final synthesis.
 - Report artifact links with the canonical `/team/<relative-path>` prefix.
-- Team configuration is mounted at `CLAWMANAGER_TEAM_CONFIG_PATH` or
-  `/etc/clawmanager/team/team.json`. The shared artifact directory is not the
-  configuration mount.
+- In pooled Lite runtimes, `/team` is a canonical report prefix rather than a
+  container-global mount. Use the resolved physical path or the artifact tools.
 - Never write API keys, Redis credentials, or team tokens into shared files.
 
 ## Event semantics
@@ -45,9 +48,8 @@ Streams carries events, while the shared workspace carries durable artifacts.
    requires files.
 3. Call `team_complete_task` with `taskId`, `status`, `summary`,
    `resultMarkdown`, and any `artifactRefs`.
-4. If the task was delegated by another member, use `team_send` after
-   completion to send that member a concise result summary. This notification
-   is not a second completion event.
+4. Do not send a second copy of the result after completion. ClawManager's
+   reliable confirmation outbox notifies the Leader.
 
 Do not call `team_update_progress(progress=100)` before completion. The
 completion tool records terminal progress after result files are durable.
@@ -77,3 +79,5 @@ completion tool records terminal progress after result files are durable.
   "result delivered".
 - Do not invent missing peer replies, status, files, or verification evidence.
 - A dispatch, plan, handoff, or process narration is not a final result.
+- Follow the inbound `responseLocale` for every user-visible plan, progress
+  summary, assignment, result, and synthesis. Preserve code and technical names.

@@ -98,6 +98,11 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	if err := gateway.ChownWorkspace(configPath, req.UID, req.GID); err != nil {
 		return fmt.Errorf("chown openclaw config: %w", err)
 	}
+	if teamEnabledFromRequest(req) {
+		if err := gateway.PrepareLiteTeamSharedWorkspace(cfg.WorkspaceRoot, req, workspacePath); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -132,9 +137,6 @@ func configureOpenClawRedisTeam(config map[string]any, req gateway.CreateGateway
 		sharedDirPath := filepath.FromSlash(sharedDir)
 		if err := os.MkdirAll(sharedDirPath, 0o750); err != nil {
 			return fmt.Errorf("create lite team shared dir: %w", err)
-		}
-		if err := gateway.ChownWorkspace(sharedDirPath, req.UID, req.GID); err != nil {
-			return fmt.Errorf("chown lite team shared dir: %w", err)
 		}
 	}
 	return nil

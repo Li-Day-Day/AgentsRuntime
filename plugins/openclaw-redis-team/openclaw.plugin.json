@@ -11,7 +11,11 @@
       "team_send",
       "team_status",
       "team_update_progress",
-      "team_complete_task"
+      "team_complete_task",
+      "team_artifact_write",
+      "team_artifact_read",
+      "team_artifact_list",
+      "team_artifact_mkdir"
     ]
   },
   "configSchema": {

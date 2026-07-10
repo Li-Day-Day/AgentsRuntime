@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -14,6 +15,7 @@ const (
 	teamConfigJSONEnv = "CLAWMANAGER_TEAM_CONFIG_JSON"
 	teamConfigPathEnv = "CLAWMANAGER_TEAM_CONFIG_PATH"
 	teamSharedDirEnv  = "CLAWMANAGER_TEAM_SHARED_DIR"
+	teamUmaskEnv      = "CLAWMANAGER_TEAM_UMASK"
 )
 
 func ApplyRequestEnvironment(env []string, req CreateGatewayRequest) []string {
@@ -41,7 +43,7 @@ func WriteLiteTeamConfigJSON(req CreateGatewayRequest, workspacePath string) err
 	if !ok || strings.TrimSpace(raw) == "" {
 		return nil
 	}
-	configPath, _, ok := LiteTeamEnvironment(req, workspacePath)
+	configPath, sharedDir, ok := LiteTeamEnvironment(req, workspacePath)
 	if !ok {
 		return nil
 	}
@@ -58,21 +60,26 @@ func WriteLiteTeamConfigJSON(req CreateGatewayRequest, workspacePath string) err
 	}
 	data = append(data, '\n')
 
-	filePath := filepath.FromSlash(configPath)
+	filePath := filepath.Clean(filepath.FromSlash(configPath))
+	sharedRoot := filepath.Clean(filepath.FromSlash(sharedDir))
+	if !pathWithin(sharedRoot, filePath) {
+		return fmt.Errorf("lite Team config escaped shared workspace: %s", filePath)
+	}
 	if err := os.MkdirAll(filepath.Dir(filePath), 0o750); err != nil {
 		return fmt.Errorf("create lite team config dir: %w", err)
 	}
-	if err := os.WriteFile(filePath, data, 0o600); err != nil {
+	if err := os.WriteFile(filePath, data, 0o664); err != nil {
 		return fmt.Errorf("write lite team config: %w", err)
 	}
-	if err := os.Chmod(filePath, 0o600); err != nil {
+	if err := os.Chmod(filePath, 0o664); err != nil {
 		return fmt.Errorf("chmod lite team config: %w", err)
 	}
-	if err := ChownWorkspace(filepath.Dir(filePath), req.UID, req.GID); err != nil {
-		return fmt.Errorf("chown lite team config dir: %w", err)
+	sharedGID := liteTeamSharedGID(req)
+	if err := ChgrpWorkspace(filepath.Dir(filePath), sharedGID); err != nil {
+		return fmt.Errorf("set lite Team config directory group: %w", err)
 	}
-	if err := ChownWorkspace(filePath, req.UID, req.GID); err != nil {
-		return fmt.Errorf("chown lite team config: %w", err)
+	if err := ChgrpWorkspace(filePath, sharedGID); err != nil {
+		return fmt.Errorf("set lite Team config group: %w", err)
 	}
 	return nil
 }
@@ -106,7 +113,22 @@ func LiteTeamEnvironment(req CreateGatewayRequest, workspacePath string) (string
 			configPath = envPathJoin(sharedDir, "team.json")
 		}
 	}
+	if isDefaultTeamConfigPath(configPath) {
+		configPath = envPathJoin(sharedDir, "team.json")
+	}
 	return configPath, sharedDir, true
+}
+
+func LiteTeamGatewayCommand(command, env []string) []string {
+	if len(command) == 0 || !truthyTeamEnv(envValue(env, "CLAWMANAGER_TEAM_ENABLED")) {
+		return command
+	}
+	umask := strings.TrimSpace(envValue(env, teamUmaskEnv))
+	if !validTeamUmask(umask) {
+		umask = "0002"
+	}
+	wrapped := []string{"/bin/sh", "-c", `umask "$1"; shift; exec "$@"`, "clawmanager-team-gateway", umask}
+	return append(wrapped, command...)
 }
 
 func applyEnvironmentMap(env []string, values map[string]string) []string {
@@ -164,6 +186,42 @@ func usesWindowsSeparators(value string) bool {
 
 func isDefaultTeamSharedDir(value string) bool {
 	return filepath.ToSlash(filepath.Clean(strings.TrimSpace(value))) == "/team"
+}
+
+func isDefaultTeamConfigPath(value string) bool {
+	normalized := filepath.ToSlash(filepath.Clean(strings.TrimSpace(value)))
+	return normalized == "/etc/clawmanager/team/team.json" || normalized == "/team/team.json"
+}
+
+func validTeamUmask(value string) bool {
+	if len(value) != 3 && len(value) != 4 {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '7' {
+			return false
+		}
+	}
+	return true
+}
+
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for idx := len(env) - 1; idx >= 0; idx-- {
+		if strings.HasPrefix(env[idx], prefix) {
+			return strings.TrimPrefix(env[idx], prefix)
+		}
+	}
+	return ""
+}
+
+func liteTeamSharedGID(req CreateGatewayRequest) int {
+	if raw, ok := requestEnvValue(req, "CLAWMANAGER_TEAM_SHARED_GID"); ok {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return req.GID
 }
 
 func truthyTeamEnv(value string) bool {

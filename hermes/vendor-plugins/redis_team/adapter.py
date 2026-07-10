@@ -36,6 +36,8 @@ DEFAULT_SHARED_DIR = "/team"
 DEFAULT_CONSUMER_GROUP = "team-members"
 READ_BLOCK_MS = 5000
 STATUS_INTERVAL_SECONDS = 30
+TEAM_SHARED_DIR_MODE = 0o2775
+TEAM_SHARED_FILE_MODE = 0o664
 
 
 def _truthy(value: Any, default: bool = False) -> bool:
@@ -54,6 +56,13 @@ def _truthy(value: Any, default: bool = False) -> bool:
 
 def _trim(value: Any) -> str:
     return str(value).strip() if value is not None else ""
+
+
+def _assert_response_locale(locale: Any, text: Any, label: str) -> None:
+    normalized = _trim(locale).lower()
+    body = str(text or "")
+    if normalized.startswith("zh") and body.strip() and re.search(r"[\u3400-\u9fff]", body) is None:
+        raise ValueError(f"{label} must use {_trim(locale) or 'zh-CN'}; rewrite user-visible prose in Chinese while preserving code and technical names")
 
 
 def processed_message_key(settings: "RedisTeamSettings", key: str) -> str:
@@ -88,17 +97,23 @@ def _short_text(value: str, limit: int = 500) -> str:
 
 
 def _atomic_write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=TEAM_SHARED_DIR_MODE)
+    path.parent.chmod(TEAM_SHARED_DIR_MODE)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.chmod(TEAM_SHARED_FILE_MODE)
     tmp.replace(path)
+    path.chmod(TEAM_SHARED_FILE_MODE)
 
 
 def _atomic_write_text(path: Path, value: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=TEAM_SHARED_DIR_MODE)
+    path.parent.chmod(TEAM_SHARED_DIR_MODE)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(value.rstrip() + "\n", encoding="utf-8")
+    tmp.chmod(TEAM_SHARED_FILE_MODE)
     tmp.replace(path)
+    path.chmod(TEAM_SHARED_FILE_MODE)
 
 
 def _read_json(path: Path) -> Any:
@@ -211,8 +226,122 @@ def event_for(settings: RedisTeamSettings, event: str, extra: Optional[dict[str,
 
 
 def ensure_team_dirs(settings: RedisTeamSettings) -> None:
-    for child in ("inbox", "status", "tasks", "results", ".hermes-redis-team"):
-        (settings.shared_path / child).mkdir(parents=True, exist_ok=True)
+    for directory in [settings.shared_path, *(settings.shared_path / child for child in ("inbox", "status", "tasks", "results", "artifacts", "tmp", ".hermes-redis-team"))]:
+        directory.mkdir(parents=True, exist_ok=True, mode=TEAM_SHARED_DIR_MODE)
+        directory.chmod(TEAM_SHARED_DIR_MODE)
+
+
+def _artifact_relative_path(value: Any) -> Path:
+    raw = _trim(value).replace("\\", "/")
+    if not raw or raw.startswith("/"):
+        raise ValueError("Team artifact path must be a non-empty relative path")
+    parts = [part for part in raw.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError("Team artifact path traversal is not allowed")
+    return Path(*parts)
+
+
+def _artifact_path(settings: RedisTeamSettings, args: dict[str, Any], *, default_scope: str) -> Path:
+    scope = _trim(args.get("scope") or default_scope).lower()
+    if scope == "team":
+        root = settings.shared_path
+    elif scope == "member":
+        root_task_id = _safe_name(_trim(args.get("rootTaskId") or args.get("root_task_id") or "unscoped"))
+        root = settings.shared_path / "artifacts" / root_task_id / "members" / _safe_name(settings.member_id)
+    else:
+        raise ValueError("Team artifact scope must be member or team")
+    candidate = root / _artifact_relative_path(args.get("path"))
+    shared_root = settings.shared_path.resolve()
+    resolved_parent = candidate.parent.resolve(strict=False)
+    if shared_root != resolved_parent and shared_root not in resolved_parent.parents:
+        raise ValueError("Team artifact path escaped the current Team workspace")
+    current = shared_root
+    for component in candidate.relative_to(shared_root).parts:
+        current = current / component
+        if current.exists() and current.is_symlink():
+            raise ValueError(f"Team artifact paths may not traverse symlinks: {current}")
+    return candidate
+
+
+def _assert_artifact_write_scope(settings: RedisTeamSettings, args: dict[str, Any]) -> None:
+    scope = _trim(args.get("scope") or "member").lower()
+    role = settings.role.lower()
+    member_id = settings.member_id.lower()
+    if scope == "team" and "leader" not in role and "leader" not in member_id:
+        raise ValueError("Only the Team Leader may write team-scoped artifacts; members must use scope=member")
+
+
+def _shared_workspace_for_target(
+    settings: RedisTeamSettings,
+    inherited: Any,
+    target_member_id: str,
+    root_task_id: str,
+) -> dict[str, Any]:
+    workspace = dict(inherited) if isinstance(inherited, dict) else {}
+    physical_path = _trim(workspace.get("physicalPath")) or settings.shared_dir
+    task_ref = _safe_name(root_task_id or "unscoped")
+    member_ref = _safe_name(target_member_id or settings.member_id)
+    workspace.update(
+        {
+            "physicalPath": physical_path,
+            "canonicalPrefix": "/team",
+            "memberArtifactPhysicalRoot": str(Path(physical_path) / "artifacts" / task_ref / "members" / member_ref),
+            "memberArtifactCanonicalRoot": f"/team/artifacts/{task_ref}/members/{member_ref}",
+        }
+    )
+    return workspace
+
+
+def _tool_team_artifact_write(args: dict[str, Any], **_kwargs) -> str:
+    settings = load_settings(None)
+    try:
+        _assert_artifact_write_scope(settings, args)
+        target = _artifact_path(settings, args, default_scope="member")
+        _atomic_write_text(target, str(args.get("content") or ""))
+        return json.dumps({"ok": True, "artifact": {"path": canonical_artifact_ref(settings, target), "bytes": target.stat().st_size}}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+def _tool_team_artifact_read(args: dict[str, Any], **_kwargs) -> str:
+    settings = load_settings(None)
+    try:
+        target = _artifact_path(settings, args, default_scope="team")
+        max_bytes = min(1024 * 1024, max(1, int(args.get("maxBytes") or 256 * 1024)))
+        if not target.is_file():
+            raise ValueError("Team artifact is not a file")
+        if target.stat().st_size > max_bytes:
+            raise ValueError("Team artifact exceeds maxBytes")
+        return json.dumps({"ok": True, "artifact": {"path": canonical_artifact_ref(settings, target), "content": target.read_text(encoding="utf-8"), "bytes": target.stat().st_size}}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+def _tool_team_artifact_list(args: dict[str, Any], **_kwargs) -> str:
+    settings = load_settings(None)
+    try:
+        target = _artifact_path(settings, args, default_scope="team")
+        limit = min(200, max(1, int(args.get("limit") or 100)))
+        entries = []
+        for child in sorted(target.iterdir(), key=lambda item: item.name)[:limit]:
+            if child.is_symlink():
+                continue
+            entries.append({"name": child.name, "type": "directory" if child.is_dir() else "file", "path": canonical_artifact_ref(settings, child), "bytes": child.stat().st_size if child.is_file() else None})
+        return json.dumps({"ok": True, "path": canonical_artifact_ref(settings, target), "entries": entries}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+def _tool_team_artifact_mkdir(args: dict[str, Any], **_kwargs) -> str:
+    settings = load_settings(None)
+    try:
+        _assert_artifact_write_scope(settings, args)
+        target = _artifact_path(settings, args, default_scope="member")
+        target.mkdir(parents=True, exist_ok=True, mode=TEAM_SHARED_DIR_MODE)
+        target.chmod(TEAM_SHARED_DIR_MODE)
+        return json.dumps({"ok": True, "artifact": {"path": canonical_artifact_ref(settings, target)}}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
 
 def write_local_status(settings: RedisTeamSettings, patch: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -538,6 +667,12 @@ def normalize_envelope(raw: Any) -> Optional[dict[str, Any]]:
         "contextRefs": [x for x in raw.get("contextRefs", []) if x] if isinstance(raw.get("contextRefs"), list) else [],
         "artifacts": raw.get("artifacts") or [],
         "metadata": raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {},
+        "responseLocale": raw.get("responseLocale") or raw.get("response_locale") or (raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}).get("responseLocale") or "zh-CN",
+        "sharedWorkspace": raw.get("sharedWorkspace") or raw.get("shared_workspace") or (raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}).get("sharedWorkspace") or {},
+        "workspaceContract": raw.get("workspaceContract") or raw.get("workspace_contract") or (raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}).get("workspaceContract") or {},
+        "checkId": raw.get("checkId") or raw.get("check_id") or (raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}).get("checkId"),
+        "checkSequence": raw.get("checkSequence") or raw.get("check_sequence") or (raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}).get("checkSequence"),
+        "requestedAt": raw.get("requestedAt") or raw.get("requested_at") or (raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}).get("requestedAt"),
         "requiresCompletion": raw.get("requiresCompletion", True),
         "completionTool": raw.get("completionTool") or "team_complete_task",
         "resultSink": raw.get("resultSink") if isinstance(raw.get("resultSink"), dict) else {},
@@ -819,6 +954,11 @@ async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
     task_id = _trim(args.get("taskId")) or f"task_{uuid.uuid4().hex}"
     parent_envelope = read_task_envelope(settings, task_id) or {}
     root_task_id = parent_envelope.get("rootTaskId") or parent_envelope.get("taskId") or task_id
+    response_locale = _trim(args.get("responseLocale")) or parent_envelope.get("responseLocale") or "zh-CN"
+    try:
+        _assert_response_locale(response_locale, text, "Team assignment")
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
     title = _trim(args.get("title")) or "Team Message"
     explicit_work_id = _trim(args.get("workId")) or _trim(args.get("assignmentId"))
     work_id = explicit_work_id or _stable_assignment_id(
@@ -849,6 +989,9 @@ async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
         "ttlSeconds": args.get("ttlSeconds") if isinstance(args.get("ttlSeconds"), int) else 3600,
         "priority": _trim(args.get("priority")) or "normal",
         "metadata": args.get("metadata") if isinstance(args.get("metadata"), dict) else {},
+        "responseLocale": response_locale,
+        "sharedWorkspace": _shared_workspace_for_target(settings, parent_envelope.get("sharedWorkspace"), to, root_task_id),
+        "workspaceContract": parent_envelope.get("workspaceContract") or {},
         "createdAt": _now_iso(),
     }
     redis = AsyncRedisClient(settings.redis_url)
@@ -915,7 +1058,32 @@ async def _tool_team_update_progress(args: dict[str, Any], **_kwargs) -> str:
         progress = min(99, max(0, progress))
     else:
         progress = None
-    progress_payload = {**dict(args), "taskId": task_id, "status": status_text, "progress": progress}
+    envelope = read_task_envelope(settings, task_id) or {}
+    event_kind = _trim(args.get("eventKind") or args.get("event_kind")).lower()
+    passive_monitor_progress = event_kind in {"assignment_check_result", "assignment_check_requested", "assignment_heartbeat"}
+    try:
+        if not passive_monitor_progress or event_kind == "assignment_check_result":
+            _assert_response_locale(envelope.get("responseLocale") or "zh-CN", summary, "Team progress")
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+    progress_payload = {
+        **dict(args),
+        "taskId": task_id,
+        "status": status_text,
+        "progress": progress,
+        "rootTaskId": args.get("rootTaskId") or args.get("root_task_id") or envelope.get("rootTaskId") or envelope.get("taskId"),
+        "rootMessageId": args.get("rootMessageId") or args.get("root_message_id") or envelope.get("rootMessageId") or envelope.get("messageId"),
+        "workId": args.get("workId") or args.get("work_id") or envelope.get("workId") or envelope.get("assignmentId"),
+        "assignmentId": args.get("assignmentId") or args.get("assignment_id") or envelope.get("assignmentId") or envelope.get("workId"),
+        "rootTaskTerminal": False,
+        "nonAuthoritative": True,
+        "visibleToChat": args.get("visibleToChat") if "visibleToChat" in args else (args.get("visible_to_chat") if "visible_to_chat" in args else not passive_monitor_progress),
+        "responseLocale": envelope.get("responseLocale") or "zh-CN",
+        "checkId": (args.get("checkId") or args.get("check_id") or envelope.get("checkId") or envelope.get("messageId")) if passive_monitor_progress else None,
+        "checkSequence": (args.get("checkSequence") or args.get("check_sequence") or envelope.get("checkSequence")) if passive_monitor_progress else None,
+        "requestedAt": (args.get("requestedAt") or args.get("requested_at") or envelope.get("requestedAt")) if passive_monitor_progress else None,
+        "respondedAt": _now_iso() if event_kind == "assignment_check_result" else None,
+    }
     status = write_local_status(
         settings,
         {
@@ -944,6 +1112,10 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
     envelope = read_task_envelope(settings, task_id)
     if not envelope:
         return json.dumps({"error": f"team_complete_task could not resolve the task envelope: {task_id}"}, ensure_ascii=False)
+    try:
+        _assert_response_locale(envelope.get("responseLocale") or "zh-CN", summary + "\n" + _trim(args.get("resultMarkdown")), "Team completion")
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
     result = write_task_result(
         settings,
         task_id,
@@ -968,6 +1140,7 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
         "completionId": completion_id,
         "completionSource": COMPLETION_SOURCE,
         "explicitCompletion": True,
+        "responseLocale": envelope.get("responseLocale") or "zh-CN",
     }
     terminal = await _publish_terminal_event(settings, _completion_event_for_status(status_text), completion_payload)
     return json.dumps({"ok": True, **result, **terminal, "completionId": completion_id}, ensure_ascii=False)
@@ -1111,6 +1284,14 @@ class RedisTeamAdapter(BasePlatformAdapter):
         metadata = metadata or {}
         task_id = metadata.get("task_id") or chat_id
         message_id = f"reply_{uuid.uuid4().hex}"
+        if task_result_is_terminal(self.settings, str(task_id)):
+            logger.info("Redis Team: suppressed duplicate reply after explicit completion for %s", task_id)
+            return SendResult(success=True, message_id=message_id)
+        envelope = read_task_envelope(self.settings, str(task_id)) or {}
+        try:
+            _assert_response_locale(envelope.get("responseLocale") or "zh-CN", content, "Team reply")
+        except ValueError as exc:
+            return SendResult(success=False, error=str(exc))
         target = _reply_target(self.settings, metadata)
         event = event_for(
             self.settings,
@@ -1575,6 +1756,19 @@ class RedisTeamAdapter(BasePlatformAdapter):
         context_refs = envelope.get("contextRefs") or []
         if context_refs:
             text += "\n\nContext refs:\n" + "\n".join(f"- {ref}" for ref in context_refs)
+        response_locale = _trim(envelope.get("responseLocale")) or "zh-CN"
+        physical_shared_dir = _trim((envelope.get("sharedWorkspace") or {}).get("physicalPath")) or self.settings.shared_dir
+        root_task_id = _trim(envelope.get("rootTaskId") or envelope.get("taskId"))
+        member_artifact_root = _trim((envelope.get("sharedWorkspace") or {}).get("memberArtifactCanonicalRoot")) or f"/team/artifacts/{_safe_name(root_task_id)}/members/{_safe_name(self.settings.member_id)}"
+        text += (
+            "\n\nRedis Team delivery contract:\n"
+            "- Complete this assignment with team_complete_task; a normal reply may not reach ClawManager.\n"
+            "- Prefer team_artifact_write/read/list/mkdir for shared artifacts. /team is a canonical report prefix, not a pooled-runtime global directory.\n"
+            "- Never list, search, resolve, or scan the parent of the current Team shared directory, and never inspect sibling Team directories.\n"
+            f"- Current member artifact root: {member_artifact_root}\n"
+            f"- Use {response_locale} for all user-visible plans, progress, results, and synthesis. Preserve code and technical names.\n"
+            f"- Current Team physical shared directory: {physical_shared_dir}"
+        )
 
         event = MessageEvent(
             text=text,
@@ -1726,6 +1920,7 @@ def register(ctx) -> None:
                     "ttlSeconds": {"type": "integer"},
                     "priority": {"type": "string"},
                     "metadata": {"type": "object"},
+                    "responseLocale": {"type": "string"},
                 },
             },
         },
@@ -1752,6 +1947,87 @@ def register(ctx) -> None:
         requires_env=["CLAWMANAGER_TEAM_SHARED_DIR"],
         is_async=True,
         description="Read Redis Team status snapshots.",
+    )
+    artifact_path_properties = {
+        "path": {"type": "string", "description": "Relative Team artifact path; absolute paths and traversal are rejected"},
+        "scope": {"type": "string", "enum": ["member", "team"]},
+        "rootTaskId": {"type": "string"},
+    }
+    ctx.register_tool(
+        name="team_artifact_write",
+        toolset="redis_team",
+        schema={
+            "name": "team_artifact_write",
+            "description": "Atomically write a UTF-8 artifact inside the current Team workspace with cooperative permissions.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path", "content"],
+                "properties": {**artifact_path_properties, "content": {"type": "string"}},
+            },
+        },
+        handler=_tool_team_artifact_write,
+        check_fn=check_requirements,
+        requires_env=["CLAWMANAGER_TEAM_SHARED_DIR"],
+        is_async=False,
+        description="Write a current-Team artifact.",
+    )
+    ctx.register_tool(
+        name="team_artifact_read",
+        toolset="redis_team",
+        schema={
+            "name": "team_artifact_read",
+            "description": "Read a UTF-8 artifact from the current Team workspace without allowing traversal.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path"],
+                "properties": {**artifact_path_properties, "maxBytes": {"type": "integer", "minimum": 1, "maximum": 1048576}},
+            },
+        },
+        handler=_tool_team_artifact_read,
+        check_fn=check_requirements,
+        requires_env=["CLAWMANAGER_TEAM_SHARED_DIR"],
+        is_async=False,
+        description="Read a current-Team artifact.",
+    )
+    ctx.register_tool(
+        name="team_artifact_list",
+        toolset="redis_team",
+        schema={
+            "name": "team_artifact_list",
+            "description": "List artifacts in the current Team workspace without following symlinks.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path"],
+                "properties": {**artifact_path_properties, "limit": {"type": "integer", "minimum": 1, "maximum": 200}},
+            },
+        },
+        handler=_tool_team_artifact_list,
+        check_fn=check_requirements,
+        requires_env=["CLAWMANAGER_TEAM_SHARED_DIR"],
+        is_async=False,
+        description="List current-Team artifacts.",
+    )
+    ctx.register_tool(
+        name="team_artifact_mkdir",
+        toolset="redis_team",
+        schema={
+            "name": "team_artifact_mkdir",
+            "description": "Create a cooperative artifact directory inside the current Team workspace.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path"],
+                "properties": artifact_path_properties,
+            },
+        },
+        handler=_tool_team_artifact_mkdir,
+        check_fn=check_requirements,
+        requires_env=["CLAWMANAGER_TEAM_SHARED_DIR"],
+        is_async=False,
+        description="Create a current-Team artifact directory.",
     )
     ctx.register_tool(
         name="team_update_progress",
