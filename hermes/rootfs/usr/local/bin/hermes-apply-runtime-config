@@ -1170,7 +1170,6 @@ def ensure_bundled_redis_team_protocol_skill(hermes_home):
         "source": str(source_dir),
         "target": str(target_dir),
         "installed": False,
-        "updated": False,
         "skipped": "",
         "error": "",
         "updated_at": utc_now(),
@@ -1179,32 +1178,12 @@ def ensure_bundled_redis_team_protocol_skill(hermes_home):
     if not enabled:
         return record
 
-    def content_digest(root):
-        digest = hashlib.sha256()
-        for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
-            if not path.is_file():
-                continue
-            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(path.read_bytes())
-            digest.update(b"\0")
-        return digest.hexdigest()
-
     try:
-        if not source_dir.exists():
+        if target_dir.exists():
+            record["skipped"] = "target exists"
+        elif not source_dir.exists():
             record["error"] = "bundled redis-team-protocol skill is missing"
         else:
-            source_digest = content_digest(source_dir)
-            target_digest = content_digest(target_dir) if target_dir.exists() else ""
-            record["source_sha256"] = source_digest
-            record["previous_sha256"] = target_digest
-            if source_digest == target_digest:
-                record["skipped"] = "up to date"
-                persist_bootstrap_payload(hermes_home, "redis-team-protocol-skill", record)
-                return record
-            existed = target_dir.exists()
-            if existed:
-                shutil.rmtree(target_dir)
             target_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(source_dir, target_dir)
             for path in target_dir.rglob("*"):
@@ -1213,7 +1192,6 @@ def ensure_bundled_redis_team_protocol_skill(hermes_home):
                 else:
                     path.chmod(0o644)
             record["installed"] = True
-            record["updated"] = existed
     except Exception as exc:
         record["error"] = str(exc)
 

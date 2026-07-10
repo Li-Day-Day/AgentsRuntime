@@ -591,7 +591,7 @@ func (s *ExecProcessStarter) StartGateway(ctx context.Context, spec GatewayStart
 		return ManagedProcess{}, fmt.Errorf("create gateway home: %w", err)
 	}
 
-	command := LiteTeamGatewayCommand(spec.Command, spec.Env)
+	command := LiteTeamGatewayCommand(spec.RuntimeType, spec.Command, spec.Env)
 	cmd := exec.CommandContext(context.Background(), command[0], command[1:]...)
 	cmd.Env = spec.Env
 	cmd.Dir = spec.WorkspacePath

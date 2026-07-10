@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-umask "${CLAWMANAGER_TEAM_UMASK:-0002}"
-
 export HOME="${HOME:-/config}"
 export HERMES_HOME="${HERMES_HOME:-${HOME}/.hermes}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
@@ -18,8 +16,6 @@ mkdir -p \
     "${UV_CACHE_DIR}" \
     "${XDG_CONFIG_HOME}" \
     "${XDG_DATA_HOME}"
-
-/usr/local/bin/hermes-apply-runtime-config >/dev/null 2>&1 || true
 
 env_file="${HERMES_HOME}/.env"
 if [ -f "${env_file}" ]; then
@@ -45,14 +41,6 @@ host="${HOST:-0.0.0.0}"
 case "${port}" in
     ''|*[!0-9]*)
         echo "invalid Hermes dashboard port: ${port}" >&2
-        exit 64
-        ;;
-esac
-
-team_worker_port="${HERMES_TEAM_WORKER_PORT:-${CLAWMANAGER_TEAM_WORKER_PORT:-$((port + 10000))}}"
-case "${team_worker_port}" in
-    ''|*[!0-9]*)
-        echo "invalid Hermes Redis Team worker port: ${team_worker_port}" >&2
         exit 64
         ;;
 esac
@@ -96,7 +84,15 @@ shutdown() {
 
 trap shutdown INT TERM
 
-echo "Starting Hermes dashboard gateway: dashboard_port=${port} host=${host}"
+if should_start_team_gateway; then
+    echo "Starting Hermes Redis Team consumer for member ${CLAWMANAGER_TEAM_MEMBER_ID}"
+    (
+        cd "${HOME}"
+        exec hermes gateway run --accept-hooks --no-supervise
+    ) &
+    team_gateway_pid="$!"
+fi
+
 hermes dashboard \
     --host "${host}" \
     --port "${port}" \
@@ -104,34 +100,6 @@ hermes dashboard \
     --insecure \
     --skip-build &
 dashboard_pid="$!"
-echo "Hermes dashboard gateway started: dashboard_pid=${dashboard_pid} dashboard_port=${port}"
-
-if should_start_team_gateway; then
-    echo "Starting Hermes Redis Team consumer: member=${CLAWMANAGER_TEAM_MEMBER_ID} dashboard_port=${port} team_worker_port=${team_worker_port}"
-    (
-        team_worker_home="${HERMES_TEAM_WORKER_HOME:-${HOME}/.clawmanager-team-worker}"
-        export HOME="${team_worker_home}"
-        export HERMES_HOME="${team_worker_home}/.hermes"
-        export XDG_CACHE_HOME="${team_worker_home}/.cache"
-        export XDG_CONFIG_HOME="${team_worker_home}/.config"
-        export XDG_DATA_HOME="${team_worker_home}/.local/share"
-        export NPM_CONFIG_CACHE="${XDG_CACHE_HOME}/npm"
-        export UV_CACHE_DIR="${XDG_CACHE_HOME}/uv"
-        export CLAWMANAGER_GATEWAY_PORT="${team_worker_port}"
-        export PORT="${team_worker_port}"
-        mkdir -p \
-            "${HERMES_HOME}" \
-            "${NPM_CONFIG_CACHE}" \
-            "${UV_CACHE_DIR}" \
-            "${XDG_CONFIG_HOME}" \
-            "${XDG_DATA_HOME}"
-        /usr/local/bin/hermes-apply-runtime-config >/dev/null 2>&1 || true
-        cd "${team_worker_home}"
-        exec hermes gateway run --accept-hooks --no-supervise
-    ) &
-    team_gateway_pid="$!"
-    echo "Hermes Redis Team consumer started: team_gateway_pid=${team_gateway_pid} team_worker_port=${team_worker_port}"
-fi
 
 wait "${dashboard_pid}"
 status="$?"
@@ -139,9 +107,7 @@ dashboard_pid=""
 
 if [ -n "${team_gateway_pid}" ]; then
     kill "${team_gateway_pid}" 2>/dev/null || true
-    team_status=0
-    wait "${team_gateway_pid}" 2>/dev/null || team_status="$?"
-    echo "Hermes Redis Team consumer stopped: team_gateway_pid=${team_gateway_pid} status=${team_status}"
+    wait "${team_gateway_pid}" 2>/dev/null || true
 fi
 
 exit "${status}"

@@ -205,6 +205,7 @@ func TestWriteOpenClawGatewayConfigUsesRequestEnvironmentLLMOverrides(t *testing
 func TestWriteOpenClawGatewayConfigWritesLiteTeamConfigJSON(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-69")
 	req := CreateGatewayRequest{
+		AgentType:  "openclaw",
 		InstanceID: 69,
 		UserID:     45,
 		UID:        200069,
@@ -248,6 +249,7 @@ func TestWriteOpenClawGatewayConfigEnablesRedisTeamForLiteTeam(t *testing.T) {
 	t.Setenv("CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR", sourcePlugin)
 
 	req := CreateGatewayRequest{
+		AgentType:  "openclaw",
 		InstanceID: 106,
 		UserID:     1,
 		UID:        200106,

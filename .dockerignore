@@ -7,4 +7,3 @@
 !plugins/openclaw-redis-team/dist/
 !plugins/openclaw-redis-team/dist/**
 **/coverage
-runtime-team-optimization-docs/

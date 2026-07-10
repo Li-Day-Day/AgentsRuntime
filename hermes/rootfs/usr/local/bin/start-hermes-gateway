@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-umask "${CLAWMANAGER_TEAM_UMASK:-0002}"
-
 export HOME="${HOME:-/config}"
 export HERMES_HOME="${HERMES_HOME:-/config/.hermes}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/config/.cache}"
@@ -100,7 +98,7 @@ if [ "$(id -u)" = "0" ]; then
         fi
     fi
     if command -v s6-setuidgid >/dev/null 2>&1 && id abc >/dev/null 2>&1; then
-        exec s6-setuidgid abc /bin/bash -lc 'cd /config && exec hermes gateway run --accept-hooks --no-supervise'
+        exec s6-setuidgid abc /bin/bash -lc 'cd /config && exec hermes gateway'
     fi
 fi
 

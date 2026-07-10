@@ -9,11 +9,11 @@ import (
 
 func TestLiteTeamGatewayCommandOnlyWrapsTeamGateway(t *testing.T) {
 	command := []string{"openclaw", "gateway", "run"}
-	if got := LiteTeamGatewayCommand(command, []string{"CLAWMANAGER_TEAM_ENABLED=false"}); !reflect.DeepEqual(got, command) {
+	if got := LiteTeamGatewayCommand("openclaw", command, []string{"CLAWMANAGER_TEAM_ENABLED=false"}); !reflect.DeepEqual(got, command) {
 		t.Fatalf("non-Team command changed: %#v", got)
 	}
 
-	got := LiteTeamGatewayCommand(command, []string{
+	got := LiteTeamGatewayCommand("openclaw", command, []string{
 		"CLAWMANAGER_TEAM_ENABLED=true",
 		"CLAWMANAGER_TEAM_UMASK=0002",
 	})
@@ -24,7 +24,7 @@ func TestLiteTeamGatewayCommandOnlyWrapsTeamGateway(t *testing.T) {
 }
 
 func TestLiteTeamGatewayCommandRejectsInvalidUmask(t *testing.T) {
-	got := LiteTeamGatewayCommand([]string{"gateway"}, []string{
+	got := LiteTeamGatewayCommand("openclaw", []string{"gateway"}, []string{
 		"CLAWMANAGER_TEAM_ENABLED=true",
 		"CLAWMANAGER_TEAM_UMASK=0022; touch /tmp/escaped",
 	})
@@ -33,10 +33,75 @@ func TestLiteTeamGatewayCommandRejectsInvalidUmask(t *testing.T) {
 	}
 }
 
+func TestLiteTeamBehaviorIsHardGatedToOpenClawRuntime(t *testing.T) {
+	for _, runtimeType := range []string{"openclaw-shell", "hermes", "unknown"} {
+		t.Run(runtimeType, func(t *testing.T) {
+			root := t.TempDir()
+			shared := filepath.Join(root, "teams", "user-1", "team-54-shared")
+			workspace := filepath.Join(root, runtimeType, "user-1", "instance-2")
+			req := CreateGatewayRequest{
+				AgentType:     runtimeType,
+				InstanceID:    2,
+				UserID:        1,
+				WorkspacePath: workspace,
+				Environment: map[string]string{
+					"CLAWMANAGER_TEAM_ENABLED":     "true",
+					"CLAWMANAGER_TEAM_CONFIG_JSON": `{ "teamId": "54" }`,
+					"CLAWMANAGER_TEAM_SHARED_DIR":  shared,
+				},
+			}
+
+			if _, _, ok := LiteTeamEnvironment(req, workspace); ok {
+				t.Fatal("non-OpenClaw runtime received Lite Team environment")
+			}
+			inputEnv := []string{"CLAWMANAGER_TEAM_CONFIG_PATH=/etc/clawmanager/team/team.json"}
+			if got := ApplyLiteTeamConfigEnvironment(append([]string(nil), inputEnv...), req, workspace); !reflect.DeepEqual(got, inputEnv) {
+				t.Fatalf("non-OpenClaw runtime remapped Team environment: %#v", got)
+			}
+			if err := WriteLiteTeamConfigJSON(req, workspace); err != nil {
+				t.Fatalf("WriteLiteTeamConfigJSON() error = %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(shared, "team.json")); !os.IsNotExist(err) {
+				t.Fatalf("non-OpenClaw runtime wrote team.json: %v", err)
+			}
+			if _, err := PrepareWorkspace(root, runtimeType, req); err != nil {
+				t.Fatalf("PrepareWorkspace() error = %v", err)
+			}
+			if _, err := os.Stat(shared); !os.IsNotExist(err) {
+				t.Fatalf("non-OpenClaw runtime created shared Team workspace: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(workspace, "home", ".openclaw", "workspace", "team")); !os.IsNotExist(err) {
+				t.Fatalf("non-OpenClaw runtime created OpenClaw Team alias: %v", err)
+			}
+			command := []string{"gateway", "run"}
+			if got := LiteTeamGatewayCommand(runtimeType, command, []string{"CLAWMANAGER_TEAM_ENABLED=true"}); !reflect.DeepEqual(got, command) {
+				t.Fatalf("non-OpenClaw runtime received Team umask wrapper: %#v", got)
+			}
+		})
+	}
+}
+
+func TestOpenClawNonTeamDoesNotCreateTeamWorkspace(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "openclaw", "user-1", "instance-2")
+	req := CreateGatewayRequest{
+		AgentType:     "openclaw",
+		InstanceID:    2,
+		UserID:        1,
+		WorkspacePath: workspace,
+	}
+	if _, err := PrepareWorkspace(root, "openclaw", req); err != nil {
+		t.Fatalf("PrepareWorkspace() error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(workspace, "home", ".openclaw", "workspace", "team")); !os.IsNotExist(err) {
+		t.Fatalf("non-Team OpenClaw runtime created Team alias: %v", err)
+	}
+}
+
 func TestLiteTeamEnvironmentRemapsGlobalConfigPath(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "openclaw", "user-1", "instance-2")
 	shared := filepath.Join(t.TempDir(), "teams", "user-1", "team-54-shared")
-	req := CreateGatewayRequest{Environment: map[string]string{
+	req := CreateGatewayRequest{AgentType: "openclaw", Environment: map[string]string{
 		"CLAWMANAGER_TEAM_ENABLED":     "true",
 		"CLAWMANAGER_TEAM_CONFIG_JSON": `{ "teamId": "54" }`,
 		"CLAWMANAGER_TEAM_CONFIG_PATH": "/etc/clawmanager/team/team.json",
@@ -58,7 +123,7 @@ func TestWriteLiteTeamConfigRejectsEscapedPathBeforeWriting(t *testing.T) {
 	root := t.TempDir()
 	shared := filepath.Join(root, "teams", "user-1", "team-54-shared")
 	escaped := filepath.Join(root, "outside", "team.json")
-	req := CreateGatewayRequest{Environment: map[string]string{
+	req := CreateGatewayRequest{AgentType: "openclaw", Environment: map[string]string{
 		"CLAWMANAGER_TEAM_ENABLED":     "true",
 		"CLAWMANAGER_TEAM_CONFIG_JSON": `{ "teamId": "54" }`,
 		"CLAWMANAGER_TEAM_CONFIG_PATH": escaped,
@@ -75,7 +140,7 @@ func TestWriteLiteTeamConfigRejectsEscapedPathBeforeWriting(t *testing.T) {
 func TestPrepareLiteTeamSharedWorkspaceRejectsOtherTeamPath(t *testing.T) {
 	root := t.TempDir()
 	workspace := filepath.Join(root, "openclaw", "user-1", "instance-2")
-	req := CreateGatewayRequest{UserID: 1, Environment: map[string]string{
+	req := CreateGatewayRequest{AgentType: "openclaw", UserID: 1, Environment: map[string]string{
 		"CLAWMANAGER_TEAM_ENABLED":    "true",
 		"CLAWMANAGER_TEAM_ID":         "54",
 		"CLAWMANAGER_TEAM_MEMBER_ID":  "pm",

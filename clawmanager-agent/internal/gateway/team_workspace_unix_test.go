@@ -21,9 +21,10 @@ func TestPrepareLiteTeamSharedWorkspaceRepairsPermissionsAndCreatesInstanceAlias
 		t.Fatal(err)
 	}
 	req := CreateGatewayRequest{
-		UserID: 1,
-		UID:    os.Getuid(),
-		GID:    os.Getgid(),
+		AgentType: "openclaw",
+		UserID:    1,
+		UID:       os.Getuid(),
+		GID:       os.Getgid(),
 		Environment: map[string]string{
 			"CLAWMANAGER_TEAM_ENABLED":    "true",
 			"CLAWMANAGER_TEAM_ID":         "54",
@@ -70,9 +71,10 @@ func TestPrepareLiteTeamSharedWorkspacePreservesNonEmptyPrivateDirectory(t *test
 		t.Fatal(err)
 	}
 	req := CreateGatewayRequest{
-		UserID: 1,
-		UID:    os.Getuid(),
-		GID:    os.Getgid(),
+		AgentType: "openclaw",
+		UserID:    1,
+		UID:       os.Getuid(),
+		GID:       os.Getgid(),
 		Environment: map[string]string{
 			"CLAWMANAGER_TEAM_ENABLED":    "true",
 			"CLAWMANAGER_TEAM_ID":         "55",

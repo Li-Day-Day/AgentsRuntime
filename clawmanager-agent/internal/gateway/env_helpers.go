@@ -25,6 +25,9 @@ func ApplyRequestEnvironment(env []string, req CreateGatewayRequest) []string {
 }
 
 func ApplyLiteTeamConfigEnvironment(env []string, req CreateGatewayRequest, workspacePath string) []string {
+	if !isOpenClawLiteRuntime(req.AgentType) {
+		return env
+	}
 	configPath, sharedDir, ok := LiteTeamEnvironment(req, workspacePath)
 	if !ok {
 		return env
@@ -39,6 +42,9 @@ func ApplyLiteTeamConfigEnvironment(env []string, req CreateGatewayRequest, work
 }
 
 func WriteLiteTeamConfigJSON(req CreateGatewayRequest, workspacePath string) error {
+	if !isOpenClawLiteRuntime(req.AgentType) {
+		return nil
+	}
 	raw, ok := requestEnvValue(req, teamConfigJSONEnv)
 	if !ok || strings.TrimSpace(raw) == "" {
 		return nil
@@ -85,6 +91,9 @@ func WriteLiteTeamConfigJSON(req CreateGatewayRequest, workspacePath string) err
 }
 
 func LiteTeamEnvironment(req CreateGatewayRequest, workspacePath string) (string, string, bool) {
+	if !isOpenClawLiteRuntime(req.AgentType) {
+		return "", "", false
+	}
 	configJSON, hasConfigJSON := requestEnvValue(req, teamConfigJSONEnv)
 	teamEnabled, hasTeamEnabled := requestEnvValue(req, "CLAWMANAGER_TEAM_ENABLED")
 	if (!hasConfigJSON || strings.TrimSpace(configJSON) == "") && (!hasTeamEnabled || !truthyTeamEnv(teamEnabled)) {
@@ -119,8 +128,8 @@ func LiteTeamEnvironment(req CreateGatewayRequest, workspacePath string) (string
 	return configPath, sharedDir, true
 }
 
-func LiteTeamGatewayCommand(command, env []string) []string {
-	if len(command) == 0 || !truthyTeamEnv(envValue(env, "CLAWMANAGER_TEAM_ENABLED")) {
+func LiteTeamGatewayCommand(runtimeType string, command, env []string) []string {
+	if len(command) == 0 || !isOpenClawLiteRuntime(runtimeType) || !truthyTeamEnv(envValue(env, "CLAWMANAGER_TEAM_ENABLED")) {
 		return command
 	}
 	umask := strings.TrimSpace(envValue(env, teamUmaskEnv))
@@ -129,6 +138,10 @@ func LiteTeamGatewayCommand(command, env []string) []string {
 	}
 	wrapped := []string{"/bin/sh", "-c", `umask "$1"; shift; exec "$@"`, "clawmanager-team-gateway", umask}
 	return append(wrapped, command...)
+}
+
+func isOpenClawLiteRuntime(runtimeType string) bool {
+	return strings.TrimSpace(runtimeType) == "openclaw"
 }
 
 func applyEnvironmentMap(env []string, values map[string]string) []string {

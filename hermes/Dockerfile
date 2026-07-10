@@ -103,9 +103,9 @@ RUN set -eux; \
     rm -rf /root/.cache /root/.npm /tmp/*
 
 COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
-# Install the canonical Redis Team adapter directly so image contents cannot
-# drift from the source reviewed and tested in this repository.
-COPY plugins/hermes-redis-team/ /tmp/hermes-vendor-plugins/redis_team/
+# Canonical source lives at plugins/hermes-redis-team. This vendor copy keeps
+# the Hermes image build independent from plugin workspace layout changes.
+COPY hermes/vendor-plugins/redis_team/ /tmp/hermes-vendor-plugins/redis_team/
 COPY hermes/rootfs/ /
 
 ENV SHELL=/bin/bash
