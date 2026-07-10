@@ -3,6 +3,8 @@ package httpserver
 import (
 	"context"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"time"
 
@@ -103,6 +105,12 @@ func openClawWaitReady(snapshot process.Snapshot) bool {
 }
 
 func openClawWaitPage(target string) string {
+	if gatewayToken := os.Getenv("OPENCLAW_GATEWAY_TOKEN"); gatewayToken != "" {
+		// Keep the token server-side until the wait page is rendered. Do not
+		// attach it to the wait-page query string or browser launch arguments.
+		target = "http://localhost:18789/#token=" + url.QueryEscape(gatewayToken)
+	}
+
 	return `<!doctype html>
 <html lang="zh-CN">
 <head>
