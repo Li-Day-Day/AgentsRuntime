@@ -4,4 +4,6 @@
 **/.DS_Store
 **/node_modules
 **/dist
+!plugins/openclaw-redis-team/dist/
+!plugins/openclaw-redis-team/dist/**
 **/coverage

@@ -27,12 +27,21 @@ for (const token of [
   if (!dist.includes(token)) throw new Error(`dist/index.js missing Redis Team protocol token: ${token}`);
 }
 for (const token of [
-  "completeActiveTaskFromText",
+  "completeActiveTask",
   "failActiveTask",
+  "xaddTerminalOnce",
+  "completionKey",
+  "processedMessageKey",
+  "stableAssignmentId",
+  "validateArtifactRefs",
   "isActiveCompletionTarget",
   "taskIdAliases",
   "writeTaskEnvelope",
   "readTaskEnvelope",
+  "runtimeStateDir",
+  "privateTaskEnvelopePath",
+  "writeJsonBestEffort",
+  "TEAM_SHARED_DIR_MODE = 0o2775",
   "isTaskTerminal",
   "statusIsActive",
   "pendingDrainBatches",
@@ -42,25 +51,63 @@ for (const token of [
   "targetResolver",
   "inferTargetChatType",
   "baseSessionKey",
-  "attachedResults",
-  "sendText",
   "completionMessageId",
+  "completionId",
+  "completionSource",
+  "explicitCompletion",
+  "WIRE_SCHEMA_VERSION = 1",
+  "PROTOCOL_VERSION = 3",
+  "completion_proposed",
+  "waitForCompletionAcknowledgement",
+  "waitForTerminalCompletionState",
+  "completion-state:",
+  "artifact_changed",
+  "waivers",
+  "skippedAssignments",
+  "completion_pending",
+  "waiting_completion",
   "resultMarkdown",
+  "Math.min(99",
+  "await writeText(resultMarkdownPath, resultMarkdown)",
   "message_failed",
-  "dispatch finished without reply/completion",
+  "assignment-",
+  "team_artifact_write",
+  "team_artifact_read",
+  "team_artifact_list",
+  "team_artifact_mkdir",
+  "assertNoArtifactSymlinkTraversal",
+  "assertTeamArtifactWriteScope",
+  "assertResponseLocale",
+  "sharedWorkspaceForTarget",
+  "suppressed duplicate reply after submitted completion",
 ]) {
   if (!dist.includes(token)) throw new Error(`dist/index.js missing Redis Team completion token: ${token}`);
-}
-if (dist.includes("leaving task running")) {
-  throw new Error("dist/index.js must not leave Redis Team tasks running after dispatch returns");
 }
 if (dist.includes("params.taskId === activeEnvelope.taskId")) {
   throw new Error("dist/index.js must match active Redis Team task ids through aliases");
 }
-if (!dist.includes("activeTaskCompleted = true;")) {
-  throw new Error("dist/index.js must mark active Redis Team tasks completed after an explicit completion/reply");
+if (dist.includes('path.join(cfg.sharedDir, ".openclaw-redis-team", "tasks"')) {
+  throw new Error("member-scoped Redis Team envelopes must not require a shared NFS .openclaw-redis-team/tasks directory");
 }
-if (!dist.includes('const runtimeStatus = params.status === "succeeded" ? "succeeded" : "failed"')) {
-  throw new Error("dist/index.js must set runtimeStatus when completing Redis Team tasks");
+const deliverStart = dist.indexOf("deliver: async (payload) => {");
+const deliverEnd = dist.indexOf("onRecordError:", deliverStart);
+if (deliverStart < 0 || deliverEnd < 0) throw new Error("unable to locate Redis Team deliver callback");
+const deliverBody = dist.slice(deliverStart, deliverEnd);
+if (deliverBody.includes("completeActiveTask") || deliverBody.includes('"task_completed"')) {
+  throw new Error("normal Redis Team replies must not complete the business task");
+}
+if (!deliverBody.includes("runtime.isActiveTaskCompleted")) {
+  throw new Error("normal Redis Team replies must be suppressed after explicit completion");
+}
+for (const tool of ["team_artifact_write", "team_artifact_read", "team_artifact_list", "team_artifact_mkdir"]) {
+  if (!manifest.contracts?.tools?.includes(tool)) {
+    throw new Error(`openclaw.plugin.json missing tool contract: ${tool}`);
+  }
+}
+if (dist.includes("seenMessageIds")) {
+  throw new Error("dist/index.js must use Redis-backed message idempotency instead of process memory");
+}
+if (!dist.includes('const runtimeStatus = "completion_pending"')) {
+  throw new Error("dist/index.js must wait for backend acknowledgement before marking Redis Team tasks terminal");
 }
 console.log("openclaw-redis-team build check passed");

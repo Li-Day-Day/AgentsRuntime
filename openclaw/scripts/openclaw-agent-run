@@ -1,6 +1,8 @@
 #!/usr/bin/with-contenv bash
 set -euo pipefail
 
+umask "${CLAWMANAGER_TEAM_UMASK:-0002}"
+
 AGENT_USER="abc"
 AGENT_BIN="/usr/local/bin/openclaw-agent"
 AGENT_DATA_DIR="/var/lib/openclaw-agent"

@@ -22,6 +22,7 @@ func TestWriteGatewayConfigWritesHermesWorkspaceConfig(t *testing.T) {
 	}
 
 	req := gateway.CreateGatewayRequest{
+		AgentType:  "hermes",
 		InstanceID: 63,
 		UserID:     45,
 		UID:        os.Getuid(),
@@ -104,16 +105,8 @@ func TestWriteGatewayConfigWritesHermesWorkspaceConfig(t *testing.T) {
 		t.Fatalf("trusted_proxies = %#v", gatewayConfig["trusted_proxies"])
 	}
 
-	teamData, err := os.ReadFile(filepath.Join(workspace, "team", "team.json"))
-	if err != nil {
-		t.Fatalf("read lite team config: %v", err)
-	}
-	var teamConfig map[string]any
-	if err := json.Unmarshal(teamData, &teamConfig); err != nil {
-		t.Fatalf("parse lite team config: %v", err)
-	}
-	if teamConfig["teamId"] != "team-1" {
-		t.Fatalf("teamId = %#v, want team-1", teamConfig["teamId"])
+	if _, err := os.Stat(filepath.Join(workspace, "team", "team.json")); !os.IsNotExist(err) {
+		t.Fatalf("Hermes wrote Lite Team config: %v", err)
 	}
 }
 

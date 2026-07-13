@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -11,9 +11,14 @@ const CHANNEL_ID = "redis-team";
 const DEFAULT_SHARED_DIR = "/team";
 const DEFAULT_GROUP = "team-members";
 const DEFAULT_EMBEDDED_TIMEOUT_SECONDS = 1800;
+const DEFAULT_ASSIGNMENT_HEARTBEAT_SECONDS = 30;
 const STATUS_INTERVAL_MS = 15000;
 const READ_BLOCK_MS = 15000;
-const SCHEMA_VERSION = 1;
+const WIRE_SCHEMA_VERSION = 1;
+const PROTOCOL_VERSION = 3;
+const COMPLETION_SOURCE = "team_complete_task";
+const TEAM_SHARED_DIR_MODE = 0o2775;
+const RUNTIME_PRIVATE_DIR_MODE = 0o700;
 const SYSTEM_REPLY_TARGETS = new Set([
   "clawmanager",
   "manager",
@@ -44,6 +49,28 @@ function intFrom(value, fallback) {
 function safeName(value) {
   return String(value || "unknown").replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 160);
 }
+const warnedRuntimePaths = new Set();
+
+function warnOnce(key, message) {
+  if (warnedRuntimePaths.has(key)) return;
+  warnedRuntimePaths.add(key);
+  console.warn("[redis-team] " + message);
+}
+
+function stableAssignmentId(cfg, params) {
+  const target = safeName(params?.to || "member");
+  const seed = [
+    cfg?.teamId || "",
+    cfg?.memberId || "",
+    params?.rootTaskId || "",
+    params?.taskId || "",
+    params?.to || "",
+    params?.title || "",
+    params?.text || "",
+  ].join("\n");
+  const digest = createHash("sha256").update(seed).digest("hex").slice(0, 12);
+  return `assignment-${target}-${digest}`;
+}
 function taskIdAliases(value) {
   const raw = trim(value);
   if (!raw) return [];
@@ -62,11 +89,64 @@ function taskIdsMatch(left, right) {
   const rightAliases = new Set(taskIdAliases(right));
   return taskIdAliases(left).some((alias) => rightAliases.has(alias));
 }
+function isGeneratedRuntimeTaskId(value) {
+  return /^task_[0-9a-f-]{16,}$/i.test(trim(value));
+}
+function isClawManagerRootTaskRef(value) {
+  return /^team-\d+-task-\d+$/i.test(trim(value));
+}
+function regexEscape(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function extractLabeledValue(text, labels) {
+  const body = String(text || "");
+  if (!body.trim()) return "";
+  for (const label of labels || []) {
+    const pattern = new RegExp(
+      "(?:^|[\\r\\n])\\s*(?:[-*]\\s*)?(?:\\*\\*)?" +
+        regexEscape(label) +
+        "(?:\\*\\*)?\\s*[:=\\uFF1A]\\s*`?([A-Za-z0-9_.:-]+)",
+      "i",
+    );
+    const match = body.match(pattern);
+    if (match?.[1]) return trim(match[1]);
+  }
+  return "";
+}
+function preferredRootTaskId(...values) {
+  let generated = "";
+  for (const value of values) {
+    const candidate = trim(value);
+    if (!candidate) continue;
+    if (isGeneratedRuntimeTaskId(candidate)) {
+      if (!generated) generated = candidate;
+      continue;
+    }
+    return candidate;
+  }
+  return generated;
+}
 function nowIso() {
   return new Date().toISOString();
 }
 function redisClientName(cfg, purpose) {
   return ["redis-team", safeName(cfg.teamId), safeName(cfg.memberId), purpose].join(":").slice(0, 512);
+}
+function completionIdFor(cfg, taskId) {
+  return ["completion", safeName(cfg.teamId), safeName(taskId), safeName(cfg.memberId)].join(":");
+}
+function completionKey(cfg, completionId) {
+  return keyPrefix(cfg) + ":completions:" + safeName(completionId);
+}
+function redisKeyPart(value) {
+  const normalized = trim(value) || "unknown";
+  return normalized.replace(/[^A-Za-z0-9_.:-]/g, "-");
+}
+function completionAckKey(cfg, completionId, attemptId) {
+  return keyPrefix(cfg) + ":completion-ack:" + redisKeyPart(completionId) + ":" + redisKeyPart(attemptId);
+}
+function completionStateKey(cfg, completionId) {
+  return keyPrefix(cfg) + ":completion-state:" + redisKeyPart(completionId);
 }
 function deriveTeamIdFromKey(value) {
   const raw = trim(value);
@@ -114,15 +194,19 @@ async function resolveRedisTeamTarget(cfg, value) {
   if (!isSafeMemberTarget(target.to)) {
     return Object.assign(target, { route: "unknown", error: "unknown Redis Team target: " + target.originalTo });
   }
-  const statuses = await readStatuses(cfg);
-  if (!statuses.length || target.to === cfg.memberId) {
+  if (target.to === cfg.memberId || safeName(target.to) === safeName(cfg.memberId)) {
     return Object.assign(target, { route: "member" });
   }
-  const known = statuses.some((status) => {
-    const memberId = trim(status?.memberId);
-    return memberId === target.to || safeName(memberId) === target.to;
-  });
-  if (known) return Object.assign(target, { route: "member" });
+  const roster = await readTeamRoster(cfg);
+  if (roster.members.length) {
+    if (isKnownRosterTarget(roster, target.to)) return Object.assign(target, { route: "member" });
+    return Object.assign(target, { route: "unknown", error: "unknown Redis Team target: " + target.originalTo });
+  }
+  const statuses = await readRawStatuses(cfg);
+  if (!statuses.length) return Object.assign(target, { route: "member" });
+  if (statuses.some((status) => statusMatchesTarget(status, target.to))) {
+    return Object.assign(target, { route: "member" });
+  }
   return Object.assign(target, { route: "unknown", error: "unknown Redis Team target: " + target.originalTo });
 }
 
@@ -282,6 +366,8 @@ function readChannelConfig(cfg, accountId = "default") {
     role: trim(account.role) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_ROLE) : "") || "member",
     sharedDir:
       trim(account.sharedDir) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_SHARED_DIR) : "") || DEFAULT_SHARED_DIR,
+    teamConfigPath:
+      trim(account.teamConfigPath) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_CONFIG_PATH) : ""),
     managerUrl:
       trim(account.managerUrl) || (fromEnv ? trim(env.CLAWMANAGER_TEAM_MANAGER_URL) : ""),
     autoRun:
@@ -336,19 +422,264 @@ function hasRequiredRedisTeamKeys(cfg) {
 }
 
 // ============ Helpers ============
-async function ensureDirs(cfg) {
-  await fs.mkdir(path.join(cfg.sharedDir, "inbox"), { recursive: true });
-  await fs.mkdir(path.join(cfg.sharedDir, "status"), { recursive: true });
-  await fs.mkdir(path.join(cfg.sharedDir, "tasks"), { recursive: true });
-  await fs.mkdir(path.join(cfg.sharedDir, "results"), { recursive: true });
-  await fs.mkdir(path.join(cfg.sharedDir, ".openclaw-redis-team"), { recursive: true });
+function runtimeStateDir(cfg) {
+  const home = trim(process.env.HOME);
+  const stateHome = trim(process.env.XDG_STATE_HOME);
+  const base = stateHome || (home ? path.join(home, ".openclaw", "redis-team") : path.join(process.cwd(), ".openclaw-redis-team"));
+  return path.join(base, "teams", safeName(cfg.teamId || "team"), safeName(cfg.memberId || "member"));
 }
 
-async function writeJson(file, value) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
+function privateTaskEnvelopePath(cfg, alias) {
+  return path.join(runtimeStateDir(cfg), "tasks", safeName(alias) + ".json");
+}
+
+async function mkdirBestEffort(dir, mode, label) {
+  try {
+    await fs.mkdir(dir, { recursive: true, mode });
+  } catch (err) {
+    warnOnce("mkdir:" + dir, `${label}: unable to create ${dir}: ${err?.message || String(err)}`);
+    return false;
+  }
+  try {
+    await fs.chmod(dir, mode);
+  } catch (err) {
+    warnOnce("chmod:" + dir, `${label}: unable to enforce permissions on ${dir}: ${err?.message || String(err)}`);
+  }
+  return true;
+}
+
+async function ensureDirs(cfg) {
+  for (const name of ["inbox", "status", "tasks", "results"]) {
+    await mkdirBestEffort(path.join(cfg.sharedDir, name), TEAM_SHARED_DIR_MODE, "shared workspace");
+  }
+  await mkdirBestEffort(path.join(runtimeStateDir(cfg), "tasks"), RUNTIME_PRIVATE_DIR_MODE, "runtime private state");
+}
+
+async function writeJson(file, value, fileMode = 0o664, dirMode = TEAM_SHARED_DIR_MODE) {
+  await mkdirBestEffort(path.dirname(file), dirMode, "JSON parent");
   const tmp = file + "." + process.pid + "." + Date.now() + "." + randomUUID() + ".tmp";
   await fs.writeFile(tmp, JSON.stringify(value, null, 2) + "\n", "utf8");
+  await fs.chmod(tmp, fileMode);
   await fs.rename(tmp, file);
+  await fs.chmod(file, fileMode);
+}
+function assertResponseLocale(locale, text, label) {
+  const normalizedLocale = trim(locale).toLowerCase();
+  const body = String(text || "");
+  if (normalizedLocale.startsWith("zh") && body.trim() && !/[\u3400-\u9fff]/u.test(body)) {
+    throw new Error(`${label || "Team output"} must use ${locale || "zh-CN"}; rewrite the user-visible prose in Chinese while preserving code and technical names.`);
+  }
+}
+
+async function writeJsonBestEffort(file, value, label, fileMode = 0o664, dirMode = TEAM_SHARED_DIR_MODE) {
+  try {
+    await writeJson(file, value, fileMode, dirMode);
+    return true;
+  } catch (err) {
+    warnOnce("write:" + file, `${label}: unable to write ${file}: ${err?.message || String(err)}`);
+    return false;
+  }
+}
+
+async function writeText(file, value) {
+  await mkdirBestEffort(path.dirname(file), TEAM_SHARED_DIR_MODE, "shared text parent");
+  const tmp = file + "." + process.pid + "." + Date.now() + "." + randomUUID() + ".tmp";
+  await fs.writeFile(tmp, value, "utf8");
+  await fs.chmod(tmp, 0o664);
+  await fs.rename(tmp, file);
+  await fs.chmod(file, 0o664);
+}
+
+function normalizedArtifactRelativePath(value) {
+  const raw = trim(value).replaceAll("\\", "/");
+  if (!raw || raw.startsWith("/") || raw === "." || raw === "..") {
+    throw new Error("Team artifact path must be a non-empty relative path");
+  }
+  if (raw.split("/").includes("..")) {
+    throw new Error("Team artifact path traversal is not allowed: " + value);
+  }
+  const normalized = path.posix.normalize(raw);
+  if (normalized === "." || normalized === ".." || normalized.startsWith("../") || normalized.includes("/../")) {
+    throw new Error("Team artifact path traversal is not allowed: " + value);
+  }
+  return normalized.replace(/^\.\//, "");
+}
+
+function assertTeamArtifactWriteScope(cfg, params) {
+  const scope = trim(params?.scope).toLowerCase() || "member";
+  const role = trim(cfg?.role).toLowerCase();
+  const memberId = trim(cfg?.memberId).toLowerCase();
+  if (scope === "team" && role !== "leader" && !role.includes("leader") && memberId !== "leader" && !memberId.includes("leader")) {
+    throw new Error("Only the Team Leader may write team-scoped artifacts; members must use scope=member");
+  }
+}
+
+async function assertNoArtifactSymlinkTraversal(root, candidate) {
+  const relative = path.relative(root, candidate);
+  if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
+    throw new Error("Team artifact path escaped the current Team workspace");
+  }
+  let current = root;
+  for (const component of relative.split(path.sep)) {
+    current = path.join(current, component);
+    try {
+      const stat = await fs.lstat(current);
+      if (stat.isSymbolicLink()) {
+        throw new Error("Team artifact paths may not traverse symlinks: " + current);
+      }
+    } catch (err) {
+      if (err?.code === "ENOENT") return;
+      throw err;
+    }
+  }
+}
+
+function teamArtifactRoot(cfg, params, activeEnvelope, defaultScope) {
+  const sharedRoot = path.resolve(cfg.sharedDir);
+  const scope = trim(params?.scope).toLowerCase() || defaultScope;
+  if (scope === "team") return sharedRoot;
+  if (scope !== "member") throw new Error("Team artifact scope must be member or team");
+  const rootTaskId = safeName(
+    params?.rootTaskId || params?.root_task_id || activeEnvelope?.rootTaskId || activeEnvelope?.taskId || "unscoped",
+  );
+  return path.join(sharedRoot, "artifacts", rootTaskId, "members", safeName(cfg.memberId));
+}
+
+async function resolveTeamArtifactPath(cfg, params, activeEnvelope, defaultScope) {
+  const relative = normalizedArtifactRelativePath(params?.path);
+  const root = teamArtifactRoot(cfg, params, activeEnvelope, defaultScope);
+  const candidate = path.resolve(root, ...relative.split("/"));
+  const sharedRoot = path.resolve(cfg.sharedDir);
+  const sharedRelative = path.relative(sharedRoot, candidate);
+  if (!sharedRelative || sharedRelative === ".." || sharedRelative.startsWith(".." + path.sep) || path.isAbsolute(sharedRelative)) {
+    throw new Error("Team artifact path escaped the current Team workspace");
+  }
+  await assertNoArtifactSymlinkTraversal(sharedRoot, candidate);
+  return { candidate, canonical: canonicalArtifactRef(cfg, candidate) };
+}
+
+function sharedWorkspaceForTarget(cfg, inherited, targetMemberId, rootTaskId) {
+  const source = inherited && typeof inherited === "object" ? inherited : {};
+  const physicalPath = trim(source.physicalPath) || trim(cfg.sharedDir);
+  const taskRef = safeName(rootTaskId || "unscoped");
+  const memberId = safeName(targetMemberId || cfg.memberId);
+  return Object.assign({}, source, {
+    physicalPath,
+    canonicalPrefix: "/team",
+    memberArtifactPhysicalRoot: path.join(physicalPath, "artifacts", taskRef, "members", memberId),
+    memberArtifactCanonicalRoot: "/team/artifacts/" + taskRef + "/members/" + memberId,
+  });
+}
+
+function canonicalArtifactRef(cfg, file) {
+  const relative = path.relative(path.resolve(cfg.sharedDir), path.resolve(file));
+  if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
+    throw new Error("artifact path escaped Redis Team shared directory: " + file);
+  }
+  return "/team/" + relative.split(path.sep).join("/");
+}
+
+async function listDirectoryArtifacts(dir, limit = 200) {
+  const out = [];
+  async function walk(current) {
+    if (out.length >= limit) return;
+    let entries = [];
+    try {
+      entries = await fs.readdir(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (out.length >= limit) return;
+      const file = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        await walk(file);
+      } else if (entry.isFile()) {
+        out.push(file);
+      }
+    }
+  }
+  await walk(dir);
+  return out;
+}
+
+async function writeArtifactManifest(cfg, sourcePath, ref, files, note = "") {
+  const digest = createHash("sha256").update(String(sourcePath || ref || randomUUID())).digest("hex").slice(0, 16);
+  const manifestDir = path.join(cfg.sharedDir, "artifacts", "_manifests");
+  await mkdirBestEffort(manifestDir, TEAM_SHARED_DIR_MODE, "artifact manifest directory");
+  const manifestPath = path.join(manifestDir, safeName(ref || sourcePath || "artifact") + "-" + digest + ".md");
+  const root = path.resolve(cfg.sharedDir);
+  const lines = [
+    "# Artifact Manifest",
+    "",
+    "- source: `" + String(ref || sourcePath || "").replace(/`/g, "\\`") + "`",
+  ];
+  if (note) lines.push("- note: " + note);
+  lines.push("", "## Files");
+  if (!files.length) {
+    lines.push("", "- No readable files were found.");
+  } else {
+    for (const file of files) {
+      const relative = path.relative(root, path.resolve(file));
+      const display = relative && !relative.startsWith(".." + path.sep) && !path.isAbsolute(relative)
+        ? "/team/" + relative.split(path.sep).join("/")
+        : file;
+      lines.push("- `" + display.replace(/`/g, "\\`") + "`");
+    }
+  }
+  await writeText(manifestPath, lines.join("\n") + "\n");
+  return canonicalArtifactRef(cfg, manifestPath);
+}
+
+async function importExternalArtifactFile(cfg, file) {
+  const digest = createHash("sha256").update(path.resolve(file)).digest("hex").slice(0, 12);
+  const targetDir = path.join(cfg.sharedDir, "artifacts", "_imported");
+  await mkdirBestEffort(targetDir, TEAM_SHARED_DIR_MODE, "artifact import directory");
+  const target = path.join(targetDir, digest + "-" + safeName(path.basename(file)));
+  await fs.copyFile(file, target);
+  return canonicalArtifactRef(cfg, target);
+}
+
+async function validateArtifactRefs(cfg, refs) {
+  const root = path.resolve(cfg.sharedDir);
+  const validated = [];
+  for (const raw of Array.isArray(refs) ? refs : []) {
+    const ref = trim(raw);
+    if (!ref) continue;
+    const candidate = ref.startsWith("/team/")
+      ? path.resolve(root, ref.slice("/team/".length))
+      : path.resolve(ref);
+    const relative = path.relative(root, candidate);
+    const insideShared = !(!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative));
+    let stat = null;
+    try {
+      stat = await fs.stat(candidate);
+    } catch (err) {
+      const manifest = await writeArtifactManifest(cfg, candidate, ref, [], "artifact path was not readable during completion validation: " + (err?.message || String(err)));
+      if (!validated.includes(manifest)) validated.push(manifest);
+      continue;
+    }
+    let canonical = "";
+    if (stat.isDirectory()) {
+      const files = await listDirectoryArtifacts(candidate);
+      canonical = await writeArtifactManifest(
+        cfg,
+        candidate,
+        ref,
+        files,
+        insideShared
+          ? "directory artifact reference normalized to a manifest"
+          : "external directory artifact reference normalized to a manifest; files may need explicit copy if ClawManager cannot access the original path",
+      );
+    } else if (stat.isFile()) {
+      canonical = insideShared ? canonicalArtifactRef(cfg, candidate) : await importExternalArtifactFile(cfg, candidate);
+    } else {
+      canonical = await writeArtifactManifest(cfg, candidate, ref, [], "artifact reference was neither a file nor a directory");
+    }
+    if (!validated.includes(canonical)) validated.push(canonical);
+  }
+  return validated;
 }
 
 async function readJson(file) {
@@ -357,6 +688,156 @@ async function readJson(file) {
   } catch {
     return undefined;
   }
+}
+
+function teamConfigCandidates(cfg) {
+  const candidates = [
+    trim(cfg.teamConfigPath),
+    trim(process.env.CLAWMANAGER_TEAM_CONFIG_PATH),
+    "/etc/clawmanager/team/team.json",
+    path.join(cfg.sharedDir || DEFAULT_SHARED_DIR, "team.json"),
+  ];
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+function normalizeRosterMember(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const memberId = trim(raw.memberId || raw.memberID || raw.memberKey || raw.id || raw.key);
+  if (!memberId) return null;
+  const role = trim(raw.role || raw.effectiveRole || raw.profileName || "member") || "member";
+  const aliases = [memberId, safeName(memberId)];
+  for (const value of [raw.displayName, raw.name]) {
+    const text = trim(value);
+    if (text) aliases.push(text, safeName(text));
+  }
+  return {
+    teamId: trim(raw.teamId),
+    memberId,
+    role,
+    effectiveRole: trim(raw.effectiveRole),
+    profileKey: trim(raw.profileKey),
+    profileName: trim(raw.profileName),
+    displayName: trim(raw.displayName || raw.name),
+    runtime: trim(raw.runtime || raw.runtimeType),
+    runtimeType: trim(raw.runtimeType || raw.runtime),
+    instanceMode: trim(raw.instanceMode),
+    isLeader: !!raw.isLeader,
+    description: trim(raw.description),
+    aliases: [...new Set(aliases.filter(Boolean))],
+  };
+}
+
+function extractRosterMembers(raw) {
+  if (!raw || typeof raw !== "object") return [];
+  const members = Array.isArray(raw.members)
+    ? raw.members
+    : Array.isArray(raw.team?.members)
+      ? raw.team.members
+      : Array.isArray(raw.roster?.members)
+        ? raw.roster.members
+        : [];
+  return members.map(normalizeRosterMember).filter(Boolean);
+}
+
+async function readTeamRoster(cfg) {
+  for (const file of teamConfigCandidates(cfg)) {
+    const raw = await readJson(file);
+    const members = extractRosterMembers(raw);
+    if (members.length) return { source: file, raw, members };
+  }
+  const envJson = trim(process.env.CLAWMANAGER_TEAM_CONFIG_JSON);
+  if (envJson) {
+    try {
+      const raw = JSON.parse(envJson);
+      const members = extractRosterMembers(raw);
+      if (members.length) return { source: "CLAWMANAGER_TEAM_CONFIG_JSON", raw, members };
+    } catch {}
+  }
+  return { source: "", raw: null, members: [] };
+}
+
+function isKnownRosterTarget(roster, target) {
+  const raw = trim(target);
+  const safe = safeName(raw);
+  return roster.members.some((member) => member.aliases.includes(raw) || member.aliases.includes(safe));
+}
+
+function rosterMemberForTarget(roster, target) {
+  const raw = trim(target);
+  const safe = safeName(raw);
+  if (!raw) return null;
+  return roster.members.find((member) => member.aliases.includes(raw) || member.aliases.includes(safe)) || null;
+}
+
+function currentRosterMember(cfg, roster) {
+  return rosterMemberForTarget(roster, cfg.memberId);
+}
+
+function rosterCommunicationMode(roster) {
+  const raw = roster?.raw || {};
+  return trim(
+    raw.communicationMode ||
+      raw.communication_mode ||
+      raw.collaborationMode ||
+      raw.collaboration_mode ||
+      raw.collaborationPolicy?.mode ||
+      raw.collaboration_policy?.mode ||
+      raw.team?.communicationMode ||
+      raw.team?.communication_mode,
+  ).toLowerCase();
+}
+
+function isLeaderMediatedRoster(roster) {
+  return rosterCommunicationMode(roster).replace(/[-\s]+/g, "_") === "leader_mediated";
+}
+
+function isLeaderRosterMember(member) {
+  if (!member) return false;
+  const role = trim(member.effectiveRole || member.role || member.profileName).toLowerCase();
+  const id = trim(member.memberId).toLowerCase();
+  return member.isLeader || id === "leader" || role === "leader" || role.includes("leader");
+}
+
+function isRosterLeaderTarget(roster, target) {
+  const member = rosterMemberForTarget(roster, target);
+  return isLeaderRosterMember(member) || trim(target).toLowerCase() === "leader";
+}
+
+function isSystemSender(value, cfg = {}) {
+  const raw = trim(value) || "clawmanager";
+  return isActiveCompletionTarget(raw, cfg) || raw.toLowerCase() === "clawmanager";
+}
+
+function statusMatchesTarget(status, target) {
+  const raw = trim(target);
+  const safe = safeName(raw);
+  for (const value of [status?.memberId, status?.memberID, status?.memberKey, status?.displayName, status?.name]) {
+    const text = trim(value);
+    if (text && (text === raw || safeName(text) === raw || safeName(text) === safe)) return true;
+  }
+  return false;
+}
+
+function rosterStatusStub(cfg, member) {
+  return {
+    teamId: cfg.teamId || member.teamId,
+    memberId: member.memberId,
+    role: member.effectiveRole || member.role,
+    rosterRole: member.role,
+    effectiveRole: member.effectiveRole || undefined,
+    profileKey: member.profileKey || undefined,
+    profileName: member.profileName || undefined,
+    displayName: member.displayName || undefined,
+    runtime: member.runtime || member.runtimeType || undefined,
+    runtimeType: member.runtimeType || member.runtime || undefined,
+    instanceMode: member.instanceMode || undefined,
+    isLeader: member.isLeader,
+    description: member.description || undefined,
+    liveness: "unknown",
+    runtimeStatus: "unknown",
+    availability: "unknown",
+    lastSeenAt: "",
+  };
 }
 
 async function writeLocalStatus(cfg, patch = {}) {
@@ -382,11 +863,11 @@ async function writeLocalStatus(cfg, patch = {}) {
     },
     patch,
   );
-  await writeJson(file, status);
+  await writeJsonBestEffort(file, status, "shared status");
   return status;
 }
 
-async function readStatuses(cfg, memberId) {
+async function readRawStatuses(cfg, memberId) {
   const dir = path.join(cfg.sharedDir, "status");
   if (memberId) return (await readJson(path.join(dir, safeName(memberId) + ".json"))) || null;
   let entries = [];
@@ -405,23 +886,436 @@ async function readStatuses(cfg, memberId) {
   return out;
 }
 
+async function readStatuses(cfg, memberId) {
+  const rawStatuses = await readRawStatuses(cfg);
+  const roster = await readTeamRoster(cfg);
+  if (memberId) {
+    const raw = rawStatuses.find((status) => statusMatchesTarget(status, memberId));
+    if (raw) return raw;
+    const member = roster.members.find((item) => isKnownRosterTarget({ members: [item] }, memberId));
+    return member ? rosterStatusStub(cfg, member) : null;
+  }
+  if (!roster.members.length) return rawStatuses;
+  const merged = [];
+  for (const member of roster.members) {
+    const status = rawStatuses.find((item) => statusMatchesTarget(item, member.memberId));
+    merged.push(Object.assign(rosterStatusStub(cfg, member), status || {}));
+  }
+  const known = new Set(merged.map((item) => safeName(item.memberId)));
+  for (const status of rawStatuses) {
+    if (!known.has(safeName(status.memberId))) merged.push(status);
+  }
+  merged.sort((a, b) => String(a.memberId).localeCompare(String(b.memberId)));
+  return merged;
+}
+
 async function writeTaskEnvelope(cfg, envelope) {
   if (!envelope?.taskId) return;
   await ensureDirs(cfg);
   const aliases = new Set(taskIdAliases(envelope.taskId));
   aliases.add(envelope.taskId);
   for (const alias of aliases) {
-    await writeJson(path.join(cfg.sharedDir, "tasks", safeName(alias) + ".json"), envelope);
+    await writeJsonBestEffort(privateTaskEnvelopePath(cfg, alias), envelope, "runtime private task envelope", 0o600, RUNTIME_PRIVATE_DIR_MODE);
+    await writeJsonBestEffort(path.join(cfg.sharedDir, "tasks", safeName(alias) + ".json"), envelope, "legacy shared task envelope");
   }
 }
 
 async function readTaskEnvelope(cfg, taskId) {
   await ensureDirs(cfg);
   for (const alias of taskIdAliases(taskId)) {
+    const privateEnvelope = await readJson(privateTaskEnvelopePath(cfg, alias));
+    if (privateEnvelope) return privateEnvelope;
     const envelope = await readJson(path.join(cfg.sharedDir, "tasks", safeName(alias) + ".json"));
     if (envelope) return envelope;
   }
   return null;
+}
+
+function isContextOnlyEnvelope(envelope) {
+  if (!envelope) return false;
+  if (envelope.requiresCompletion === false) return true;
+  const intent = trim(envelope.intent || envelope.metadata?.intent || envelope.type).toLowerCase();
+  return intent === "member_result_confirmed" || intent === "context" || intent === "notification";
+}
+
+function normalizeMonitorPolicy(raw) {
+  const policy = raw && typeof raw === "object" ? raw : {};
+  const enabled = policy.enabled === undefined ? true : boolFrom(policy.enabled, true);
+  const heartbeatEverySec = Math.min(
+    300,
+    Math.max(
+      15,
+      intFrom(
+        policy.heartbeatEverySec || policy.heartbeat_every_sec || process.env.CLAWMANAGER_TEAM_HEARTBEAT_SECONDS,
+        DEFAULT_ASSIGNMENT_HEARTBEAT_SECONDS,
+      ),
+    ),
+  );
+  const visibleHeartbeatEverySec = Math.min(
+    1800,
+    Math.max(
+      heartbeatEverySec,
+      intFrom(
+        policy.visibleHeartbeatEverySec ||
+          policy.visible_heartbeat_every_sec ||
+          process.env.CLAWMANAGER_TEAM_VISIBLE_HEARTBEAT_SECONDS,
+        180,
+      ),
+    ),
+  );
+  const checkEverySec = Math.min(
+    1800,
+    Math.max(60, intFrom(policy.checkEverySec || policy.check_every_sec, 180)),
+  );
+  const softTimeoutSec = Math.min(
+    7200,
+    Math.max(checkEverySec, intFrom(policy.softTimeoutSec || policy.soft_timeout_sec, 360)),
+  );
+  return {
+    enabled,
+    heartbeatEverySec,
+    visibleHeartbeatEverySec,
+    checkEverySec,
+    softTimeoutSec,
+    visibleToChat: policy.visibleToChat === undefined ? true : boolFrom(policy.visibleToChat, true),
+  };
+}
+
+function monitorPolicyForEnvelope(envelope) {
+  return normalizeMonitorPolicy(
+    envelope?.monitorPolicy ||
+      envelope?.monitor_policy ||
+      envelope?.metadata?.monitorPolicy ||
+      envelope?.metadata?.monitor_policy ||
+      {},
+  );
+}
+
+function startAssignmentHeartbeat({ envelope, emitTaskEvent, log, isTerminal }) {
+  const policy = monitorPolicyForEnvelope(envelope);
+  if (!policy.enabled || isContextOnlyEnvelope(envelope)) return () => {};
+  const intervalMs = policy.heartbeatEverySec * 1000;
+  const visibleHeartbeatModulo = Math.max(
+    1,
+    Math.ceil(policy.visibleHeartbeatEverySec / policy.heartbeatEverySec),
+  );
+  let stopped = false;
+  let seq = 0;
+  let inFlight = false;
+  let timer;
+  const stop = () => {
+    stopped = true;
+    if (timer) clearInterval(timer);
+  };
+  const emitHeartbeat = async () => {
+    if (stopped || inFlight) return;
+    if (typeof isTerminal === "function" && isTerminal()) {
+      stop();
+      return;
+    }
+    inFlight = true;
+    try {
+      const heartbeatSeq = ++seq;
+      const visibleHeartbeat =
+        policy.visibleToChat &&
+        heartbeatSeq >= visibleHeartbeatModulo &&
+        heartbeatSeq % visibleHeartbeatModulo === 0;
+      if (typeof isTerminal === "function" && isTerminal()) {
+        stop();
+        return;
+      }
+      await emitTaskEvent("assignment_heartbeat", {
+        eventKind: "assignment_heartbeat",
+        status: "running",
+        availability: "busy",
+        runtimeStatus: "running",
+        summary: visibleHeartbeat
+          ? "\u4efb\u52a1\u4ecd\u5728\u6267\u884c\uff0cAgent \u6b63\u5728\u7ee7\u7eed\u5904\u7406\u5f53\u524d\u56de\u5408\u3002"
+          : "\u4efb\u52a1\u4ecd\u5728\u6267\u884c",
+        phase: "execution",
+        heartbeat: true,
+        heartbeatSeq,
+        lastActivityAt: nowIso(),
+        visibleToChat: visibleHeartbeat,
+        rootTaskTerminal: false,
+        nonAuthoritative: true,
+        monitorPolicy: policy,
+      });
+    } catch (err) {
+      log?.warn?.("redis-team: assignment heartbeat failed: " + (err?.message || String(err)));
+    } finally {
+      inFlight = false;
+    }
+  };
+  timer = setInterval(() => {
+    void emitHeartbeat();
+  }, intervalMs);
+  timer.unref?.();
+  return stop;
+}
+
+function appendRedisTeamCompletionGuidance(text, envelope) {
+  const body = String(text || "");
+  if (isContextOnlyEnvelope(envelope)) return body;
+  const locale = trim(envelope?.responseLocale || envelope?.response_locale || "zh-CN");
+  const physicalSharedDir = trim(
+    envelope?.sharedWorkspace?.physicalPath ||
+      envelope?.workspaceContract?.physicalSharedDir ||
+      process.env.CLAWMANAGER_TEAM_SHARED_DIR,
+  );
+  const memberArtifactRoot = trim(
+    envelope?.sharedWorkspace?.memberArtifactPhysicalRoot ||
+      envelope?.workspaceContract?.memberArtifactPhysicalRoot,
+  );
+  const guidance = [
+    body,
+    "",
+    "Redis Team delivery rule: finish this assignment by calling team_complete_task with status=\"succeeded\", a concise summary, and resultMarkdown containing the answer. A normal chat answer may stay private in OpenClaw and not reach ClawManager.",
+    "Progress visibility rule: when you create an execution plan or reach a meaningful milestone, call team_update_progress with status=\"running\", a concise summary, and eventKind set to leader_plan, worker_plan, worker_progress, or leader_synthesis as appropriate. Use assignment_check_result only when replying to a ClawManager Monitor envelope carrying a monitor checkId. Do not expose hidden reasoning or tool logs; only publish user-visible plans, phase summaries, blockers, verification notes, and recovery status.",
+    `Output language rule: use ${locale} for every user-visible plan, assignment, progress summary, resultMarkdown, and final synthesis. Preserve source code, API names, file names, and necessary technical terms in their original form.`,
+    "Shared artifact rule: prefer team_artifact_write/read/list/mkdir. These tools enforce current-Team isolation and cooperative permissions. The /team prefix is only the canonical link returned to ClawManager in pooled Lite runtimes.",
+    "Verification truth rule: if browser or DOM verification did not run or failed, label it unverified. A hand-written simulator or static inspection is not a browser pass. Changing an artifact after review invalidates that review and requires fresh validation.",
+    "Risk waiver rule: a failed or stale required assignment blocks root success unless the Leader records assignmentId, reason, and accepted risk in team_complete_task. Never waive work that is still running or pending.",
+    "Optional-work rule: optional work may be omitted, but every omitted optional assignment must be listed in skippedAssignments with assignmentId and a concrete reason.",
+    "Never list, search, resolve, or scan the parent of the current Team shared directory, and never inspect sibling Team directories.",
+  ];
+  if (physicalSharedDir) guidance.push("Resolved current-Team physical shared directory: " + physicalSharedDir);
+  if (memberArtifactRoot) guidance.push("Resolved current-member artifact directory: " + memberArtifactRoot);
+  return guidance.join("\n");
+}
+
+function extractContentText(value, depth = 0) {
+  if (depth > 6 || value === undefined || value === null) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => extractContentText(item, depth + 1))
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  if (typeof value !== "object") return "";
+  const type = trim(value.type || value.kind).toLowerCase();
+  if (["thinking", "reasoning", "tool_use", "tool_result", "function_call"].includes(type)) return "";
+  for (const key of ["text", "content", "resultMarkdown", "result", "answer", "message", "summary"]) {
+    const text = extractContentText(value[key], depth + 1);
+    if (text) return text;
+  }
+  return "";
+}
+
+function assistantTextFromRecord(record) {
+  if (!record || typeof record !== "object") return "";
+  const message = record.message && typeof record.message === "object" ? record.message : null;
+  if (message && trim(message.role).toLowerCase() === "assistant") {
+    return extractContentText(message.content || message.text || message);
+  }
+  if (trim(record.role).toLowerCase() === "assistant") {
+    return extractContentText(record.content || record.text || record.message || record);
+  }
+  const data = record.data && typeof record.data === "object" ? record.data : null;
+  if (data && trim(data.role).toLowerCase() === "assistant") {
+    return extractContentText(data.content || data.text || data.message || data);
+  }
+  const artifacts =
+    record.trace?.artifacts ||
+    record.data?.trace?.artifacts ||
+    record.artifacts ||
+    record.data?.artifacts;
+  if (Array.isArray(artifacts?.assistantTexts) && artifacts.assistantTexts.length) {
+    return extractContentText(artifacts.assistantTexts[artifacts.assistantTexts.length - 1]);
+  }
+  return "";
+}
+
+function usableFallbackAssistantText(text) {
+  const value = trim(text);
+  if (!value) return "";
+  const compact = value.toLowerCase().replace(/\s+/g, "");
+  if (
+    compact === "redisteamtaskcompleted" ||
+    compact === "redisteamtaskprocessingcompleted" ||
+    compact === "redisteamtaskfailed" ||
+    compact.startsWith("[assignment]")
+  ) {
+    return "";
+  }
+  const lower = value.toLowerCase();
+  const looksInterim =
+    lower.startsWith("now i'll ") ||
+    lower.startsWith("i will ") ||
+    lower.startsWith("i'll ") ||
+    lower.startsWith("let me ") ||
+    lower.startsWith("working on ") ||
+    value.startsWith("\u6211\u5c06") ||
+    value.startsWith("\u6211\u4f1a") ||
+    value.startsWith("\u63a5\u4e0b\u6765");
+  if (
+    lower.includes("still waiting") ||
+    lower.includes("continuing to wait") ||
+    lower.includes("waiting on ") ||
+    lower.includes("yielding") ||
+    lower.includes("duplicate ") ||
+    lower.includes(" noted") ||
+    value.includes("缁х画绛夊緟") ||
+    value.includes("浠嶅湪绛夊緟") ||
+    value.includes("绛夊緟 Designer") ||
+    value.includes("绛夊緟Designer") ||
+    value.includes("绛夊緟 Architect") ||
+    value.includes("绛夊緟Architect") ||
+    value.includes("绛夊緟 PM") ||
+    value.includes("绛夊緟PM") ||
+    value.includes("閲嶅") ||
+    value.includes("寤惰繜閫佽揪")
+  ) {
+    return "";
+  }
+  const hasFinalMarker =
+    lower.includes("complete") ||
+    lower.includes("result") ||
+    lower.includes("final") ||
+    value.includes("瀹屾垚") ||
+    value.includes("缁撴灉") ||
+    value.includes("鑺辫") ||
+    value.includes("鎶ュ憡");
+  if (looksInterim && !hasFinalMarker) return "";
+  return value;
+}
+
+async function shouldUseAssistantSessionFallback(cfg, envelope, text) {
+  if (!envelope || isContextOnlyEnvelope(envelope)) return false;
+  if (envelope.requiresCompletion === false) return false;
+  const fallbackText = usableFallbackAssistantText(text);
+  if (!fallbackText) return false;
+  const roster = await readTeamRoster(cfg);
+  const currentMember = currentRosterMember(cfg, roster);
+  const currentIsLeader = isLeaderRosterMember(currentMember) || isRosterLeaderTarget(roster, cfg.memberId);
+  if (isLeaderMediatedRoster(roster) && currentIsLeader) {
+    return false;
+  }
+  if (isSystemSender(envelope.from, cfg)) return true;
+  if (roster.members.length && isKnownRosterTarget(roster, envelope.from)) {
+    if (isLeaderMediatedRoster(roster) && !currentIsLeader && isRosterLeaderTarget(roster, envelope.from)) {
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+async function readTextTail(file, maxBytes = 512 * 1024) {
+  try {
+    const stat = await fs.stat(file);
+    if (!stat.isFile()) return "";
+    if (stat.size <= maxBytes) return await fs.readFile(file, "utf8");
+    const handle = await fs.open(file, "r");
+    try {
+      const buffer = Buffer.alloc(maxBytes);
+      await handle.read(buffer, 0, maxBytes, stat.size - maxBytes);
+      return buffer.toString("utf8");
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return "";
+  }
+}
+
+function resolveSessionFile(baseDir, raw) {
+  const value = trim(raw);
+  if (!value) return "";
+  return path.isAbsolute(value) ? value : path.resolve(baseDir, value);
+}
+
+function sessionRecordFromIndex(index, sessionKey) {
+  if (!index || typeof index !== "object") return null;
+  if (sessionKey && index[sessionKey] && typeof index[sessionKey] === "object") return index[sessionKey];
+  const sessions = Array.isArray(index.sessions)
+    ? index.sessions
+    : index.sessions && typeof index.sessions === "object"
+      ? Object.values(index.sessions)
+      : [];
+  if (sessionKey) {
+    const found = sessions.find((item) => {
+      if (!item || typeof item !== "object") return false;
+      return [item.key, item.sessionKey, item.id, item.conversationId].some((value) => trim(value) === sessionKey);
+    });
+    if (found) return found;
+  }
+  return sessions.length ? sessions[sessions.length - 1] : null;
+}
+
+async function recentJsonlFiles(dir) {
+  let entries = [];
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const files = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+    const file = path.join(dir, entry.name);
+    try {
+      const stat = await fs.stat(file);
+      files.push({ file, mtimeMs: stat.mtimeMs });
+    } catch {}
+  }
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return files.map((item) => item.file);
+}
+
+async function sessionFilesFromDispatchResult(dispatchResult) {
+  const storePath = trim(dispatchResult?.storePath);
+  const route = dispatchResult?.route || {};
+  const sessionKey = trim(route.sessionKey || route.sessionId || dispatchResult?.sessionKey);
+  const candidates = [];
+  if (storePath) {
+    candidates.push(storePath);
+    candidates.push(path.dirname(storePath));
+    candidates.push(path.join(storePath, "sessions"));
+  }
+  const files = [];
+  const dirs = [];
+  for (const candidate of [...new Set(candidates.filter(Boolean))]) {
+    try {
+      const stat = await fs.stat(candidate);
+      if (stat.isFile() && candidate.endsWith(".jsonl")) files.push(candidate);
+      if (stat.isDirectory()) dirs.push(candidate);
+    } catch {}
+  }
+  for (const dir of dirs) {
+    const index = await readJson(path.join(dir, "sessions.json"));
+    const record = sessionRecordFromIndex(index, sessionKey);
+    if (record) {
+      for (const key of ["sessionFile", "file", "path", "jsonlPath"]) {
+        const file = resolveSessionFile(dir, record[key]);
+        if (file) files.push(file);
+      }
+    }
+    files.push(...(await recentJsonlFiles(dir)).slice(0, 5));
+  }
+  return [...new Set(files)];
+}
+
+async function readLatestAssistantTextFromDispatch(dispatchResult) {
+  for (const file of await sessionFilesFromDispatchResult(dispatchResult)) {
+    const text = await readTextTail(file);
+    if (!text) continue;
+    let latest = "";
+    for (const line of text.split(/\r?\n/)) {
+      const raw = line.trim();
+      if (!raw) continue;
+      try {
+        const record = JSON.parse(raw);
+        const candidate = usableFallbackAssistantText(assistantTextFromRecord(record));
+        if (candidate) latest = candidate;
+      } catch {}
+    }
+    if (latest) return latest;
+  }
+  return "";
 }
 
 function fieldsToObject(fields) {
@@ -457,7 +1351,7 @@ function parseReadGroupResponse(value) {
   return out;
 }
 
-async function xaddJson(redis, stream, event) {
+function eventStreamFields(event) {
   const fields = ["payload", JSON.stringify(event)];
   for (const key of [
     "event",
@@ -488,13 +1382,78 @@ async function xaddJson(redis, stream, event) {
       fields.push(key, String(event[key]));
     }
   }
-  await redis.command("XADD", stream, "*", ...fields);
+  return fields;
+}
+
+async function xaddJson(redis, stream, event) {
+  return redis.command("XADD", stream, "*", ...eventStreamFields(event));
+}
+
+async function xaddTerminalOnce(redis, cfg, completionId, event) {
+  const script = [
+    "local existing = redis.call('GET', KEYS[1])",
+    "if existing then return {0, existing} end",
+    "local streamId = redis.call('XADD', KEYS[2], '*', unpack(ARGV))",
+    "redis.call('SET', KEYS[1], streamId)",
+    "return {1, streamId}",
+  ].join("\n");
+  const result = await redis.command(
+    "EVAL",
+    script,
+    2,
+    completionKey(cfg, completionId),
+    eventsKey(cfg),
+    ...eventStreamFields(event),
+  );
+  return {
+    published: Array.isArray(result) ? Number(result[0]) === 1 : false,
+    streamId: Array.isArray(result) ? String(result[1] || "") : "",
+  };
+}
+
+async function waitForCompletionAcknowledgement(redis, cfg, completionId, attemptId, timeoutMs = 10000) {
+  const key = completionAckKey(cfg, completionId, attemptId);
+  const deadline = Date.now() + Math.max(1000, timeoutMs);
+  while (Date.now() < deadline) {
+    const raw = await redis.command("GET", key);
+    if (raw) {
+      try {
+        return JSON.parse(String(raw));
+      } catch {
+        return { decision: String(raw), reason: "unstructured_ack" };
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return null;
+}
+
+async function waitForTerminalCompletionState(redis, cfg, completionId, timeoutMs = 300000) {
+  const key = completionStateKey(cfg, completionId);
+  const deadline = Date.now() + Math.max(1000, timeoutMs);
+  while (Date.now() < deadline) {
+    const raw = await redis.command("GET", key);
+    if (raw) {
+      let state;
+      try {
+        state = JSON.parse(String(raw));
+      } catch {
+        state = { decision: String(raw), reason: "unstructured_completion_state" };
+      }
+      const decision = trim(state?.decision).toLowerCase();
+      if (decision && decision !== "deferred" && decision !== "submitted") return state;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return null;
 }
 
 function eventFor(cfg, event, extra = {}) {
   return Object.assign(
     {
-      v: SCHEMA_VERSION,
+      v: WIRE_SCHEMA_VERSION,
+      protocolVersion: PROTOCOL_VERSION,
+      eventId: "evt_" + randomUUID(),
       event,
       type: event,
       teamId: cfg.teamId,
@@ -520,6 +1479,19 @@ function taskEvent(cfg, event, envelope, extra = {}) {
         message_id: envelope.messageId,
         taskId: envelope.taskId,
         task_id: envelope.taskId,
+        rootTaskId: envelope.rootTaskId || envelope.taskId,
+        rootMessageId: envelope.rootMessageId || envelope.messageId,
+        workId: envelope.workId || envelope.assignmentId,
+        assignmentId: envelope.assignmentId || envelope.workId,
+        canonicalWorkId: envelope.assignmentId || envelope.workId,
+        phaseId: envelope.phaseId || envelope.currentPhaseId,
+        revision: envelope.revision || 1,
+        required: envelope.required !== false,
+        reviewRequired: boolFrom(envelope.reviewRequired, false),
+        planVersion: Number(envelope.planVersion || 0),
+        ledgerVersion: Number(envelope.ledgerVersion || 0),
+        workflowState: envelope.workflowState,
+        dependsOn: envelope.dependsOn || [],
         availability: "busy",
         runtimeStatus: "running",
         summary: event,
@@ -532,40 +1504,70 @@ function taskEvent(cfg, event, envelope, extra = {}) {
 // ============ Message Envelope ============
 function normalizeEnvelope(raw) {
   if (!raw || typeof raw !== "object") return null;
+  const text = raw.text || raw.prompt || raw.rawPayload || "";
+  const textRootTaskId = extractLabeledValue(text, ["rootTaskId", "root_task_id"]);
+  const textRootMessageId = extractLabeledValue(text, ["rootMessageId", "root_message_id"]);
+  const rawTaskId = raw.taskId || raw.task_id || "";
+  const rawRootTaskId = preferredRootTaskId(
+    raw.rootTaskId || raw.root_task_id,
+    rawTaskId,
+  );
+  const rootTaskId = preferredRootTaskId(
+    isGeneratedRuntimeTaskId(rawRootTaskId) ? textRootTaskId : rawRootTaskId,
+    textRootTaskId,
+    rawRootTaskId,
+  );
+  const taskId =
+    isGeneratedRuntimeTaskId(rawTaskId) && rootTaskId && rootTaskId !== rawTaskId
+      ? rootTaskId
+      : rawTaskId || rootTaskId || ("task_" + randomUUID());
   const envelope = {
-    schemaVersion: raw.v || raw.schemaVersion || SCHEMA_VERSION,
+    schemaVersion: raw.v || raw.schemaVersion || WIRE_SCHEMA_VERSION,
+    protocolVersion: raw.protocolVersion || raw.protocol_version || raw.v || WIRE_SCHEMA_VERSION,
     messageId: raw.messageId || raw.message_id || raw.id || ("msg_" + randomUUID()),
-    taskId: raw.taskId || raw.task_id || ("task_" + randomUUID()),
+    taskId,
+    rootTaskId: rootTaskId || taskId,
+    rootMessageId: raw.rootMessageId || raw.root_message_id || textRootMessageId || raw.messageId || raw.message_id,
+    workId: raw.workId || raw.work_id || raw.assignmentId || raw.assignment_id,
+    assignmentId: raw.assignmentId || raw.assignment_id || raw.workId || raw.work_id,
+    dependsOn: Array.isArray(raw.dependsOn) ? raw.dependsOn.filter(Boolean) : [],
     teamId: raw.teamId || raw.team_id,
     from: raw.from || raw.sender || raw.memberId || raw.member_id || "unknown",
     to: raw.to || raw.recipient || "",
     conversationId: raw.conversationId || raw.conversation_id || raw.taskId || raw.task_id,
     type: raw.type || "message",
+    intent: raw.intent || raw.metadata?.intent || raw.type || "message",
     role: raw.role || "teammate",
-    text: raw.text || raw.prompt || raw.rawPayload || "",
+    text,
     priority: raw.priority || "normal",
     createdAt: raw.createdAt || raw.created_at || nowIso(),
     expiresAt: raw.expiresAt || raw.expires_at,
     contextRefs: Array.isArray(raw.contextRefs) ? raw.contextRefs.filter(Boolean) : [],
     artifacts: raw.artifacts || [],
     metadata: raw.metadata || {},
+    responseLocale: raw.responseLocale || raw.response_locale || raw.metadata?.responseLocale || raw.metadata?.response_locale || "zh-CN",
+    sharedWorkspace: raw.sharedWorkspace || raw.shared_workspace || raw.metadata?.sharedWorkspace || raw.metadata?.shared_workspace || {},
+    workspaceContract: raw.workspaceContract || raw.workspace_contract || raw.metadata?.workspaceContract || raw.metadata?.workspace_contract || {},
+    workflowState: raw.workflowState || raw.workflow_state || raw.metadata?.workflowState || raw.metadata?.workflow_state || "planning",
+    planVersion: Number(raw.planVersion ?? raw.plan_version ?? raw.metadata?.planVersion ?? raw.metadata?.plan_version ?? 0),
+    ledgerVersion: Number(raw.ledgerVersion ?? raw.ledger_version ?? raw.metadata?.ledgerVersion ?? raw.metadata?.ledger_version ?? 0),
+    currentPhaseId: raw.currentPhaseId || raw.current_phase_id || raw.phaseId || raw.phase_id || raw.metadata?.currentPhaseId || raw.metadata?.phaseId,
+    phaseId: raw.phaseId || raw.phase_id || raw.currentPhaseId || raw.current_phase_id,
+    revision: Math.max(1, intFrom(raw.revision ?? raw.metadata?.revision, 1)),
+    required: raw.required === undefined ? true : boolFrom(raw.required, true),
+    reviewRequired: boolFrom(raw.reviewRequired ?? raw.review_required ?? raw.metadata?.reviewRequired, false),
+    monitorPolicy: normalizeMonitorPolicy(raw.monitorPolicy || raw.monitor_policy || raw.metadata?.monitorPolicy || raw.metadata?.monitor_policy),
+    requiresCompletion: raw.requiresCompletion !== false,
+    completionTool: raw.completionTool || "team_complete_task",
+    resultSink: raw.resultSink || {},
     idempotencyKey: raw.idempotencyKey || raw.messageId,
   };
   return envelope;
 }
 
-const seenMessageIds = new Set();
-function dedup(key) {
-  if (seenMessageIds.has(key)) return true;
-  seenMessageIds.add(key);
-  if (seenMessageIds.size > 10000) {
-    const iter = seenMessageIds.values();
-    for (let i = 0; i < 1000; i++) {
-      const v = iter.next();
-      if (!v.done) seenMessageIds.delete(v.value);
-    }
-  }
-  return false;
+function processedMessageKey(cfg, key) {
+  const digest = createHash("sha256").update(String(key || "")).digest("hex");
+  return `claw:team:${cfg.teamId}:processed:${cfg.memberId}:${digest}`;
 }
 
 // ============ Runtime Operations ============
@@ -573,6 +1575,7 @@ function createRuntime(api) {
   let runtimeApi = api;
   let activeEnvelope = null;
   let activeTaskCompleted = false;
+  let activeTaskCompletionPending = false;
   let lastOutbound = null;
 
   async function withRedis(cfg, existingRedis, fn) {
@@ -589,13 +1592,22 @@ function createRuntime(api) {
   function activeTaskMatches(taskId) {
     if (!activeEnvelope) return false;
     if (!taskId) return true;
-    return taskIdsMatch(taskId, activeEnvelope.taskId);
+    return taskIdsMatch(taskId, activeEnvelope.taskId) || taskIdsMatch(taskId, activeEnvelope.rootTaskId);
   }
 
   function taskMatchesEnvelope(envelope, taskId) {
     if (!envelope) return false;
     if (!taskId) return true;
-    return taskIdsMatch(taskId, envelope.taskId);
+    return taskIdsMatch(taskId, envelope.taskId) || taskIdsMatch(taskId, envelope.rootTaskId);
+  }
+
+  function completionTaskIdFor(envelope, taskId) {
+    const explicit = trim(taskId);
+    const root = preferredRootTaskId(envelope?.rootTaskId, envelope?.taskId);
+    if (root && (!explicit || taskMatchesEnvelope(envelope, explicit) || isGeneratedRuntimeTaskId(explicit))) {
+      return root;
+    }
+    return explicit || root || "";
   }
 
   function firstText(...values) {
@@ -609,18 +1621,6 @@ function createRuntime(api) {
     return "";
   }
 
-  function textFromDispatchResult(activeResult) {
-    return firstText(
-      activeResult?.outbound?.message?.text,
-      activeResult?.result?.text,
-      activeResult?.result?.message?.text,
-      activeResult?.result?.response?.text,
-      activeResult?.result?.content,
-      activeResult?.result?.result,
-      activeResult?.result?.resultMarkdown,
-    );
-  }
-
   function summarizeText(text, fallback = "Redis Team task completed") {
     const firstLine = String(text || "")
       .split(/\r?\n/)
@@ -629,36 +1629,114 @@ function createRuntime(api) {
     return (firstLine || fallback).slice(0, 160);
   }
 
-  async function completeActiveTaskFromText(text, meta = {}) {
+  async function persistCompletionDecision({
+    cfg,
+    taskId,
+    completionId,
+    attemptId,
+    streamId,
+    completionStatus,
+    summary,
+    artifactRefs,
+    acknowledgement,
+    redis,
+  }) {
+    const decision = trim(acknowledgement?.decision).toLowerCase();
+    if (decision === "accepted") {
+      await withRedis(cfg, redis, async (client) => {
+        await client.command("SET", completionKey(cfg, completionId), streamId || attemptId, "EX", 604800);
+      });
+      await writeLocalStatus(cfg, {
+        availability: completionStatus === "succeeded" ? "idle" : "blocked",
+        runtimeStatus: completionStatus,
+        currentTaskId: taskId,
+        progress: completionStatus === "succeeded" ? 100 : 0,
+        lastSummary: summary,
+        artifactRefs,
+      });
+      if (!activeEnvelope || taskMatchesEnvelope(activeEnvelope, taskId)) {
+        activeTaskCompleted = true;
+        activeTaskCompletionPending = false;
+      }
+      return decision;
+    }
+    if (decision) {
+      await writeLocalStatus(cfg, {
+        availability: decision === "rejected" ? "blocked" : "busy",
+        runtimeStatus: decision === "rejected" ? "blocked" : "running",
+        currentTaskId: taskId,
+        progress: 99,
+        lastSummary: acknowledgement?.reason || summary,
+        artifactRefs,
+      });
+      if (!activeEnvelope || taskMatchesEnvelope(activeEnvelope, taskId)) {
+        activeTaskCompleted = false;
+        activeTaskCompletionPending = false;
+      }
+      return decision;
+    }
+    if (!activeEnvelope || taskMatchesEnvelope(activeEnvelope, taskId)) {
+      activeTaskCompleted = false;
+      activeTaskCompletionPending = true;
+    }
+    return "submitted";
+  }
+
+  async function completeActiveTask(text, meta = {}) {
     const cfg = meta.cfg || readChannelConfig(runtimeApi.config || {}, meta.accountId || "default");
     const envelope = meta.envelope || activeEnvelope;
     const result = firstText(text, meta.resultMarkdown, meta.result, meta.summary);
     if (!envelope || !taskMatchesEnvelope(envelope, meta.taskId || envelope.taskId) || !result) return false;
-    const taskId = trim(meta.taskId) || envelope.taskId;
-    const completionMessageId = trim(meta.messageId);
+    const taskId = completionTaskIdFor(envelope, meta.taskId || envelope.taskId);
+    const completionId = trim(meta.completionId) || completionIdFor(cfg, taskId);
+    const completionMessageId = trim(meta.messageId) || completionId;
     const messageId = trim(meta.eventMessageId) || envelope.messageId || completionMessageId || ("msg_" + randomUUID());
     const inReplyTo = trim(meta.inReplyTo) || envelope.messageId;
     const resultMarkdown = typeof meta.resultMarkdown === "string" && meta.resultMarkdown.trim()
       ? meta.resultMarkdown
       : result;
     const summary = trim(meta.summary) || summarizeText(result);
+    const responseLocale = meta.responseLocale || envelope?.responseLocale || "zh-CN";
+    assertResponseLocale(responseLocale, summary + "\n" + resultMarkdown, "Team completion");
     const artifactRefs = Array.isArray(meta.artifactRefs) ? meta.artifactRefs : [];
+    const roster = await readTeamRoster(cfg);
+    const leaderMediated = isLeaderMediatedRoster(roster);
+    const currentMember = currentRosterMember(cfg, roster);
+    const currentIsLeader = isLeaderRosterMember(currentMember) || isRosterLeaderTarget(roster, cfg.memberId);
+    const assignmentResultOnly = leaderMediated && !currentIsLeader;
+    const completionStatus = ["failed", "cancelled"].includes(trim(meta.completionStatus).toLowerCase())
+      ? "failed"
+      : "succeeded";
+    const workId = trim(meta.workId) || trim(envelope.workId) || trim(envelope.assignmentId) || undefined;
+    const assignmentId = trim(meta.assignmentId) || trim(envelope.assignmentId) || trim(envelope.workId) || undefined;
 
+    const attemptId = trim(meta.attemptId) || ("attempt_" + randomUUID());
+    const workflowFinal = meta.workflowFinal === undefined ? currentIsLeader : boolFrom(meta.workflowFinal, false);
+    const finalAnswerReady = meta.finalAnswerReady === undefined ? currentIsLeader : boolFrom(meta.finalAnswerReady, false);
+    const remainingActions = Array.isArray(meta.remainingActions) ? meta.remainingActions.filter(Boolean) : [];
     await ensureDirs(cfg);
     await writeLocalStatus(cfg, {
-      availability: "idle",
-      runtimeStatus: "succeeded",
+      availability: "busy",
+      runtimeStatus: "completion_pending",
       currentTaskId: taskId,
-      progress: 100,
+      progress: 99,
       lastSummary: summary,
       artifactRefs,
     });
-    await withRedis(cfg, meta.redis, async (redis) => {
-      await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "task_completed", envelope, {
+    const terminal = await withRedis(cfg, meta.redis, async (redis) => {
+      const proposal = taskEvent(cfg, "completion_proposed", envelope, {
         messageId,
         message_id: messageId,
         completionMessageId: completionMessageId || undefined,
         completion_message_id: completionMessageId || undefined,
+        completionId,
+        attemptId,
+        completionSource: COMPLETION_SOURCE,
+        explicitCompletion: true,
+        assignmentResultOnly: assignmentResultOnly || undefined,
+        rootTaskTerminal: leaderMediated ? (!assignmentResultOnly && currentIsLeader) : undefined,
+        workId,
+        assignmentId,
         sourceMessageId: envelope.messageId,
         source_message_id: envelope.messageId,
         taskId,
@@ -666,17 +1744,96 @@ function createRuntime(api) {
         inReplyTo,
         replyTo: inReplyTo,
         to: trim(meta.to) || undefined,
-        availability: "idle",
-        runtimeStatus: "succeeded",
-        status: "succeeded",
+        availability: completionStatus === "succeeded" ? "idle" : "blocked",
+        runtimeStatus: completionStatus,
+        status: completionStatus,
+        workflowFinal,
+        finalAnswerReady,
+        remainingActions,
+        waivers: Array.isArray(meta.waivers) ? meta.waivers : [],
+        skippedAssignments: Array.isArray(meta.skippedAssignments) ? meta.skippedAssignments : [],
+        confirmFinal: boolFrom(meta.confirmFinal, false),
+        planVersion: Number(meta.planVersion ?? envelope.planVersion ?? 0),
+        ledgerVersion: Number(meta.ledgerVersion ?? envelope.ledgerVersion ?? 0),
+        currentPhaseId: meta.currentPhaseId || envelope.currentPhaseId || envelope.phaseId,
         summary,
         result,
         resultMarkdown,
         artifactRefs,
-      }));
+      });
+      const streamId = await xaddJson(redis, eventsKey(cfg), proposal);
+      const ack = await waitForCompletionAcknowledgement(
+        redis,
+        cfg,
+        completionId,
+        attemptId,
+        Number(meta.ackTimeoutMs || 10000),
+      );
+      return { published: true, streamId: String(streamId || ""), ack };
     });
-    if (!activeEnvelope || taskMatchesEnvelope(activeEnvelope, taskId)) activeTaskCompleted = true;
-    return true;
+    const decision = await persistCompletionDecision({
+      cfg,
+      taskId,
+      completionId,
+      attemptId,
+      streamId: terminal?.streamId,
+      completionStatus,
+      summary,
+      artifactRefs,
+      acknowledgement: terminal?.ack,
+      redis: meta.redis,
+    });
+    if (decision === "submitted" || decision === "deferred") {
+      void (async () => {
+        const lateRedis = new RedisClient(cfg.redisUrl);
+        await lateRedis.connect();
+        try {
+          let lateDecision = decision;
+          if (decision === "submitted") {
+            const acknowledgement = await waitForCompletionAcknowledgement(lateRedis, cfg, completionId, attemptId, 300000);
+            if (acknowledgement) {
+              lateDecision = await persistCompletionDecision({
+                cfg,
+                taskId,
+                completionId,
+                attemptId,
+                streamId: terminal?.streamId,
+                completionStatus,
+                summary,
+                artifactRefs,
+                acknowledgement,
+                redis: lateRedis,
+              });
+            }
+          }
+          if (lateDecision === "deferred") {
+            const completionState = await waitForTerminalCompletionState(lateRedis, cfg, completionId, 300000);
+            if (completionState) await persistCompletionDecision({
+              cfg,
+              taskId,
+              completionId,
+              attemptId,
+              streamId: terminal?.streamId,
+              completionStatus,
+              summary,
+              artifactRefs,
+              acknowledgement: completionState,
+              redis: lateRedis,
+            });
+          }
+        } finally {
+          lateRedis.close();
+        }
+      })().catch(() => {});
+    }
+    return {
+      published: terminal?.published !== false,
+      completionId,
+      attemptId,
+      decision,
+      reason: terminal?.ack?.reason || (decision === "submitted" ? "ack_timeout" : ""),
+      acknowledgement: terminal?.ack || null,
+    };
   }
 
   async function failActiveTask(error, meta = {}) {
@@ -684,9 +1841,29 @@ function createRuntime(api) {
     const envelope = meta.envelope || activeEnvelope;
     const errorText = trim(error?.message) || trim(error) || "Redis Team task failed";
     const messageId = trim(meta.messageId) || envelope?.messageId || ("msg_" + randomUUID());
-    const taskId = trim(meta.taskId) || envelope?.taskId || "";
+    const taskId = completionTaskIdFor(envelope, meta.taskId || envelope?.taskId || "");
     const inReplyTo = trim(meta.inReplyTo) || envelope?.messageId || undefined;
     const summary = trim(meta.summary) || errorText;
+    const completionSource = trim(meta.completionSource) || "runtime_error";
+    const completionId = trim(meta.completionId) || completionIdFor(cfg, taskId || messageId);
+    await ensureDirs(cfg);
+    let artifactRefs = await validateArtifactRefs(cfg, meta.artifactRefs);
+    let resultMarkdown = trim(meta.resultMarkdown) || summary;
+    if (taskId && artifactRefs.length === 0) {
+      const resultDir = path.join(cfg.sharedDir, "results", safeName(taskId));
+      const resultMarkdownPath = path.join(resultDir, "result.md");
+      await mkdirBestEffort(resultDir, TEAM_SHARED_DIR_MODE, "shared result directory");
+      await writeText(resultMarkdownPath, resultMarkdown);
+      artifactRefs = [canonicalArtifactRef(cfg, resultMarkdownPath)];
+      await writeJson(path.join(resultDir, "result.json"), {
+        taskId,
+        status: "failed",
+        summary,
+        resultMarkdown,
+        artifactRefs,
+        completedAt: nowIso(),
+      });
+    }
     const base = {
       messageId,
       message_id: messageId,
@@ -700,11 +1877,15 @@ function createRuntime(api) {
       availability: "blocked",
       runtimeStatus: "failed",
       status: "failed",
+      completionId,
+      completionSource,
+      explicitCompletion: completionSource === COMPLETION_SOURCE,
       summary,
       error: errorText,
+      resultMarkdown,
+      artifactRefs,
     };
 
-    await ensureDirs(cfg);
     if (envelope) {
       await writeLocalStatus(cfg, {
         availability: "blocked",
@@ -722,9 +1903,10 @@ function createRuntime(api) {
           envelope ? taskEvent(cfg, "message_failed", envelope, base) : eventFor(cfg, "message_failed", base),
         );
       }
-      await xaddJson(
+      await xaddTerminalOnce(
         redis,
-        eventsKey(cfg),
+        cfg,
+        completionId,
         envelope ? taskEvent(cfg, "task_failed", envelope, base) : eventFor(cfg, "task_failed", base),
       );
     });
@@ -742,6 +1924,8 @@ function createRuntime(api) {
     const target = await resolveRedisTeamTarget(cfg, params.to);
     const status = await readStatuses(cfg, cfg.memberId);
     const requestedTaskId = trim(params.taskId);
+    const title = trim(params.title) || "Team Message";
+    const text = trim(params.text) || trim(params.prompt) || "";
     const statusIsActive =
       String(status?.availability || "").toLowerCase() === "busy" ||
       String(status?.runtimeStatus || "").toLowerCase() === "running";
@@ -750,27 +1934,111 @@ function createRuntime(api) {
       activeTaskMatches(inferredTaskId)
         ? activeEnvelope
         : await readTaskEnvelope(cfg, inferredTaskId);
+    const textRootTaskId = extractLabeledValue(text, ["rootTaskId", "root_task_id"]);
+    const textRootMessageId = extractLabeledValue(text, ["rootMessageId", "root_message_id"]);
+    const explicitRootTaskId = preferredRootTaskId(params.rootTaskId, params.root_task_id);
+    const explicitRootMessageId = trim(params.rootMessageId) || trim(params.root_message_id);
+    const roster = await readTeamRoster(cfg);
+    const inheritedRootTaskId = preferredRootTaskId(
+      explicitRootTaskId,
+      inferredEnvelope?.rootTaskId,
+      activeEnvelope?.rootTaskId,
+      isClawManagerRootTaskRef(inferredEnvelope?.taskId) ? inferredEnvelope?.taskId : "",
+      isClawManagerRootTaskRef(activeEnvelope?.taskId) ? activeEnvelope?.taskId : "",
+      textRootTaskId,
+    );
+    const generatedTaskId = "task_" + randomUUID();
+    const taskId = requestedTaskId || inheritedRootTaskId || inferredEnvelope?.taskId || activeEnvelope?.taskId || generatedTaskId;
+    const rootTaskId = inheritedRootTaskId || preferredRootTaskId(taskId);
+    const rootMessageId =
+      explicitRootMessageId ||
+      inferredEnvelope?.rootMessageId ||
+      inferredEnvelope?.messageId ||
+      activeEnvelope?.rootMessageId ||
+      activeEnvelope?.messageId ||
+      textRootMessageId;
+    const explicitWorkId = trim(params.workId) || trim(params.assignmentId);
+    const preserveInboundAssignment =
+      !explicitWorkId &&
+      isLeaderMediatedRoster(roster) &&
+      isRosterLeaderTarget(roster, target.to) &&
+      (trim(inferredEnvelope?.workId) || trim(inferredEnvelope?.assignmentId));
+    const workId = explicitWorkId ||
+      (preserveInboundAssignment
+        ? trim(inferredEnvelope?.workId) || trim(inferredEnvelope?.assignmentId)
+        : stableAssignmentId(cfg, {
+            taskId,
+            rootTaskId,
+            to: target.to,
+            title,
+            text,
+          }));
+    const assignmentId =
+      trim(params.assignmentId) ||
+      trim(params.workId) ||
+      (preserveInboundAssignment
+        ? trim(inferredEnvelope?.assignmentId) || trim(inferredEnvelope?.workId)
+        : workId);
+    const inheritedSharedWorkspace =
+      params.sharedWorkspace ||
+      params.shared_workspace ||
+      inferredEnvelope?.sharedWorkspace ||
+      activeEnvelope?.sharedWorkspace ||
+      {};
+    const responseLocale =
+      trim(params.responseLocale || params.response_locale) ||
+      trim(inferredEnvelope?.responseLocale) ||
+      trim(activeEnvelope?.responseLocale) ||
+      "zh-CN";
+    const phaseId =
+      trim(params.phaseId || params.phase_id) ||
+      trim(inferredEnvelope?.currentPhaseId || inferredEnvelope?.phaseId) ||
+      trim(activeEnvelope?.currentPhaseId || activeEnvelope?.phaseId) ||
+      "phase-1";
+    const revision = Math.max(1, intFrom(params.revision, 1));
+    const requiredForRoot = params.required === undefined ? true : boolFrom(params.required, true);
+    assertResponseLocale(responseLocale, text, "Team assignment");
     const message = {
-      v: SCHEMA_VERSION,
+      v: WIRE_SCHEMA_VERSION,
+      protocolVersion: PROTOCOL_VERSION,
       messageId: "msg_" + randomUUID(),
       teamId: cfg.teamId,
       from: cfg.memberId,
       to: target.to,
       originalTo: target.originalTo,
       intent: trim(params.intent) || "send",
-      taskId: requestedTaskId || inferredEnvelope?.taskId || activeEnvelope?.taskId || "task_" + randomUUID(),
+      taskId,
+      rootTaskId,
+      root_task_id: rootTaskId,
+      rootMessageId,
+      root_message_id: rootMessageId,
+      workId,
+      assignmentId,
+      canonicalWorkId: assignmentId,
+      phaseId,
+      revision,
+      required: requiredForRoot,
+      reviewRequired: boolFrom(params.reviewRequired ?? params.review_required, false),
+      dependsOn: Array.isArray(params.dependsOn) ? params.dependsOn.filter(Boolean) : [],
+	  planVersion: Number(params.planVersion ?? params.plan_version ?? inferredEnvelope?.planVersion ?? activeEnvelope?.planVersion ?? 1),
+	  ledgerVersion: Number(params.ledgerVersion ?? params.ledger_version ?? inferredEnvelope?.ledgerVersion ?? activeEnvelope?.ledgerVersion ?? 0),
+	  workflowState: "executing",
       conversationId:
         inferredEnvelope?.conversationId ||
         inferredEnvelope?.taskId ||
         activeEnvelope?.conversationId ||
         activeEnvelope?.taskId ||
         undefined,
-      title: trim(params.title) || "Team Message",
-      text: trim(params.text) || trim(params.prompt) || "",
+      title,
+      text,
       contextRefs: Array.isArray(params.contextRefs) ? params.contextRefs.filter(Boolean) : [],
       ttlSeconds: typeof params.ttlSeconds === "number" ? params.ttlSeconds : 3600,
       priority: trim(params.priority) || "normal",
       metadata: params.metadata || {},
+      responseLocale,
+      sharedWorkspace: sharedWorkspaceForTarget(cfg, inheritedSharedWorkspace, target.to, rootTaskId || taskId),
+      workspaceContract:
+        inferredEnvelope?.workspaceContract || activeEnvelope?.workspaceContract || {},
       createdAt: nowIso(),
     };
 
@@ -778,16 +2046,32 @@ function createRuntime(api) {
     await redis.connect();
     try {
       if (target.route === "unknown") {
-        await failActiveTask(target.error, {
-          cfg,
-          redis,
-          envelope: inferredEnvelope,
-          eventName: "message_failed",
-          messageId: message.messageId,
-          taskId: message.taskId,
-          to: target.originalTo,
-          summary: target.error,
-        });
+        const failureEvent = inferredEnvelope
+          ? taskEvent(cfg, "message_failed", inferredEnvelope, {
+              messageId: message.messageId,
+              message_id: message.messageId,
+              taskId: message.taskId,
+              task_id: message.taskId,
+              to: target.originalTo,
+              availability: "busy",
+              runtimeStatus: "running",
+              status: "message_failed",
+              summary: target.error,
+              error: target.error,
+            })
+          : eventFor(cfg, "message_failed", {
+              messageId: message.messageId,
+              message_id: message.messageId,
+              taskId: message.taskId,
+              task_id: message.taskId,
+              to: target.originalTo,
+              availability: "busy",
+              runtimeStatus: "running",
+              status: "message_failed",
+              summary: target.error,
+              error: target.error,
+            });
+        await xaddJson(redis, eventsKey(cfg), failureEvent);
         lastOutbound = { message, target, failed: true, error: target.error };
         return Object.assign({}, message, { failed: true, error: target.error });
       }
@@ -796,45 +2080,34 @@ function createRuntime(api) {
       const outbound = {
         messageId: message.messageId,
         taskId: message.taskId,
+        rootTaskId: message.rootTaskId,
+        root_task_id: message.rootTaskId,
+        rootMessageId: message.rootMessageId,
+        root_message_id: message.rootMessageId,
+        workId: message.workId,
+        assignmentId: message.assignmentId,
+        canonicalWorkId: message.canonicalWorkId,
+        phaseId: message.phaseId,
+        revision: message.revision,
+        required: message.required,
+        reviewRequired: message.reviewRequired,
+        dependsOn: message.dependsOn,
+        planVersion: message.planVersion,
+        ledgerVersion: message.ledgerVersion,
+        workflowState: message.workflowState,
+        sourceMessageId: inferredEnvelope?.messageId || activeEnvelope?.messageId,
+        source_message_id: inferredEnvelope?.messageId || activeEnvelope?.messageId,
         conversationId: message.conversationId,
         to: message.to,
         originalTo: message.originalTo,
         text: message.text,
         summary: message.title,
       };
-      const completesActiveTask =
-        !!inferredEnvelope &&
-        taskMatchesEnvelope(inferredEnvelope, message.taskId) &&
-        isActiveCompletionTarget(target.originalTo, cfg);
-      const eventName = completesActiveTask || target.system ? "reply" : "outbound";
+      const eventName = target.system || target.group ? "reply" : "outbound";
       await xaddJson(redis, eventsKey(cfg), eventFor(cfg, eventName, Object.assign({}, outbound, {
         to: target.originalTo,
         inReplyTo: inferredEnvelope?.messageId || activeEnvelope?.messageId,
       })));
-      if (completesActiveTask) {
-        if (message.text) {
-          await completeActiveTaskFromText(message.text, {
-            cfg,
-            redis,
-            envelope: inferredEnvelope,
-            messageId: message.messageId,
-            taskId: message.taskId,
-            inReplyTo: inferredEnvelope?.messageId,
-            summary: message.title,
-            to: target.originalTo,
-          });
-        } else {
-          await failActiveTask("completion target received empty text", {
-            cfg,
-            redis,
-            envelope: inferredEnvelope,
-            eventName: "message_failed",
-            messageId: message.messageId,
-            taskId: message.taskId,
-            to: target.originalTo,
-          });
-        }
-      }
       lastOutbound = { message, target };
     } finally {
       redis.close();
@@ -846,24 +2119,35 @@ function createRuntime(api) {
     const status = await readStatuses(cfg, cfg.memberId);
     if (!status || !envelope?.taskId) return false;
     const statusTaskId = status.currentTaskId || status.runtimeTaskId;
-    if (!taskIdsMatch(statusTaskId, envelope.taskId)) return false;
+    if (!taskIdsMatch(statusTaskId, envelope.taskId) && !taskIdsMatch(statusTaskId, envelope.rootTaskId)) return false;
     return ["succeeded", "failed"].includes(String(status.runtimeStatus || "").toLowerCase());
   }
 
   return {
+    isActiveTaskCompleted(taskId) {
+      return activeTaskMatches(taskId) && activeTaskCompleted;
+    },
+
+    isActiveTaskCompletionPending(taskId) {
+      return activeTaskMatches(taskId) && activeTaskCompletionPending;
+    },
+
     async withActiveEnvelope(envelope, fn) {
       const prevEnvelope = activeEnvelope;
       const prevCompleted = activeTaskCompleted;
+      const prevCompletionPending = activeTaskCompletionPending;
       const prevOutbound = lastOutbound;
       activeEnvelope = envelope;
       activeTaskCompleted = false;
+      activeTaskCompletionPending = false;
       lastOutbound = null;
       try {
         const result = await fn();
-        return { result, completed: activeTaskCompleted, outbound: lastOutbound };
+        return { result, completed: activeTaskCompleted, completionPending: activeTaskCompletionPending, outbound: lastOutbound };
       } finally {
         activeEnvelope = prevEnvelope;
         activeTaskCompleted = prevCompleted;
+        activeTaskCompletionPending = prevCompletionPending;
         lastOutbound = prevOutbound;
       }
     },
@@ -889,13 +2173,165 @@ function createRuntime(api) {
       return readStatuses(cfg, memberId);
     },
 
+    async artifactWrite(params) {
+      const cfg = readChannelConfig(runtimeApi.config || {});
+      if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
+      assertTeamArtifactWriteScope(cfg, params);
+      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "member");
+      await mkdirBestEffort(path.dirname(resolved.candidate), TEAM_SHARED_DIR_MODE, "Team artifact parent");
+      await writeText(resolved.candidate, String(params?.content ?? ""));
+      if (activeEnvelope && cfg.redisUrl && cfg.memberId && hasRequiredRedisTeamKeys(cfg)) {
+        const responseLocale = trim(activeEnvelope.responseLocale || "zh-CN");
+        const summary = responseLocale.toLowerCase().startsWith("zh")
+          ? "已更新团队产物：" + resolved.canonical
+          : "Team artifact updated: " + resolved.canonical;
+        await withRedis(cfg, null, async (redis) => {
+          await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "artifact_changed", activeEnvelope, {
+            eventKind: "artifact_changed",
+            artifactChanged: true,
+            artifactRefs: [resolved.canonical],
+            status: "running",
+            runtimeStatus: "running",
+            rootTaskTerminal: false,
+            nonAuthoritative: true,
+            reviewRequired: boolFrom(activeEnvelope.reviewRequired, false),
+            responseLocale,
+            summary,
+          }));
+        });
+      }
+      return { path: resolved.canonical, bytes: Buffer.byteLength(String(params?.content ?? ""), "utf8") };
+    },
+
+    async artifactRead(params) {
+      const cfg = readChannelConfig(runtimeApi.config || {});
+      if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
+      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "team");
+      const stat = await fs.stat(resolved.candidate);
+      if (!stat.isFile()) throw new Error("Team artifact is not a file: " + resolved.canonical);
+      const maxBytes = Math.min(1024 * 1024, Math.max(1, intFrom(params?.maxBytes, 256 * 1024)));
+      if (stat.size > maxBytes) throw new Error("Team artifact exceeds maxBytes: " + stat.size);
+      return { path: resolved.canonical, bytes: stat.size, content: await fs.readFile(resolved.candidate, "utf8") };
+    },
+
+    async artifactList(params) {
+      const cfg = readChannelConfig(runtimeApi.config || {});
+      if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
+      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "team");
+      const limit = Math.min(200, Math.max(1, intFrom(params?.limit, 100)));
+      const entries = await fs.readdir(resolved.candidate, { withFileTypes: true });
+      const result = [];
+      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name)).slice(0, limit)) {
+        if (entry.isSymbolicLink()) continue;
+        const candidate = path.join(resolved.candidate, entry.name);
+        const stat = await fs.stat(candidate);
+        result.push({
+          name: entry.name,
+          type: entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "other",
+          path: canonicalArtifactRef(cfg, candidate),
+          bytes: entry.isFile() ? stat.size : undefined,
+        });
+      }
+      return { path: resolved.canonical, entries: result };
+    },
+
+    async artifactMkdir(params) {
+      const cfg = readChannelConfig(runtimeApi.config || {});
+      if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
+      assertTeamArtifactWriteScope(cfg, params);
+      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "member");
+      if (!(await mkdirBestEffort(resolved.candidate, TEAM_SHARED_DIR_MODE, "Team artifact directory"))) {
+        throw new Error("Unable to create Team artifact directory: " + resolved.canonical);
+      }
+      return { path: resolved.canonical };
+    },
+
     async updateProgress(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
+      const taskId = trim(params?.taskId);
+      const progressStatus = trim(params?.status).toLowerCase();
+      if (!taskId || !progressStatus) {
+        throw new Error("team_update_progress requires taskId and status");
+      }
+      if (!["idle", "busy", "running", "blocked", "waiting_review", "waiting_completion"].includes(progressStatus)) {
+        throw new Error("terminal status must use team_complete_task");
+      }
+      const progress = typeof params.progress === "number"
+        ? Math.min(99, Math.max(0, params.progress))
+        : undefined;
+      const currentEnvelope = activeTaskMatches(taskId) ? activeEnvelope : null;
+      let eventKind = trim(params.eventKind || params.event_kind).toLowerCase();
+      const monitorEnvelope =
+        trim(currentEnvelope?.intent).toLowerCase() === "assignment_status_check" ||
+        trim(currentEnvelope?.metadata?.monitorType || currentEnvelope?.metadata?.monitor_type).toLowerCase() === "assignment_status_check";
+      if ((eventKind === "assignment_check_result" || eventKind === "assignment_check_requested") && !monitorEnvelope) {
+        eventKind = "worker_progress";
+      }
+      const passiveMonitorProgress =
+        eventKind === "assignment_check_result" ||
+        eventKind === "assignment_check_requested" ||
+        eventKind === "assignment_heartbeat";
+      const responseLocale = params.responseLocale || params.response_locale || currentEnvelope?.responseLocale || "zh-CN";
+      if (!passiveMonitorProgress || eventKind === "assignment_check_result") {
+        assertResponseLocale(responseLocale, params.summary || params.detail || "", "Team progress");
+      }
+      const checkId = trim(params.checkId || params.check_id || currentEnvelope?.metadata?.checkId || currentEnvelope?.messageId);
+      const checkSequence = params.checkSequence ?? params.check_sequence ?? currentEnvelope?.metadata?.checkSequence;
+      params = Object.assign(
+        {},
+        params,
+        {
+          eventKind,
+          taskId,
+          task_id: taskId,
+          status: progressStatus,
+          progress,
+          rootTaskId: params.rootTaskId || params.root_task_id || currentEnvelope?.rootTaskId || currentEnvelope?.taskId,
+          rootMessageId: params.rootMessageId || params.root_message_id || currentEnvelope?.rootMessageId || currentEnvelope?.messageId,
+          workId: params.workId || params.work_id || currentEnvelope?.workId || currentEnvelope?.assignmentId,
+          assignmentId: params.assignmentId || params.assignment_id || currentEnvelope?.assignmentId || currentEnvelope?.workId,
+          canonicalWorkId: params.canonicalWorkId || params.canonical_work_id || params.assignmentId || params.assignment_id || currentEnvelope?.assignmentId || currentEnvelope?.workId,
+          phaseId: params.phaseId || params.phase_id || params.phase || currentEnvelope?.phaseId || currentEnvelope?.currentPhaseId,
+          revision: Math.max(1, intFrom(params.revision ?? currentEnvelope?.revision, 1)),
+          required: params.required === undefined ? currentEnvelope?.required !== false : boolFrom(params.required, true),
+          reviewRequired: boolFrom(params.reviewRequired ?? params.review_required, false),
+          validatedRevision: params.validatedRevision ?? params.validated_revision,
+          planVersion: Number(params.planVersion ?? params.plan_version ?? currentEnvelope?.planVersion ?? 0),
+          ledgerVersion: Number(params.ledgerVersion ?? params.ledger_version ?? currentEnvelope?.ledgerVersion ?? 0),
+          workflowState: params.workflowState || params.workflow_state || currentEnvelope?.workflowState,
+          phases: Array.isArray(params.phases) ? params.phases : undefined,
+          remainingActions: Array.isArray(params.remainingActions || params.remaining_actions) ? (params.remainingActions || params.remaining_actions) : undefined,
+          rootTaskTerminal: false,
+          nonAuthoritative: true,
+          visibleToChat:
+            params.visibleToChat === undefined && params.visible_to_chat === undefined
+              ? !passiveMonitorProgress
+              : params.visibleToChat !== false && params.visible_to_chat !== false,
+          responseLocale,
+          checkId: passiveMonitorProgress ? checkId : undefined,
+          checkSequence: passiveMonitorProgress ? checkSequence : undefined,
+          requestedAt: passiveMonitorProgress ? (params.requestedAt || params.requested_at || currentEnvelope?.metadata?.requestedAt) : undefined,
+          respondedAt: eventKind === "assignment_check_result" ? nowIso() : undefined,
+        },
+      );
+      if (currentEnvelope && eventKind === "leader_plan") {
+        currentEnvelope.planVersion = Number(params.planVersion || currentEnvelope.planVersion || 1);
+        currentEnvelope.workflowState = params.workflowState || "executing";
+        if (Array.isArray(params.phases) && params.phases.length > 0) {
+          const firstActivePhase = params.phases.find((phase) =>
+            ["active", "awaiting_results"].includes(trim(phase?.status).toLowerCase()),
+          ) || params.phases[0];
+          currentEnvelope.currentPhaseId =
+            trim(firstActivePhase?.phaseId || firstActivePhase?.phase_id || firstActivePhase?.id || firstActivePhase?.name) ||
+            currentEnvelope.currentPhaseId;
+        }
+        await writeTaskEnvelope(cfg, currentEnvelope);
+      }
       await ensureDirs(cfg);
       const status = await writeLocalStatus(cfg, {
-        availability: params.status === "idle" ? "idle" : params.status,
-        currentTaskId: params.taskId,
-        progress: typeof params.progress === "number" ? params.progress : undefined,
+        availability: progressStatus === "idle" ? "idle" : progressStatus,
+        currentTaskId: taskId,
+        progress,
         lastSummary: params.summary || params.status,
         artifactRefs: Array.isArray(params.artifactRefs) ? params.artifactRefs : [],
       });
@@ -904,7 +2340,7 @@ function createRuntime(api) {
         const redis = new RedisClient(cfg.redisUrl);
         await redis.connect();
         try {
-          await xaddJson(redis, eventsKey(cfg), eventFor(cfg, "progress", params));
+          await xaddJson(redis, eventsKey(cfg), eventFor(cfg, "task_progress", params));
         } finally {
           redis.close();
         }
@@ -914,79 +2350,105 @@ function createRuntime(api) {
 
     async completeTask(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
-      await ensureDirs(cfg);
-      const resultDir = path.join(cfg.sharedDir, "results", safeName(params.taskId));
-      await fs.mkdir(resultDir, { recursive: true });
-      const artifactRefs = Array.isArray(params.artifactRefs) ? params.artifactRefs.slice() : [];
-      if (params.resultMarkdown) {
-        await fs.writeFile(path.join(resultDir, "result.md"), params.resultMarkdown, "utf8");
-        artifactRefs.push(path.join(resultDir, "result.md"));
+      const taskId = trim(params?.taskId);
+      const completionStatus = trim(params?.status).toLowerCase();
+      const summary = trim(params?.summary);
+      if (!taskId || !completionStatus || !summary) {
+        throw new Error("team_complete_task requires taskId, status and summary");
       }
+      if (!["succeeded", "failed", "cancelled"].includes(completionStatus)) {
+        throw new Error("team_complete_task status must be succeeded, failed or cancelled");
+      }
+      const completionEnvelope = activeTaskMatches(taskId)
+        ? activeEnvelope
+        : await readTaskEnvelope(cfg, taskId);
+      const resultTaskId = completionTaskIdFor(completionEnvelope, params.rootTaskId || params.root_task_id || taskId) || taskId;
+      params = Object.assign({}, params, {
+        taskId: resultTaskId,
+        task_id: resultTaskId,
+        rootTaskId: resultTaskId,
+        root_task_id: resultTaskId,
+        rootMessageId: params.rootMessageId || params.root_message_id || completionEnvelope?.rootMessageId || completionEnvelope?.messageId,
+        root_message_id: params.rootMessageId || params.root_message_id || completionEnvelope?.rootMessageId || completionEnvelope?.messageId,
+        status: completionStatus,
+        summary,
+        responseLocale: params.responseLocale || params.response_locale || completionEnvelope?.responseLocale || "zh-CN",
+      });
+      const resultMarkdown = trim(params.resultMarkdown) || params.summary;
+      const responseLocale = params.responseLocale || params.response_locale || completionEnvelope?.responseLocale || "zh-CN";
+      assertResponseLocale(responseLocale, summary + "\n" + resultMarkdown, "Team completion");
+      await ensureDirs(cfg);
+      const resultDir = path.join(cfg.sharedDir, "results", safeName(resultTaskId));
+      await mkdirBestEffort(resultDir, TEAM_SHARED_DIR_MODE, "shared result directory");
+      const artifactRefs = await validateArtifactRefs(cfg, params.artifactRefs);
+      const resultMarkdownPath = path.join(resultDir, "result.md");
+      await writeText(resultMarkdownPath, resultMarkdown);
+      artifactRefs.push(canonicalArtifactRef(cfg, resultMarkdownPath));
       await writeJson(
         path.join(resultDir, "result.json"),
-        Object.assign({}, params, { artifactRefs, completedAt: nowIso() }),
+        Object.assign({}, params, { resultMarkdown, artifactRefs, completedAt: nowIso() }),
       );
-      const runtimeStatus = params.status === "succeeded" ? "succeeded" : "failed";
-      const status = await writeLocalStatus(cfg, {
-        availability: params.status === "succeeded" ? "idle" : "blocked",
+      const runtimeStatus = "completion_pending";
+      let status = await writeLocalStatus(cfg, {
+        availability: "busy",
         runtimeStatus,
-        currentTaskId: params.taskId,
-        progress: params.status === "succeeded" ? 100 : undefined,
+        currentTaskId: resultTaskId,
+        progress: params.status === "succeeded" ? 99 : undefined,
         lastSummary: params.summary,
         artifactRefs,
       });
+      let completionResult = null;
 
       if (cfg.enabled && cfg.redisUrl && cfg.memberId && hasRequiredRedisTeamKeys(cfg)) {
         const redis = new RedisClient(cfg.redisUrl);
         await redis.connect();
         try {
-          const eventName = params.status === "succeeded" ? "task_completed" : "task_failed";
-          const terminalEnvelope = activeTaskMatches(params.taskId)
+          const terminalEnvelope = completionEnvelope || (activeTaskMatches(params.taskId)
             ? activeEnvelope
-            : await readTaskEnvelope(cfg, params.taskId);
+            : await readTaskEnvelope(cfg, params.taskId));
           if (terminalEnvelope && taskMatchesEnvelope(terminalEnvelope, params.taskId)) {
-            if (params.status === "succeeded") {
-              await completeActiveTaskFromText(params.resultMarkdown || params.summary, {
+            completionResult = await completeActiveTask(resultMarkdown, {
                 cfg,
                 redis,
                 envelope: terminalEnvelope,
-                taskId: params.taskId,
+                taskId: resultTaskId,
+                completionId: params.completionId,
                 summary: params.summary,
-                resultMarkdown: params.resultMarkdown || params.summary,
+                resultMarkdown,
                 artifactRefs,
+                workId: params.workId || params.work_id,
+                assignmentId: params.assignmentId || params.assignment_id,
+                attemptId: params.attemptId || params.attempt_id,
+                workflowFinal: params.workflowFinal ?? params.workflow_final ?? params.sealWorkflow ?? params.seal_workflow,
+                finalAnswerReady: params.finalAnswerReady ?? params.final_answer_ready,
+                remainingActions: params.remainingActions || params.remaining_actions || [],
+                waivers: params.waivers || params.assignmentWaivers || params.assignment_waivers || [],
+                skippedAssignments: params.skippedAssignments || params.skipped_assignments || [],
+                confirmFinal: params.confirmFinal ?? params.confirm_final,
+                planVersion: params.planVersion ?? params.plan_version ?? completionEnvelope?.planVersion,
+                ledgerVersion: params.ledgerVersion ?? params.ledger_version ?? completionEnvelope?.ledgerVersion,
+                currentPhaseId: params.currentPhaseId || params.current_phase_id || completionEnvelope?.currentPhaseId,
+                completionStatus: params.status,
               });
-            } else {
-              await failActiveTask(params.summary || "Redis Team task failed", {
-                cfg,
-                redis,
-                envelope: terminalEnvelope,
-                taskId: params.taskId,
-                summary: params.summary,
-              });
-            }
           } else {
-            await xaddJson(redis, eventsKey(cfg), eventFor(cfg, eventName, Object.assign({}, params, {
-              artifactRefs,
-              availability: params.status === "succeeded" ? "idle" : "blocked",
-              runtimeStatus,
-            })));
+            throw new Error("team_complete_task could not resolve the active task envelope: " + params.taskId);
           }
         } finally {
           redis.close();
         }
+        status = await readStatuses(cfg, cfg.memberId);
       }
-      return { status, artifactRefs };
+      return { status, artifactRefs, completion: completionResult };
     },
 
-    completeActiveTaskFromText,
+    completeActiveTask,
     failActiveTask,
     isTaskTerminal,
-    textFromDispatchResult,
   };
 }
 
 // ============ Consumer Logic ============
-async function startConsumer(cfg, onMessage, log) {
+async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
   if (!cfg.enabled) {
     log.info("redis-team: disabled; skipping consumer");
     return null;
@@ -1072,8 +2534,16 @@ async function startConsumer(cfg, onMessage, log) {
           try {
             const envelope = normalizeEnvelope(msg);
             if (!envelope) continue;
-            if (dedup(envelope.idempotencyKey)) {
+            const processedKey = processedMessageKey(cfg, envelope.idempotencyKey);
+            if (await redis.command("GET", processedKey)) {
               log.info("redis-team: dedup skipped " + envelope.messageId);
+              await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
+              continue;
+            }
+            if (isContextOnlyEnvelope(envelope)) {
+              log.info("redis-team: dispatching context-only notification " + envelope.messageId);
+              await onMessage(envelope);
+              await redis.command("SET", processedKey, envelope.messageId, "EX", 604800);
               await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
               continue;
             }
@@ -1088,21 +2558,17 @@ async function startConsumer(cfg, onMessage, log) {
               }),
             );
             await onMessage(envelope);
+            await redis.command("SET", processedKey, envelope.messageId, "EX", 604800);
             await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
           } catch (err) {
             const error = err instanceof Error ? err.message : String(err);
             log.error("redis-team: message processing failed: " + error);
             const envelope = normalizeEnvelope(msg) || {};
-            await xaddJson(
-              redis,
-              eventsKey(cfg),
-              taskEvent(cfg, "task_failed", envelope, {
-                availability: "blocked",
-                runtimeStatus: "failed",
-                summary: error,
-                error,
-              }),
-            );
+            if (typeof onProcessingFailure === "function") {
+              await onProcessingFailure(envelope, error);
+            } else {
+              log.warn("redis-team: no structured failure handler is registered; leaving task non-terminal");
+            }
             await xaddJson(redis, dlqKey(cfg), eventFor(cfg, "dlq", { redisId: msg.redisId, error, message: msg }));
             try {
               await redis.command("XACK", inboxKey(cfg), cfg.consumerGroup, msg.redisId);
@@ -1149,11 +2615,24 @@ const teamSendParameters = {
     text: { type: "string", description: "Message content" },
     intent: { type: "string", description: "Message intent" },
     taskId: { type: "string" },
+    rootTaskId: { type: "string", description: "Root ClawManager task ID that this assignment belongs to" },
+    rootMessageId: { type: "string", description: "Root ClawManager message ID that this assignment belongs to" },
+    workId: { type: "string", description: "Stable business work item ID within the root task" },
+    assignmentId: { type: "string", description: "Stable assignment ID; defaults to workId" },
+    phaseId: { type: "string", description: "Structured workflow phase ID" },
+    revision: { type: "number", minimum: 1, description: "Assignment/artifact revision" },
+    required: { type: "boolean", description: "Whether this assignment blocks root completion" },
+    reviewRequired: { type: "boolean", description: "Whether the latest revision requires review before root completion" },
+    planVersion: { type: "number", minimum: 0 },
+    ledgerVersion: { type: "number", minimum: 0 },
+    dependsOn: { type: "array", items: { type: "string" } },
     title: { type: "string" },
     contextRefs: { type: "array", items: { type: "string" } },
     ttlSeconds: { type: "number", minimum: 1 },
     priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
     metadata: { type: "object" },
+    responseLocale: { type: "string", description: "User-visible response locale inherited from the root task" },
+    sharedWorkspace: { type: "object", description: "Current Team workspace contract inherited from the root task" },
   },
 };
 
@@ -1173,10 +2652,31 @@ const progressParameters = {
     taskId: { type: "string" },
     status: {
       type: "string",
-      enum: ["idle", "busy", "blocked", "waiting_review", "succeeded", "failed"],
+      enum: ["idle", "busy", "running", "blocked", "waiting_review", "waiting_completion"],
     },
-    progress: { type: "number", minimum: 0, maximum: 100 },
+    progress: { type: "number", minimum: 0, maximum: 99 },
     summary: { type: "string" },
+    eventKind: {
+      type: "string",
+      description: "User-visible process event kind such as leader_plan, worker_plan, worker_progress, assignment_check_result, or leader_synthesis",
+    },
+    phase: { type: "string" },
+    phaseId: { type: "string" },
+    revision: { type: "number", minimum: 1 },
+    required: { type: "boolean" },
+    reviewRequired: { type: "boolean" },
+    validatedRevision: { type: "number", minimum: 1 },
+    planVersion: { type: "number", minimum: 0 },
+    ledgerVersion: { type: "number", minimum: 0 },
+    workflowState: { type: "string" },
+    phases: { type: "array", items: { type: "object" } },
+    remainingActions: { type: "array", items: { type: "string" } },
+    detail: { type: "string" },
+    workId: { type: "string" },
+    assignmentId: { type: "string" },
+    rootTaskId: { type: "string" },
+    rootMessageId: { type: "string" },
+    visibleToChat: { type: "boolean" },
     artifactRefs: { type: "array", items: { type: "string" } },
   },
 };
@@ -1187,11 +2687,94 @@ const completeParameters = {
   required: ["taskId", "status", "summary"],
   properties: {
     taskId: { type: "string" },
-    status: { type: "string", enum: ["succeeded", "failed", "blocked"] },
+    status: { type: "string", enum: ["succeeded", "failed", "cancelled"] },
     summary: { type: "string" },
     resultMarkdown: { type: "string" },
     artifactRefs: { type: "array", items: { type: "string" } },
+    completionId: { type: "string" },
+    attemptId: { type: "string" },
+    rootTaskId: { type: "string" },
+    rootMessageId: { type: "string" },
+    workId: { type: "string" },
+    assignmentId: { type: "string" },
+    workflowFinal: { type: "boolean", description: "Leader declares that the workflow has no remaining required phase" },
+    finalAnswerReady: { type: "boolean" },
+    remainingActions: { type: "array", items: { type: "string" } },
+    waivers: {
+      type: "array",
+      description: "Explicit Leader risk waivers for terminal failed/stale required assignments",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["assignmentId", "reason", "risk"],
+        properties: {
+          assignmentId: { type: "string" },
+          reason: { type: "string" },
+          risk: { type: "string" },
+        },
+      },
+    },
+    skippedAssignments: {
+      type: "array",
+      description: "Optional assignments omitted from the final workflow, each with a structured reason",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["assignmentId", "reason"],
+        properties: {
+          assignmentId: { type: "string" },
+          reason: { type: "string" },
+        },
+      },
+    },
+    confirmFinal: { type: "boolean", description: "Confirm finality after a narrative/structure contradiction warning" },
+    planVersion: { type: "number", minimum: 0 },
+    ledgerVersion: { type: "number", minimum: 0 },
+    currentPhaseId: { type: "string" },
   },
+};
+
+const artifactPathProperties = {
+  path: { type: "string", description: "Relative path. Absolute paths and '..' traversal are rejected." },
+  scope: { type: "string", enum: ["member", "team"], description: "member is rooted at the current member's task artifact directory; team is rooted at the current Team shared directory and is writable only by the Leader." },
+  rootTaskId: { type: "string", description: "Optional root task ID; inherited from the active assignment when omitted." },
+};
+
+const artifactWriteParameters = {
+  type: "object",
+  additionalProperties: false,
+  required: ["path", "content"],
+  properties: {
+    ...artifactPathProperties,
+    content: { type: "string" },
+  },
+};
+
+const artifactReadParameters = {
+  type: "object",
+  additionalProperties: false,
+  required: ["path"],
+  properties: {
+    ...artifactPathProperties,
+    maxBytes: { type: "number", minimum: 1, maximum: 1048576 },
+  },
+};
+
+const artifactListParameters = {
+  type: "object",
+  additionalProperties: false,
+  required: ["path"],
+  properties: {
+    ...artifactPathProperties,
+    limit: { type: "number", minimum: 1, maximum: 200 },
+  },
+};
+
+const artifactMkdirParameters = {
+  type: "object",
+  additionalProperties: false,
+  required: ["path"],
+  properties: artifactPathProperties,
 };
 
 // ============ Plugin Entry ============
@@ -1210,6 +2793,7 @@ export default definePluginEntry({
       memberId: { type: "string" },
       role: { type: "string" },
       sharedDir: { type: "string" },
+      teamConfigPath: { type: "string" },
       autoRun: { type: "boolean" },
       consumerGroup: { type: "string" },
       inboxKey: { type: "string" },
@@ -1308,6 +2892,42 @@ export default definePluginEntry({
       parameters: completeParameters,
       async execute(_id, params) {
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, ...(await runtime.completeTask(params || {})) }, null, 2) }] };
+      },
+    });
+    api.registerTool({
+      name: "team_artifact_write",
+      label: "Team Artifact Write",
+      description: "Atomically write a UTF-8 artifact inside the current Team workspace with cooperative permissions.",
+      parameters: artifactWriteParameters,
+      async execute(_id, params) {
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, artifact: await runtime.artifactWrite(params || {}) }, null, 2) }] };
+      },
+    });
+    api.registerTool({
+      name: "team_artifact_read",
+      label: "Team Artifact Read",
+      description: "Read a UTF-8 artifact from the current Team workspace without allowing path traversal.",
+      parameters: artifactReadParameters,
+      async execute(_id, params) {
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, artifact: await runtime.artifactRead(params || {}) }, null, 2) }] };
+      },
+    });
+    api.registerTool({
+      name: "team_artifact_list",
+      label: "Team Artifact List",
+      description: "List artifacts in the current Team workspace without following symlinks.",
+      parameters: artifactListParameters,
+      async execute(_id, params) {
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, ...(await runtime.artifactList(params || {})) }, null, 2) }] };
+      },
+    });
+    api.registerTool({
+      name: "team_artifact_mkdir",
+      label: "Team Artifact Mkdir",
+      description: "Create a cooperative member-scoped artifact directory inside the current Team workspace.",
+      parameters: artifactMkdirParameters,
+      async execute(_id, params) {
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, artifact: await runtime.artifactMkdir(params || {}) }, null, 2) }] };
       },
     });
 
@@ -1471,19 +3091,44 @@ export default definePluginEntry({
                     "redis-team: received message " + envelope.messageId + " type=" + envelope.type,
                   );
                   const emitTaskEvent = async (event, extra = {}) => {
+                    if (
+                      event === "assignment_heartbeat" &&
+                      runtime.isActiveTaskCompleted(envelope.taskId)
+                    ) {
+                      return;
+                    }
                     const r = new RedisClient(cfg.redisUrl);
                     await r.connect();
                     try {
+                      if (
+                        event === "assignment_heartbeat" &&
+                        runtime.isActiveTaskCompleted(envelope.taskId)
+                      ) {
+                        return;
+                      }
                       await xaddJson(r, eventsKey(cfg), taskEvent(cfg, event, envelope, extra));
                     } finally {
                       r.close();
                     }
                   };
+                  const contextOnly = isContextOnlyEnvelope(envelope);
+                  const peerId = String(envelope.from || "unknown");
+                  const createdMs = Date.parse(envelope.createdAt);
+                  const ts = Number.isFinite(createdMs) ? createdMs : undefined;
+                  const textIn = String(envelope.text || "");
+                  const taskId = String(envelope.taskId || "");
+                  const conversationId = String(envelope.conversationId || cfg.teamId || "");
 
                   if (!ctx.channelRuntime) {
                     ctx.log?.warn?.(
                       "redis-team: channelRuntime unavailable; start gateway with plugin runtime or open Web UI node",
                     );
+                    if (contextOnly) {
+                      await writeLocalStatus(cfg, {
+                        lastContextAt: nowIso(),
+                      });
+                      return;
+                    }
                     await writeLocalStatus(cfg, {
                       availability: "blocked",
                       runtimeStatus: "failed",
@@ -1503,6 +3148,12 @@ export default definePluginEntry({
 
                   if (!cfg.autoRun) {
                     ctx.log?.info?.("redis-team: autoRun disabled; skipping agent dispatch");
+                    if (contextOnly) {
+                      await writeLocalStatus(cfg, {
+                        lastContextAt: nowIso(),
+                      });
+                      return;
+                    }
                     await writeLocalStatus(cfg, {
                       availability: "blocked",
                       runtimeStatus: "failed",
@@ -1518,12 +3169,74 @@ export default definePluginEntry({
                     return;
                   }
 
-                  const peerId = String(envelope.from || "unknown");
-                  const createdMs = Date.parse(envelope.createdAt);
-                  const ts = Number.isFinite(createdMs) ? createdMs : undefined;
-                  const textIn = String(envelope.text || "");
-                  const taskId = String(envelope.taskId || "");
-                  const conversationId = String(envelope.conversationId || cfg.teamId || "");
+                  if (contextOnly) {
+                    try {
+                      await dispatchInboundDirectDmWithRuntime({
+                        cfg: ctx.cfg,
+                        runtime: { channel: ctx.channelRuntime },
+                        channel: CHANNEL_ID,
+                        channelLabel: "Redis Team",
+                        accountId: ctx.accountId,
+                        peer: { kind: "group", id: cfg.teamId },
+                        senderId: peerId,
+                        senderAddress: peerId,
+                        recipientAddress: cfg.memberId,
+                        conversationLabel: "Team " + cfg.teamId + " context " + envelope.messageId,
+                        rawBody: textIn,
+                        messageId: envelope.messageId,
+                        timestamp: ts,
+                        commandAuthorized: true,
+                        bodyForAgent: textIn,
+                        provider: CHANNEL_ID,
+                        surface: "Redis Team",
+                        originatingChannel: CHANNEL_ID,
+                        originatingTo: peerId,
+                        extraContext: {
+                          ChatType: "group",
+                          NativeChannelId: conversationId,
+                          RedisTeamTaskId: taskId,
+                          UntrustedContext: [
+                            "Redis Team context notification:",
+                            "- teamId: " + cfg.teamId,
+                            "- taskId: " + (taskId || "(none)"),
+                            "- from: " + peerId,
+                            "- to: " + cfg.memberId,
+                            "- requiresCompletion: false",
+                          ],
+                        },
+                        deliver: async () => {},
+                        onRecordError: (err) => {
+                          ctx.log?.error?.(
+                            "redis-team: record context notification failed: " + (err?.message || String(err)),
+                          );
+                        },
+                        onDispatchError: (err, info) => {
+                          ctx.log?.warn?.(
+                            "redis-team: context notification dispatch failed (" +
+                              info.kind +
+                              "): " +
+                              (err?.message || String(err)),
+                          );
+                        },
+                      });
+                    } catch (err) {
+                      ctx.log?.warn?.(
+                        "redis-team: context notification dispatch skipped after error: " +
+                          (err?.message || String(err)),
+                      );
+                    }
+                    await writeLocalStatus(cfg, {
+                      lastContextAt: nowIso(),
+                    });
+                    ctx.setStatus({
+                      accountId: ctx.accountId,
+                      running: true,
+                      connected: true,
+                      lastConnectedAt: Date.now(),
+                      statusState: "online",
+                    });
+                    return;
+                  }
 
                   await writeLocalStatus(cfg, {
                     availability: "busy",
@@ -1537,10 +3250,18 @@ export default definePluginEntry({
                     summary: "Redis Team task started",
                   });
 
-                  let deliveredReply = false;
                   let dispatchFailed = false;
-                  const activeResult = await runtime.withActiveEnvelope(envelope, async () => {
-                    await dispatchInboundDirectDmWithRuntime({
+                  let deliveredViaCallback = false;
+                  const stopHeartbeat = startAssignmentHeartbeat({
+                    envelope,
+                    emitTaskEvent,
+                    log: ctx.log || console,
+                    isTerminal: () => runtime.isActiveTaskCompleted(envelope.taskId),
+                  });
+                  let activeResult;
+                  try {
+                    activeResult = await runtime.withActiveEnvelope(envelope, async () => {
+                    const dispatchResult = await dispatchInboundDirectDmWithRuntime({
                     cfg: ctx.cfg,
                     runtime: { channel: ctx.channelRuntime },
                     channel: CHANNEL_ID,
@@ -1550,12 +3271,12 @@ export default definePluginEntry({
                     senderId: peerId,
                     senderAddress: peerId,
                     recipientAddress: cfg.memberId,
-                    conversationLabel: "Team " + cfg.teamId + " · task " + envelope.taskId,
+                    conversationLabel: "Team " + cfg.teamId + " 路 task " + envelope.taskId,
                     rawBody: textIn,
                     messageId: envelope.messageId,
                     timestamp: ts,
                     commandAuthorized: true,
-                    bodyForAgent: textIn,
+                    bodyForAgent: appendRedisTeamCompletionGuidance(textIn, envelope),
                     provider: CHANNEL_ID,
                     surface: "Redis Team",
                     originatingChannel: CHANNEL_ID,
@@ -1574,9 +3295,13 @@ export default definePluginEntry({
                       ],
                     },
                     deliver: async (payload) => {
-                      deliveredReply = true;
+                      if (runtime.isActiveTaskCompleted(envelope.taskId) || runtime.isActiveTaskCompletionPending(envelope.taskId)) {
+                        ctx.log?.info?.("redis-team: suppressed duplicate reply after submitted completion for " + envelope.messageId);
+                        return;
+                      }
+                      assertResponseLocale(envelope.responseLocale || "zh-CN", payload?.text || "", "Team reply");
+                      deliveredViaCallback = true;
                       ctx.log?.info?.("redis-team: delivering reply for " + envelope.messageId);
-                      const replyText = payload?.text || "";
                       const replyMessageId = "msg_" + randomUUID();
                       const r = new RedisClient(cfg.redisUrl);
                       await r.connect();
@@ -1585,33 +3310,20 @@ export default definePluginEntry({
                           messageId: replyMessageId,
                           message_id: replyMessageId,
                           inReplyTo: envelope.messageId,
+                          sourceMessageId: envelope.messageId,
+                          source_message_id: envelope.messageId,
                           taskId: envelope.taskId,
                           task_id: envelope.taskId,
+                          rootTaskId: envelope.rootTaskId || envelope.taskId,
+                          root_task_id: envelope.rootTaskId || envelope.taskId,
+                          rootMessageId: envelope.rootMessageId || envelope.messageId,
+                          root_message_id: envelope.rootMessageId || envelope.messageId,
+                          workId: envelope.workId || envelope.assignmentId,
+                          assignmentId: envelope.assignmentId || envelope.workId,
                           text: payload?.text || "",
                           mediaUrls: payload?.mediaUrls,
                           mediaUrl: payload?.mediaUrl,
                         }));
-                        if (replyText) {
-                          await runtime.completeActiveTaskFromText(replyText, {
-                            cfg,
-                            redis: r,
-                            envelope,
-                            messageId: replyMessageId,
-                            taskId: envelope.taskId,
-                            inReplyTo: envelope.messageId,
-                            summary: "Redis Team task completed",
-                          });
-                        } else {
-                          await runtime.failActiveTask("dispatch delivered an empty reply", {
-                            cfg,
-                            redis: r,
-                            envelope,
-                            eventName: "message_failed",
-                            messageId: replyMessageId,
-                            taskId: envelope.taskId,
-                            inReplyTo: envelope.messageId,
-                          });
-                        }
                       } finally {
                         r.close();
                       }
@@ -1642,34 +3354,58 @@ export default definePluginEntry({
                       });
                     },
                     });
-                  });
+                    return { dispatchResult };
+                    });
+                  } finally {
+                    stopHeartbeat();
+                  }
 
-                  if (!deliveredReply && !dispatchFailed && !activeResult?.completed) {
+                  let fallbackCompleted = false;
+                  let fallbackPending = false;
+                  if (!dispatchFailed && !activeResult?.completed && !activeResult?.outbound && !deliveredViaCallback) {
+                    const fallbackText = await readLatestAssistantTextFromDispatch(activeResult?.result?.dispatchResult);
+                    if (await shouldUseAssistantSessionFallback(cfg, envelope, fallbackText)) {
+                      const usableFallbackText = usableFallbackAssistantText(fallbackText);
+                      const fallbackResult = await runtime.completeActiveTask(usableFallbackText, {
+                        cfg,
+                        envelope,
+                        taskId: envelope.taskId,
+                        summary: usableFallbackText.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Redis Team task completed",
+                        resultMarkdown: usableFallbackText,
+                      });
+                      fallbackCompleted = fallbackResult?.decision === "accepted";
+                      fallbackPending = fallbackResult?.decision === "submitted";
+                      if (fallbackCompleted) {
+                        ctx.log?.info?.("redis-team: completed task from assistant session fallback for " + envelope.messageId);
+                      }
+                    }
+                  }
+
+                  if (!dispatchFailed && !activeResult?.completed && !activeResult?.completionPending && !fallbackCompleted && !fallbackPending) {
                     if (await runtime.isTaskTerminal(cfg, envelope)) {
                       ctx.log?.info?.(
                         "redis-team: task " + envelope.taskId + " already terminal after dispatch",
                       );
                     } else {
-                      const result = runtime.textFromDispatchResult(activeResult);
-                      if (result) {
-                        await runtime.completeActiveTaskFromText(result, {
-                          cfg,
-                          envelope,
-                          taskId: envelope.taskId,
-                          inReplyTo: envelope.messageId,
-                          summary: "Redis Team task completed",
-                        });
-                      } else {
-                        const error = "dispatch finished without reply/completion";
-                        ctx.log?.warn?.(
-                          "redis-team: " + error + " for " + envelope.messageId + "; marking task failed",
-                        );
-                        await runtime.failActiveTask(error, {
-                          cfg,
-                          envelope,
-                          taskId: envelope.taskId,
-                          summary: "Redis Team task failed",
-                        });
+                      const summary = "Agent \u56de\u5408\u5df2\u7ed3\u675f\uff0c\u6b63\u5728\u7b49\u5f85\u663e\u5f0f\u5b8c\u6210\u56de\u6267\u3002";
+                      await writeLocalStatus(cfg, {
+                        availability: "waiting_completion",
+                        runtimeStatus: "waiting_completion",
+                        currentTaskId: envelope.taskId,
+                        lastSummary: summary,
+                      });
+                      const r = new RedisClient(cfg.redisUrl);
+                      await r.connect();
+                      try {
+                        await xaddJson(r, eventsKey(cfg), taskEvent(cfg, "task_progress", envelope, {
+                          status: "waiting_completion",
+                          availability: "waiting_completion",
+                          runtimeStatus: "waiting_completion",
+                          summary,
+                          completionRequired: true,
+                        }));
+                      } finally {
+                        r.close();
                       }
                     }
                   }
@@ -1680,6 +3416,14 @@ export default definePluginEntry({
                     connected: true,
                     lastConnectedAt: Date.now(),
                     statusState: "online",
+                  });
+                },
+                async (envelope, error) => {
+                  await runtime.failActiveTask(error, {
+                    cfg,
+                    envelope,
+                    taskId: envelope?.taskId,
+                    summary: "Redis Team message processing failed",
                   });
                 },
                 ctx.log || console,

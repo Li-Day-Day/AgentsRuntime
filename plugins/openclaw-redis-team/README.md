@@ -8,6 +8,8 @@ This plugin connects an OpenClaw runtime managed by ClawManager to a Redis Strea
 - Exposes `team_send` for assigning work to another team member.
 - Exposes `team_status` for reading member status snapshots from the shared Team directory.
 - Exposes `team_update_progress` and `team_complete_task` for structured progress/result reporting.
+- Exposes `team_artifact_write`, `team_artifact_read`, `team_artifact_list`, and
+  `team_artifact_mkdir` for current-Team scoped artifact operations.
 - Writes small events to Redis and writes durable task/status/result files under the shared Team directory.
 - Attempts to run inbound tasks through OpenClaw embedded agent runtime helper when available.
 
@@ -21,6 +23,11 @@ CLAWMANAGER_TEAM_ROLE=developer
 CLAWMANAGER_TEAM_REDIS_URL=redis://redis:6379/0
 CLAWMANAGER_TEAM_SHARED_DIR=/team
 ```
+
+In pooled Lite runtimes, `/team` is a canonical link returned to ClawManager,
+not a container-global mount. Artifact tools resolve the physical current-Team
+directory, reject traversal and symlink escapes, and create cooperative
+`2775` directories and `0664` files.
 
 Optional:
 
@@ -48,8 +55,28 @@ before `CLAWMANAGER_TEAM_EMBEDDED_TIMEOUT_SECONDS`, so ClawManager does not leav
 the task in `running` forever.
 When ClawManager provides explicit stream keys, the plugin uses those keys
 instead of deriving them from `CLAWMANAGER_TEAM_ID`. Events include
-`task_received`, `task_started`, and a final `task_completed` or `task_failed`
-with both camelCase and snake_case id fields.
+`task_received`, `task_started`, and structured progress events with both
+camelCase and snake_case id fields.
+
+## Completion protocol
+
+Redis Team protocol v3 keeps the original wire schema (`v: 1`) for older
+ClawManager releases and adds a backend acknowledgement handshake. A normal
+assistant reply or successful agent turn is progress, not task completion. An
+explicit `team_complete_task` call emits `completion_proposed`; the runtime
+marks the task terminal and locks the stable `completionId` only after
+ClawManager returns an `accepted` acknowledgement. Deferred and rejected
+attempts keep the assignment retryable. Runtime errors still emit a structured
+`task_failed` event.
+
+Every explicit completion atomically writes `results/<taskId>/result.json` and
+`results/<taskId>/result.md`, even when the caller only provides a summary. The
+proposal carries a deterministic `completionId`, a per-attempt `attemptId`,
+`completionSource`, `explicitCompletion`, workflow/ledger versions, and
+canonical `/team/...` artifact references. Leader completions additionally
+declare `workflowFinal`, `finalAnswerReady`, and `remainingActions`. These
+additive fields allow ClawManager to prevent a completed collection phase from
+prematurely closing a multi-stage root task.
 
 ## Redis keys
 
@@ -62,14 +89,7 @@ claw:team:<teamId>:dlq
 
 ## Packaging for AgentsRuntime
 
-```bash
-npm run build
-npm pack --pack-destination ../../openclaw/vendor-plugins
-```
-
-Dockerfile install:
-
-```dockerfile
-COPY vendor-plugins/openclaw-redis-team.tgz /tmp/openclaw-redis-team.tgz
-RUN HOME=/defaults openclaw plugins install /tmp/openclaw-redis-team.tgz
-```
+`plugins/openclaw-redis-team` is the canonical source. The image copies this
+directory into its build context, runs `npm pack`, and installs the generated
+archive. Prepacked archives under `openclaw/vendor-plugins` remain only for
+older build consumers and are not authoritative.
