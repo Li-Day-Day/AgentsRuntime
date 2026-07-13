@@ -30,7 +30,24 @@ RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
     libnotify-bin \
+    patch \
   && rm -rf /var/lib/apt/lists/*
+
+COPY openclaw/patches/selkies-unicode-clipboard.patch /usr/local/share/openclaw/patches/selkies-unicode-clipboard.patch
+COPY openclaw/patches/test_selkies_unicode_clipboard.py /usr/local/share/openclaw/patches/test_selkies_unicode_clipboard.py
+
+RUN set -eux; \
+  SELKIES_INPUT_HANDLER="$( \
+    /lsiopy/bin/python3 -c \
+      'import importlib.util; print(importlib.util.find_spec("selkies.input_handler").origin)' \
+  )"; \
+  patch --batch --forward "$SELKIES_INPUT_HANDLER" \
+    < /usr/local/share/openclaw/patches/selkies-unicode-clipboard.patch; \
+  /lsiopy/bin/python3 -m py_compile "$SELKIES_INPUT_HANDLER"; \
+  install -d -m 0700 /tmp/selkies-clipboard-test-runtime; \
+  XDG_RUNTIME_DIR=/tmp/selkies-clipboard-test-runtime \
+    /lsiopy/bin/python3 /usr/local/share/openclaw/patches/test_selkies_unicode_clipboard.py; \
+  rm -rf /tmp/selkies-clipboard-test-runtime
 
 COPY --from=node-runtime /usr/local /usr/local
 

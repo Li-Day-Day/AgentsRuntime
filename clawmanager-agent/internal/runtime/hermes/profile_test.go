@@ -114,6 +114,48 @@ func TestGatewayEnvMovesDefaultTeamSharedDirIntoWorkspace(t *testing.T) {
 	}
 }
 
+func TestGatewayEnvRemovesRuntimePodAgentEnvAndKeepsInstanceAgentEnv(t *testing.T) {
+	profile := hermes.NewProfile("hermes")
+	workspacePath := "/workspaces/hermes/user-45/instance-65"
+	base := []string{
+		"RUNTIME_AGENT_CONTROL_TOKEN=control",
+		"RUNTIME_AGENT_REPORT_TOKEN=report",
+		"RUNTIME_AGENT_DATA_DIR=/var/lib/clawmanager-agent",
+		"RUNTIME_AGENT_PUBLIC_PORT=20000",
+		"RUNTIME_AGENT_LISTEN_ADDR=127.0.0.1:19090",
+		"CLAWMANAGER_AGENT_ENABLED=true",
+		"CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN=agt_boot_xxx",
+		"CLAWMANAGER_AGENT_INSTANCE_ID=65",
+	}
+	req := gateway.CreateGatewayRequest{
+		InstanceID: 65,
+		UserID:     45,
+	}
+
+	env := profile.GatewayEnv(base, gateway.Config{RuntimeType: "hermes", GatewayAuthMode: "trusted-proxy"}, req, workspacePath, 20019)
+	values := envMap(env)
+	for _, key := range []string{
+		"RUNTIME_AGENT_CONTROL_TOKEN",
+		"RUNTIME_AGENT_REPORT_TOKEN",
+		"RUNTIME_AGENT_DATA_DIR",
+		"RUNTIME_AGENT_PUBLIC_PORT",
+		"RUNTIME_AGENT_LISTEN_ADDR",
+	} {
+		if _, ok := values[key]; ok {
+			t.Fatalf("%s = %q, want unset", key, values[key])
+		}
+	}
+	if values["CLAWMANAGER_AGENT_ENABLED"] != "true" {
+		t.Fatalf("CLAWMANAGER_AGENT_ENABLED = %q, want true", values["CLAWMANAGER_AGENT_ENABLED"])
+	}
+	if values["CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN"] != "agt_boot_xxx" {
+		t.Fatalf("CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN = %q, want preserved", values["CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN"])
+	}
+	if values["CLAWMANAGER_AGENT_INSTANCE_ID"] != "65" {
+		t.Fatalf("CLAWMANAGER_AGENT_INSTANCE_ID = %q, want 65", values["CLAWMANAGER_AGENT_INSTANCE_ID"])
+	}
+}
+
 func envMap(env []string) map[string]string {
 	values := map[string]string{}
 	for _, item := range env {

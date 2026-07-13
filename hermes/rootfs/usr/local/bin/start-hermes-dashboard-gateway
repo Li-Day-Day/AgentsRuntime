@@ -59,6 +59,7 @@ falsey() {
     esac
 }
 
+
 should_start_team_gateway() {
     truthy "${CLAWMANAGER_TEAM_ENABLED:-}" || return 1
     falsey "${CLAWMANAGER_TEAM_AUTORUN:-true}" && return 1
@@ -69,11 +70,53 @@ should_start_team_gateway() {
 
 team_gateway_pid=""
 dashboard_pid=""
+agent_pid=""
+
+start_instance_agent() {
+    if [ "${CLAWMANAGER_AGENT_ENABLED:-false}" != "true" ]; then
+        return 0
+    fi
+    if [ ! -x /usr/local/bin/clawmanager-agent ]; then
+        echo "ClawManager instance agent binary missing or not executable" >&2
+        return 0
+    fi
+    if [ -z "${CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN:-}" ] && [ -z "${CLAWMANAGER_AGENT_SESSION_TOKEN:-}" ]; then
+        echo "ClawManager instance agent skipped: missing bootstrap/session token" >&2
+        return 0
+    fi
+
+    echo "Starting ClawManager Hermes instance agent for instance ${CLAWMANAGER_AGENT_INSTANCE_ID:-unknown}"
+    (
+        unset RUNTIME_AGENT_CONTROL_TOKEN
+        unset RUNTIME_AGENT_REPORT_TOKEN
+        unset RUNTIME_AGENT_DATA_DIR
+        unset RUNTIME_AGENT_PUBLIC_PORT
+        unset RUNTIME_AGENT_LISTEN_ADDR
+
+        /usr/local/bin/clawmanager-agent &
+        child_pid="$!"
+        trap 'kill "${child_pid}" 2>/dev/null || true; wait "${child_pid}" 2>/dev/null || true; exit 143' INT TERM
+        set +e
+        wait "${child_pid}"
+        status="$?"
+        trap - INT TERM
+        if [ "${status}" -ne 0 ]; then
+            echo "ClawManager Hermes instance agent exited with status ${status}" >&2
+        else
+            echo "ClawManager Hermes instance agent exited" >&2
+        fi
+        exit "${status}"
+    ) &
+    agent_pid="$!"
+}
 
 shutdown() {
     trap - INT TERM
     if [ -n "${dashboard_pid}" ]; then
         kill "${dashboard_pid}" 2>/dev/null || true
+    fi
+    if [ -n "${agent_pid}" ]; then
+        kill "${agent_pid}" 2>/dev/null || true
     fi
     if [ -n "${team_gateway_pid}" ]; then
         kill "${team_gateway_pid}" 2>/dev/null || true
@@ -83,6 +126,9 @@ shutdown() {
 }
 
 trap shutdown INT TERM
+
+
+start_instance_agent
 
 if should_start_team_gateway; then
     echo "Starting Hermes Redis Team consumer for member ${CLAWMANAGER_TEAM_MEMBER_ID}"
@@ -101,9 +147,16 @@ hermes dashboard \
     --skip-build &
 dashboard_pid="$!"
 
+set +e
 wait "${dashboard_pid}"
 status="$?"
+set -e
 dashboard_pid=""
+
+if [ -n "${agent_pid}" ]; then
+    kill "${agent_pid}" 2>/dev/null || true
+    wait "${agent_pid}" 2>/dev/null || true
+fi
 
 if [ -n "${team_gateway_pid}" ]; then
     kill "${team_gateway_pid}" 2>/dev/null || true

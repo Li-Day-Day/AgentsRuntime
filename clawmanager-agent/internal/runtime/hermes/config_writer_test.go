@@ -70,6 +70,29 @@ func TestWriteGatewayConfigWritesHermesWorkspaceConfig(t *testing.T) {
 		}
 	}
 
+	wantProviderBlock := `providers:
+  clawmanager:
+    name: ClawManager
+    base_url: http://clawmanager-gateway.clawmanager-system.svc.cluster.local:9001/api/v1/gateway/llm
+    default_model: auto
+    transport: openai_chat
+    key_env: OPENAI_API_KEY
+    models:
+      auto: {}
+      gpt-4.1: {}
+  custom:
+    name: custom
+    base_url: http://clawmanager-gateway.clawmanager-system.svc.cluster.local:9001/api/v1/gateway/llm
+    default_model: auto
+    transport: openai_chat
+    key_env: OPENAI_API_KEY
+    models:
+      auto: {}
+      gpt-4.1: {}`
+	if !strings.Contains(configText, wantProviderBlock) {
+		t.Fatalf("config.yaml missing managed custom provider alias:\n%s", configText)
+	}
+
 	envData, err := os.ReadFile(filepath.Join(hermesHome, ".env"))
 	if err != nil {
 		t.Fatal(err)

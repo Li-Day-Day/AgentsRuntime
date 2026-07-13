@@ -2,6 +2,7 @@ package config
 
 import (
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -17,5 +18,9 @@ func TestLoadDefaultsToWrappedChromium(t *testing.T) {
 	}
 	if cfg.BrowserExecutable != "/usr/local/bin/wrapped-chromium" {
 		t.Fatalf("BrowserExecutable = %q, want wrapped chromium", cfg.BrowserExecutable)
+	}
+	wantCommand := []string{"openclaw", "gateway", "run", "--auth", "token"}
+	if !reflect.DeepEqual(cfg.OpenClawCommand, wantCommand) {
+		t.Fatalf("OpenClawCommand = %#v, want %#v", cfg.OpenClawCommand, wantCommand)
 	}
 }

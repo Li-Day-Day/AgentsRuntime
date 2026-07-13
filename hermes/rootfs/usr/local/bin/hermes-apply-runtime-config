@@ -1688,6 +1688,10 @@ if has_llm_config:
         provider_entry["models"] = provider_models
 
         providers_cfg[provider_key] = provider_entry
+        if provider_key == "clawmanager":
+            custom_entry = dict(provider_entry)
+            custom_entry["name"] = "custom"
+            providers_cfg["custom"] = custom_entry
         data["providers"] = providers_cfg
 
     data["model"] = model_cfg

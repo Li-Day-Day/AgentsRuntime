@@ -57,6 +57,14 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 	env = setEnv(env, "HOST", "0.0.0.0")
 	env = setEnv(env, "PORT", strconv.Itoa(port))
 	env = setEnv(env, "HERMES_ACCEPT_HOOKS", "1")
+	env = unsetEnv(
+		env,
+		"RUNTIME_AGENT_CONTROL_TOKEN",
+		"RUNTIME_AGENT_REPORT_TOKEN",
+		"RUNTIME_AGENT_DATA_DIR",
+		"RUNTIME_AGENT_PUBLIC_PORT",
+		"RUNTIME_AGENT_LISTEN_ADDR",
+	)
 	if cfg.GatewayAuthMode == "trusted-proxy" {
 		env = unsetEnv(env, "OPENCLAW_GATEWAY_TOKEN", "CLAWMANAGER_GATEWAY_TOKEN", "RUNTIME_GATEWAY_TOKEN")
 	} else if cfg.GatewayToken != "" {

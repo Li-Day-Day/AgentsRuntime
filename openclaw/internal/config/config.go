@@ -92,7 +92,7 @@ func Load() (Config, error) {
 		ProtocolVersion:                  "v1",
 		LocalHTTPBind:                    "0.0.0.0:18080",
 		LogFilePath:                      "/var/log/openclaw-agent/agent.log",
-		OpenClawCommand:                  []string{"openclaw", "gateway", "run"},
+		OpenClawCommand:                  []string{"openclaw", "gateway", "run", "--auth", "token"},
 		OpenClawDoctorCommand:            []string{"openclaw", "doctor", "--fix"},
 		OpenClawDoctorPolicy:             "auto",
 		StartupNotificationMessage:       "正在启动龙虾",

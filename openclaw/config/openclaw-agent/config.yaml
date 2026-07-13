@@ -10,6 +10,8 @@ openclaw_command:
   - openclaw
   - gateway
   - run
+  - --auth
+  - token
 openclaw_doctor_command:
   - openclaw
   - doctor

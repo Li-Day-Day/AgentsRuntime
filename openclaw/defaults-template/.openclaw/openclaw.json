@@ -61,13 +61,35 @@
         "compaction": {
           "mode": "default",
           "reserveTokens": 8192,
-          "keepRecentTokens": 8192,
-          "maxHistoryShare": 0.85
+          "keepRecentTokens": 50000,
+          "maxHistoryShare": 0.85,
+          "notifyUser": true
         },
         "maxConcurrent": 4,
         "subagents": {
           "maxConcurrent": 8
         }
+      }
+    },
+    "hooks": {
+      "internal": {
+        "enabled": true,
+        "entries": {
+          "session-memory": {
+              "enabled": true,
+              "messages": 50
+          }
+        }
+      }
+    },
+    "session": {
+      "reset": {
+        "idleMinutes": 10080,
+        "mode": "idle"
+      },
+      "maintenance": {
+        "maxEntries": 2000,
+        "pruneAfter": "180d"
       }
     },
     "tools": {
@@ -80,6 +102,15 @@
       "ownerDisplay": "raw"
     },
     "channels": {},
+    "cron": {
+      "enabled": true,
+      "maxConcurrentRuns": 2,
+      "sessionRetention": "24h",
+      "runLog": {
+          "maxBytes": "2mb",
+          "keepLines": 2000
+      }
+    },
     "gateway": {
       "port": 18789,
       "mode": "local",
@@ -91,8 +122,8 @@
         ]
       },
       "auth": {
-        "mode": "none",
-        "token": "xxxxxx"
+        "mode": "token",
+        "token": "032d4976ab4def9dca229e5862ffe4d00e7076cd49b73ee629172bca10ce0abe"
       },
       "tailscale": {
         "mode": "off",

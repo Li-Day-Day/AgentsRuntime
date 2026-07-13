@@ -1,0 +1,315 @@
+diff --git a/selkies/input_handler.py b/selkies/input_handler.py
+index c9200ea..885be9f 100644
+--- a/selkies/input_handler.py
++++ b/selkies/input_handler.py
+@@ -818,6 +818,10 @@ class SelkiesGamepad:
+ class WebRTCInputError(Exception): pass
+ 
+ class WebRTCInput:
++    UNICODE_CLIPBOARD_CONFIRM_TIMEOUT = 0.5
++    UNICODE_CLIPBOARD_CONFIRM_INTERVAL = 0.01
++    UNICODE_CLIPBOARD_RESTORE_DELAY = 1.0
++
+     def __init__(
+         self,
+         gst_webrtc_app,
+@@ -919,6 +923,11 @@ class WebRTCInput:
+         self.use_clipboard_fallback = False
+         self.clipboard_paused = False
+         self.clipboard_injection_lock = asyncio.Lock()
++        self.unicode_clipboard_restore_task = None
++        self.unicode_clipboard_original = None
++        self.unicode_clipboard_original_captured = False
++        self.unicode_clipboard_last_injected = None
++        self.pending_inbound_clipboard = None
+         self.keyboard_queue = asyncio.Queue()
+         self.keyboard_worker_task = None
+         self.on_update_rate_control_mode = lambda mode: logger_webrtc_input.warning("unhandled on_update_rate_control_mode")
+@@ -1465,51 +1474,219 @@ class WebRTCInput:
+         except (FileNotFoundError, asyncio.TimeoutError, Exception):
+             pass
+ 
++    @staticmethod
++    def _clipboard_data_length(data):
++        return len(data) if data is not None else 0
++
++    @staticmethod
++    def _clipboard_data_matches(actual, expected):
++        if isinstance(actual, bytes) and isinstance(expected, str):
++            expected = expected.encode("utf-8")
++        elif isinstance(actual, str) and isinstance(expected, bytes):
++            actual = actual.encode("utf-8")
++        return actual == expected
++
++    async def _clear_system_clipboard(self):
++        env = self._get_wl_env() if self.is_wayland else os.environ.copy()
++        command = ["wl-copy", "--clear"] if self.is_wayland else [
++            "xclip", "-selection", "clipboard", "-i"
++        ]
++        try:
++            process = await subprocess.create_subprocess_exec(
++                *command,
++                stdin=None if self.is_wayland else subprocess.PIPE,
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.DEVNULL,
++                env=env,
++            )
++            if not self.is_wayland and process.stdin:
++                process.stdin.close()
++            await asyncio.wait_for(process.communicate(), timeout=1.0)
++            return process.returncode == 0
++        except Exception:
++            return False
++
++    async def _write_clipboard_value(self, data, mime_type="text/plain"):
++        if data is None or data == "" or data == b"":
++            return await self._clear_system_clipboard()
++        return await self.write_clipboard(data, mime_type=mime_type or "text/plain")
++
++    async def _write_inbound_clipboard(self, data, mime_type="text/plain"):
++        async with self.clipboard_injection_lock:
++            data_length = self._clipboard_data_length(data)
++            if self.clipboard_paused:
++                self.pending_inbound_clipboard = (data, mime_type)
++                logger_webrtc_input.info(
++                    "Clipboard direction=inbound length=%d status=queued", data_length
++                )
++                return False
++
++            success = await self._write_clipboard_value(data, mime_type)
++            logger_webrtc_input.info(
++                "Clipboard direction=inbound length=%d status=%s",
++                data_length,
++                "applied" if success else "error",
++            )
++            return success
++
++    async def _finish_unicode_clipboard(self):
++        try:
++            pending = self.pending_inbound_clipboard
++            self.pending_inbound_clipboard = None
++            if pending is not None:
++                data, mime_type = pending
++                success = await self._write_clipboard_value(data, mime_type)
++                logger_webrtc_input.info(
++                    "Clipboard direction=inbound length=%d status=%s",
++                    self._clipboard_data_length(data),
++                    "applied" if success else "error",
++                )
++                return
++
++            current_data, _ = await self.read_clipboard(use_binary=True)
++            if not self._clipboard_data_matches(
++                current_data, self.unicode_clipboard_last_injected
++            ):
++                logger_webrtc_input.info(
++                    "Clipboard direction=restore length=0 status=cas-skipped"
++                )
++                return
++
++            original_data, original_mime = self.unicode_clipboard_original or (None, None)
++            success = await self._write_clipboard_value(
++                original_data, original_mime or "text/plain"
++            )
++            logger_webrtc_input.info(
++                "Clipboard direction=restore length=%d status=%s",
++                self._clipboard_data_length(original_data),
++                "applied" if success else "error",
++            )
++        except Exception:
++            logger_webrtc_input.error(
++                "Clipboard direction=restore length=0 status=error"
++            )
++        finally:
++            restore_task = self.unicode_clipboard_restore_task
++            if (
++                restore_task is not None
++                and restore_task is not asyncio.current_task()
++            ):
++                restore_task.cancel()
++            self.clipboard_paused = False
++            self.unicode_clipboard_original = None
++            self.unicode_clipboard_original_captured = False
++            self.unicode_clipboard_last_injected = None
++            self.unicode_clipboard_restore_task = None
++
++    async def _restore_unicode_clipboard_after_delay(self):
++        restore_task = asyncio.current_task()
++        try:
++            await asyncio.sleep(self.UNICODE_CLIPBOARD_RESTORE_DELAY)
++            async with self.clipboard_injection_lock:
++                if self.unicode_clipboard_restore_task is restore_task:
++                    await self._finish_unicode_clipboard()
++        except asyncio.CancelledError:
++            async with self.clipboard_injection_lock:
++                if self.unicode_clipboard_restore_task is restore_task:
++                    await self._finish_unicode_clipboard()
++            raise
++        except Exception:
++            async with self.clipboard_injection_lock:
++                if self.unicode_clipboard_restore_task is restore_task:
++                    await self._finish_unicode_clipboard()
++
++    async def _wait_for_unicode_clipboard(self, text_to_type):
++        deadline = self.loop.time() + self.UNICODE_CLIPBOARD_CONFIRM_TIMEOUT
++        while True:
++            current_data, _ = await self.read_clipboard(use_binary=False)
++            if self._clipboard_data_matches(current_data, text_to_type):
++                return True
++            if self.loop.time() >= deadline:
++                return False
++            await asyncio.sleep(self.UNICODE_CLIPBOARD_CONFIRM_INTERVAL)
++
+     async def _inject_unicode_via_clipboard(self, text_to_type):
+         async with self.clipboard_injection_lock:
++            previous_restore_task = self.unicode_clipboard_restore_task
++            if previous_restore_task is not None:
++                self.unicode_clipboard_restore_task = None
++                previous_restore_task.cancel()
++
+             self.clipboard_paused = True
+             KEY_SHIFT_L = 0xFFE1
+-            KEY_INSERT  = 0xFF63
+-
++            KEY_INSERT = 0xFF63
+             currently_active_mods = list(self.active_modifiers)
++            shift_pressed = False
++            insert_pressed = False
++            injection_succeeded = False
+ 
+             try:
+                 for mod_keysym in currently_active_mods:
+                     await self.send_x11_keypress(mod_keysym, down=False)
+ 
+-                old_data, old_mime = await self.read_clipboard(use_binary=True)
++                if not self.unicode_clipboard_original_captured:
++                    self.unicode_clipboard_original = await self.read_clipboard(
++                        use_binary=True
++                    )
++                    self.unicode_clipboard_original_captured = True
+ 
+                 mime_to_use = "UTF8_STRING" if not self.is_wayland else "text/plain"
+-                await self.write_clipboard(text_to_type, mime_type=mime_to_use)
+-                await asyncio.sleep(0.02)
++                self.unicode_clipboard_last_injected = text_to_type
++                if not await self.write_clipboard(text_to_type, mime_type=mime_to_use):
++                    raise RuntimeError("unicode clipboard write failed")
+ 
++                if not await self._wait_for_unicode_clipboard(text_to_type):
++                    raise asyncio.TimeoutError("unicode clipboard confirmation timed out")
++
++                logger_webrtc_input.info(
++                    "Clipboard direction=unicode length=%d status=confirmed",
++                    self._clipboard_data_length(text_to_type),
++                )
++                shift_pressed = True
+                 await self.send_x11_keypress(KEY_SHIFT_L, down=True)
++                insert_pressed = True
+                 await self.send_x11_keypress(KEY_INSERT, down=True)
+                 await self.send_x11_keypress(KEY_INSERT, down=False)
++                insert_pressed = False
+                 await self.send_x11_keypress(KEY_SHIFT_L, down=False)
+-                await asyncio.sleep(0.05)
++                shift_pressed = False
+ 
+-                if old_data is not None:
+-                    await self.write_clipboard(old_data, mime_type=old_mime or "text/plain")
+-                elif self.is_wayland:
++                self.unicode_clipboard_restore_task = asyncio.create_task(
++                    self._restore_unicode_clipboard_after_delay()
++                )
++                await asyncio.sleep(0)
++                injection_succeeded = True
++            except asyncio.CancelledError:
++                logger_webrtc_input.info(
++                    "Clipboard direction=unicode length=%d status=cancelled",
++                    self._clipboard_data_length(text_to_type),
++                )
++                raise
++            except Exception:
++                logger_webrtc_input.error(
++                    "Clipboard direction=unicode length=%d status=error",
++                    self._clipboard_data_length(text_to_type),
++                )
++            finally:
++                if insert_pressed:
+                     try:
+-                        proc = await subprocess.create_subprocess_exec(
+-                            "wl-copy", "--clear",
+-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+-                            env=self._get_wl_env()
+-                        )
+-                        await asyncio.wait_for(proc.communicate(), timeout=1.0)
++                        await self.send_x11_keypress(KEY_INSERT, down=False)
++                    except Exception:
++                        pass
++                if shift_pressed:
++                    try:
++                        await self.send_x11_keypress(KEY_SHIFT_L, down=False)
+                     except Exception:
+                         pass
+-
+-            except Exception as e:
+-                logger_webrtc_input.error(f"Error during clipboard injection: {e}", exc_info=True)
+-            finally:
+                 for mod_keysym in currently_active_mods:
+                     if mod_keysym in self.active_modifiers:
+-                        await self.send_x11_keypress(mod_keysym, down=True)
++                        try:
++                            await self.send_x11_keypress(mod_keysym, down=True)
++                        except Exception:
++                            pass
+ 
+-                self.clipboard_paused = False
++                if not injection_succeeded:
++                    await self._finish_unicode_clipboard()
+ 
+     async def send_x11_mouse(self, x, y, button_mask, scroll_magnitude, relative=False, display_id='primary'):
+         if relative:
+@@ -2253,15 +2430,11 @@ class WebRTCInput:
+                     logger_webrtc_input.info(f"Finished multi-part clipboard receive. Total size: {received_size}")
+                     data = self.multipart_clipboard_buffer.getvalue()
+                     mime_type = self.multipart_clipboard_mime_type
+-                    async def _write_multipart():
+-                        if mime_type == "text/plain":
+-                            text_data = data.decode("utf-8", "ignore")
+-                            if await self.write_clipboard(text_data):
+-                                logger_webrtc_input.info(f"Set multi-part clipboard content, length: {len(text_data)}")
+-                        else:
+-                            if await self.write_clipboard(data, mime_type=mime_type):
+-                                logger_webrtc_input.info(f"Set multi-part binary clipboard content ({mime_type}), size: {len(data)} bytes")
+-                    asyncio.create_task(_write_multipart())
++                    if mime_type == "text/plain":
++                        data = data.decode("utf-8", "ignore")
++                    asyncio.create_task(
++                        self._write_inbound_clipboard(data, mime_type=mime_type)
++                    )
+                 self.multipart_clipboard_buffer = None
+                 self.multipart_clipboard_in_progress = False
+         elif msg_type == "cr": 
+@@ -2276,10 +2449,9 @@ class WebRTCInput:
+                 try:
+                     _, mime_type, b64_data = toks
+                     data_bytes = base64.b64decode(b64_data)
+-                    async def _write_cb():
+-                        if await self.write_clipboard(data_bytes, mime_type=mime_type):
+-                            logger_webrtc_input.info(f"Set binary clipboard content ({mime_type}), size: {len(data_bytes)} bytes")
+-                    asyncio.create_task(_write_cb())
++                    asyncio.create_task(
++                        self._write_inbound_clipboard(data_bytes, mime_type=mime_type)
++                    )
+                 except Exception as e:
+                     logger_webrtc_input.error(f"Binary clipboard write error: {e}")
+             else:
+@@ -2288,10 +2460,7 @@ class WebRTCInput:
+             if self.enable_clipboard in ["true", "in"]:
+                 try: 
+                     data = base64.b64decode(toks[1]).decode("utf-8", 'ignore')
+-                    async def _write_cw():
+-                        if await self.write_clipboard(data):
+-                            logger_webrtc_input.info(f"Set clipboard content, length: {len(data)}")
+-                    asyncio.create_task(_write_cw())
++                    asyncio.create_task(self._write_inbound_clipboard(data))
+                 except Exception as e: 
+                     logger_webrtc_input.error(f"Clipboard decode error: {e}")
+                     return
