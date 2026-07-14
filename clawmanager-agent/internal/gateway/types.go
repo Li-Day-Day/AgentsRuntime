@@ -79,7 +79,7 @@ type RuntimeProfile interface {
 	GatewayCommand(authMode string) []string
 	GatewayEnv(base []string, cfg Config, req CreateGatewayRequest, workspacePath string, port int) []string
 	PrepareWorkspace(cfg Config, req CreateGatewayRequest, workspacePath string) error
-	WriteGatewayConfig(cfg Config, req CreateGatewayRequest, workspacePath string) error
+	WriteGatewayConfig(cfg Config, req CreateGatewayRequest, workspacePath string, port int) error
 	HealthChecker(cfg Config) GatewayHealthChecker
 }
 
@@ -93,6 +93,7 @@ type CreateGatewayRequest struct {
 	UserID        int               `json:"user_id"`
 	AgentType     string            `json:"agent_type"`
 	WorkspacePath string            `json:"workspace_path"`
+	GatewayPort   int               `json:"gateway_port,omitempty"`
 	PortRange     PortRange         `json:"port_range"`
 	UID           int               `json:"uid"`
 	GID           int               `json:"gid"`

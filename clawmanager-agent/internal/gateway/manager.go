@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -105,15 +106,28 @@ func (m *GatewayManager) CreateGateway(_ context.Context, req CreateGatewayReque
 
 	capacity := m.effectiveCapacityLocked()
 	if capacity <= 0 || m.usedSlotsLocked() >= capacity {
+		var reserveErr error = ErrNoFreePort
+		if req.GatewayPort > 0 {
+			reserveErr = fmt.Errorf("requested gateway port %d is unavailable: capacity exhausted: %w", req.GatewayPort, ErrNoFreePort)
+			log.Printf("runtime-agent reserve requested gateway port failed: instance_id=%d generation=%d gateway_port=%d: %v", req.InstanceID, req.Generation, req.GatewayPort, reserveErr)
+		}
 		m.mu.Unlock()
 		for _, process := range oldProcesses {
 			m.stopProcessAsync(process)
 		}
-		return CreateGatewayResponse{}, ErrNoFreePort
+		return CreateGatewayResponse{}, reserveErr
 	}
 
-	port, err := m.ports.Reserve(req.InstanceID, req.Generation, rng)
+	var port int
+	if req.GatewayPort > 0 {
+		port, err = m.ports.ReserveExact(req.InstanceID, req.Generation, req.GatewayPort)
+	} else {
+		port, err = m.ports.Reserve(req.InstanceID, req.Generation, rng)
+	}
 	if err != nil {
+		if req.GatewayPort > 0 {
+			log.Printf("runtime-agent reserve requested gateway port failed: instance_id=%d generation=%d gateway_port=%d: %v", req.InstanceID, req.Generation, req.GatewayPort, err)
+		}
 		m.mu.Unlock()
 		for _, process := range oldProcesses {
 			m.stopProcessAsync(process)
@@ -157,7 +171,7 @@ func (m *GatewayManager) startGatewayInBackground(gatewayID string, req CreateGa
 		m.markGatewayError(gatewayID, 0, err)
 		return
 	}
-	if err := m.profile().WriteGatewayConfig(m.cfg, req, workspacePath); err != nil {
+	if err := m.profile().WriteGatewayConfig(m.cfg, req, workspacePath, port); err != nil {
 		m.markGatewayError(gatewayID, 0, err)
 		return
 	}

@@ -306,17 +306,25 @@ func TestCreateGatewayWritesConfigPassesTokenAndDoesNotReportRunningWhenOriginPr
 	mgr := NewGatewayManager(cfg, starter, NewPortAllocator(func(int) bool { return false }))
 	mgr.SetHealthChecker(health)
 
-	resp, err := mgr.CreateGateway(context.Background(), testGatewayRequest(cfg.WorkspaceRoot, 63, 45, 7))
+	req := testGatewayRequest(cfg.WorkspaceRoot, 63, 45, 7)
+	req.GatewayPort = 20003
+	resp, err := mgr.CreateGateway(context.Background(), req)
 	if err != nil {
 		t.Fatalf("CreateGateway() error = %v, want async starting response", err)
 	}
 	if resp.Status != "starting" {
 		t.Fatalf("CreateGateway().Status = %q, want starting", resp.Status)
 	}
+	if resp.Port != 20003 {
+		t.Fatalf("CreateGateway().Port = %d, want requested 20003", resp.Port)
+	}
 	eventually(t, func() bool { return starter.startCount() == 1 })
 	spec := starter.startedSpec(0)
 	if !stringSlicesEqual(spec.Command, cfg.GatewayCommand) {
 		t.Fatalf("gateway command = %#v, want %#v", spec.Command, cfg.GatewayCommand)
+	}
+	if spec.Port != 20003 {
+		t.Fatalf("GatewayStartSpec.Port = %d, want requested 20003", spec.Port)
 	}
 	if got := envValue(spec.Env, "OPENCLAW_GATEWAY_TOKEN"); got != "" {
 		t.Fatalf("OPENCLAW_GATEWAY_TOKEN = %q, want removed for trusted-proxy auth", got)
@@ -334,6 +342,9 @@ func TestCreateGatewayWritesConfigPassesTokenAndDoesNotReportRunningWhenOriginPr
 	}
 	if !bytes.Contains(data, []byte(`"basePath": "/api/v1/instances/63/proxy"`)) {
 		t.Fatalf("OpenClaw config missing instance proxy basePath: %s", string(data))
+	}
+	if !bytes.Contains(data, []byte(`"port": 20003`)) {
+		t.Fatalf("OpenClaw config missing requested gateway port: %s", string(data))
 	}
 
 	eventually(t, func() bool {

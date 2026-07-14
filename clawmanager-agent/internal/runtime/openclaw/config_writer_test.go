@@ -32,6 +32,7 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	    "trustedProxies": ["127.0.0.1"],
 	    "keep": "value"
 	  },
+	  "cron": {"custom": "keep"},
 	  "agents": {"defaults": {"model": "auto/gpt-4.1"}}
 	}`)
 	if err := os.WriteFile(configPath, existing, 0o644); err != nil {
@@ -49,7 +50,7 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 		LLMAPIKeySet:    true,
 		LLMModelIDs:     []string{"gpt-5.5", "gpt-5.5-mini"},
 	}
-	if err := WriteGatewayConfig(cfg, req, workspace); err != nil {
+	if err := WriteGatewayConfig(cfg, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
@@ -63,6 +64,9 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	}
 
 	gateway := objectAt(t, merged, "gateway")
+	if gateway["port"] != float64(20003) {
+		t.Fatalf("gateway.port = %#v, want 20003", gateway["port"])
+	}
 	auth := objectAt(t, gateway, "auth")
 	if auth["mode"] != "trusted-proxy" {
 		t.Fatalf("gateway.auth.mode = %#v, want trusted-proxy", auth["mode"])
@@ -160,6 +164,10 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	if got := modelIDSet(providerModels); len(got) != 2 || !got["gpt-5.5"] || !got["gpt-5.5-mini"] {
 		t.Fatalf("models.providers.auto.models = %#v, want injected model ids", providerModels)
 	}
+	assertPlatformDefaults(t, merged)
+	if objectAt(t, merged, "cron")["custom"] != "keep" {
+		t.Fatalf("cron.custom was not preserved")
+	}
 	if runtime.GOOS != "windows" {
 		info, err := os.Stat(configPath)
 		if err != nil {
@@ -249,7 +257,7 @@ func TestWriteOpenClawGatewayConfigUsesRequestEnvironmentLLMOverrides(t *testing
 	}
 	cfg := Config{GatewayAuthMode: "trusted-proxy"}
 
-	if err := WriteGatewayConfig(cfg, req, workspace); err != nil {
+	if err := WriteGatewayConfig(cfg, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
@@ -286,7 +294,7 @@ func TestWriteOpenClawGatewayConfigWritesLiteTeamConfigJSON(t *testing.T) {
 		},
 	}
 
-	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace); err != nil {
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
@@ -340,7 +348,7 @@ func TestWriteOpenClawGatewayConfigEnablesRedisTeamForLiteTeam(t *testing.T) {
 		},
 	}
 
-	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace); err != nil {
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 

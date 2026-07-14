@@ -19,7 +19,10 @@ const openClawRedisTeamPluginID = "redis-team"
 const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR"
 const openClawBrowserExecutablePath = "/usr/bin/chromium"
 
-func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string) error {
+func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string, port int) error {
+	if port <= 0 || port > 65535 {
+		return fmt.Errorf("invalid gateway port %d", port)
+	}
 	if err := gateway.WriteLiteTeamConfigJSON(req, workspacePath); err != nil {
 		return err
 	}
@@ -44,6 +47,7 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	}
 	configureManagedOpenClawBrowser(config)
 
+	mergePlatformDefaults(config, port)
 	if teamEnabledFromRequest(req) {
 		if err := configureOpenClawRedisTeam(config, req, workspacePath); err != nil {
 			return err
@@ -125,6 +129,40 @@ func setDefaultObjectValue(object map[string]any, key string, value any) {
 		return
 	}
 	object[key] = value
+}
+
+func mergePlatformDefaults(config map[string]any, port int) {
+	gatewayConfig := ensureObject(config, "gateway")
+	gatewayConfig["port"] = port
+
+	cron := ensureObject(config, "cron")
+	cron["enabled"] = true
+	cron["maxConcurrentRuns"] = 2
+	runLog := ensureObject(cron, "runLog")
+	runLog["keepLines"] = 2000
+	runLog["maxBytes"] = "2mb"
+	cron["sessionRetention"] = "24h"
+
+	update := ensureObject(config, "update")
+	update["checkOnStart"] = false
+	auto := ensureObject(update, "auto")
+	auto["enabled"] = false
+
+	hooks := ensureObject(config, "hooks")
+	internal := ensureObject(hooks, "internal")
+	internal["enabled"] = true
+	entries := ensureObject(internal, "entries")
+	sessionMemory := ensureObject(entries, "session-memory")
+	sessionMemory["enabled"] = true
+	sessionMemory["messages"] = 50
+
+	session := ensureObject(config, "session")
+	reset := ensureObject(session, "reset")
+	reset["idleMinutes"] = 10080
+	reset["mode"] = "idle"
+	maintenance := ensureObject(session, "maintenance")
+	maintenance["maxEntries"] = 2000
+	maintenance["pruneAfter"] = "180d"
 }
 
 func configureOpenClawRedisTeam(config map[string]any, req gateway.CreateGatewayRequest, workspacePath string) error {

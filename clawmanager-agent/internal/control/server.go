@@ -168,14 +168,7 @@ func writeCreateGatewayError(w http.ResponseWriter, err error) {
 	case errors.Is(err, gateway.ErrRuntimeType), errors.Is(err, gateway.ErrWorkspacePath):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, gateway.ErrDraining), errors.Is(err, gateway.ErrNoFreePort), errors.Is(err, gateway.ErrStaleGeneration):
-		status := http.StatusConflict
-		if errors.Is(err, gateway.ErrNoFreePort) {
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.WriteHeader(status)
-			_, _ = w.Write([]byte("no free port"))
-			return
-		}
-		http.Error(w, err.Error(), status)
+		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, gateway.ErrGatewayStartFailed):
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	default:

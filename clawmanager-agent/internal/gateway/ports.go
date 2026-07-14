@@ -77,6 +77,35 @@ func (a *PortAllocator) Reserve(instanceID, generation int, rng PortRange) (int,
 	return 0, ErrNoFreePort
 }
 
+// ReserveExact reserves the supplied primary gateway port and its associated
+// port block. It intentionally does not constrain the port to a locally
+// configured range: the control plane owns exact port assignment.
+func (a *PortAllocator) ReserveExact(instanceID, generation, port int) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	blockSize := a.blockSize
+	if blockSize <= 0 {
+		blockSize = 1
+	}
+	if port <= 0 || port > 65535 || port+blockSize-1 > 65535 {
+		return 0, fmt.Errorf("invalid requested gateway port %d", port)
+	}
+	if !a.blockAvailableLocked(port, blockSize) {
+		return 0, fmt.Errorf("requested gateway port %d is unavailable: %w", port, ErrNoFreePort)
+	}
+
+	allocation := portAllocation{
+		InstanceID:  instanceID,
+		Generation:  generation,
+		PrimaryPort: port,
+		Status:      portReserved,
+	}
+	for offset := 0; offset < blockSize; offset++ {
+		a.ports[port+offset] = allocation
+	}
+	return port, nil
+}
 func (a *PortAllocator) blockAvailableLocked(port, blockSize int) bool {
 	for offset := 0; offset < blockSize; offset++ {
 		member := port + offset

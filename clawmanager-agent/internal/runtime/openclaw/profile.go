@@ -61,8 +61,8 @@ func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayR
 	return nil
 }
 
-func (p Profile) WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string) error {
-	return WriteGatewayConfig(cfg, req, workspacePath)
+func (p Profile) WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string, port int) error {
+	return WriteGatewayConfig(cfg, req, workspacePath, port)
 }
 
 func (p Profile) HealthChecker(cfg gateway.Config) gateway.GatewayHealthChecker {

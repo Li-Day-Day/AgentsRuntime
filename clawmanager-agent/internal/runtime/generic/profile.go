@@ -59,7 +59,7 @@ func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayR
 	return nil
 }
 
-func (p Profile) WriteGatewayConfig(gateway.Config, gateway.CreateGatewayRequest, string) error {
+func (p Profile) WriteGatewayConfig(gateway.Config, gateway.CreateGatewayRequest, string, int) error {
 	return nil
 }
 
