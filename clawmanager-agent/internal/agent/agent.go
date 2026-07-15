@@ -98,6 +98,17 @@ func (a *Agent) ReportHeartbeat(ctx context.Context, payload gateway.HeartbeatPa
 	return a.reporter.ReportHeartbeat(ctx, payload)
 }
 
+func (a *Agent) ReportSkills(ctx context.Context, payload gateway.SkillReportPayload) error {
+	if payload.PodID == 0 {
+		payload.PodID = a.currentPodID()
+	}
+	return a.reporter.ReportSkills(ctx, payload)
+}
+
+func (a *Agent) PodID() int {
+	return a.currentPodID()
+}
+
 func (a *Agent) registerUntilReady(ctx context.Context) error {
 	for {
 		podID, err := a.reporter.Register(ctx, a.manager.RegisterPayload())

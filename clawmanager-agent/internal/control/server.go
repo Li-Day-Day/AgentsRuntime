@@ -99,6 +99,46 @@ func NewControlHandler(cfg gateway.Config, manager *gateway.GatewayManager, repo
 		writeJSON(w, http.StatusOK, map[string]bool{"draining": manager.Draining()})
 	})
 
+	mux.HandleFunc("/v1/skills/resync", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeControl(cfg, w, r) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			InstanceID int    `json:"instance_id"`
+			Mode       string `json:"mode"`
+			Trigger    string `json:"trigger"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && r.ContentLength != 0 {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		skillsReporter, ok := reporter.(gateway.SkillsReporter)
+		if !ok || skillsReporter == nil {
+			http.Error(w, "skills reporter unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		mode := strings.TrimSpace(req.Mode)
+		if mode == "" {
+			mode = "full"
+		}
+		payload := gateway.BuildSkillReportPayloadForInstance(cfg, manager, skillsReporter.PodID(), mode, req.InstanceID)
+		if err := skillsReporter.ReportSkills(r.Context(), payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"ok":          true,
+			"mode":        mode,
+			"trigger":     strings.TrimSpace(req.Trigger),
+			"instance_id": req.InstanceID,
+			"instances":   len(payload.Instances),
+		})
+	})
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mux.ServeHTTP(noRedirectResponseWriter{ResponseWriter: w}, r)
 	})

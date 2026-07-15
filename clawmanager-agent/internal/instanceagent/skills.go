@@ -31,27 +31,11 @@ func ScanSkills(dirs []string) ([]SkillInfo, error) {
 	seen := map[string]bool{}
 
 	for _, dir := range dirs {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
+		if err := scanSkillDirectory(dir, seen, &skills); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
 			return nil, err
-		}
-		for _, entry := range entries {
-			if !entry.IsDir() || isHiddenSegment(entry.Name()) {
-				continue
-			}
-			path := filepath.Join(dir, entry.Name())
-			if seen[path] {
-				continue
-			}
-			seen[path] = true
-			skill, err := InspectSkill(path)
-			if err != nil {
-				continue
-			}
-			skills = append(skills, skill)
 		}
 	}
 
@@ -59,6 +43,46 @@ func ScanSkills(dirs []string) ([]SkillInfo, error) {
 		return skills[i].Identifier < skills[j].Identifier
 	})
 	return skills, nil
+}
+
+func scanSkillDirectory(dir string, seen map[string]bool, skills *[]SkillInfo) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || isHiddenSegment(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
+
+		if isSkillDirectory(path) {
+			skill, err := InspectSkill(path)
+			if err != nil {
+				continue
+			}
+			*skills = append(*skills, skill)
+			continue
+		}
+
+		// Hermes category folders (e.g. social-media/, research/) only contain
+		// DESCRIPTION.md and nested skills. Recurse into children instead of
+		// treating the category directory itself as a skill.
+		if err := scanSkillDirectory(path, seen, skills); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isSkillDirectory(path string) bool {
+	manifestName, _ := readSkillManifest(path)
+	return manifestName != ""
 }
 
 func InspectSkill(path string) (SkillInfo, error) {
@@ -71,6 +95,9 @@ func InspectSkill(path string) (SkillInfo, error) {
 	}
 
 	manifestName, manifest := readSkillManifest(path)
+	if manifestName == "" {
+		return SkillInfo{}, errors.New("skill directory must contain SKILL.md, skill.json, or manifest.json")
+	}
 	contentMD5, sizeBytes, fileCount, err := ContentMD5(path)
 	if err != nil {
 		return SkillInfo{}, err

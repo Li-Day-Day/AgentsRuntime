@@ -83,6 +83,39 @@ func TestControlHandlerCreatesIdempotentGatewayAndRejectsNoFreePort(t *testing.T
 	})
 }
 
+func TestControlHandlerSkillsResyncReportsInventory(t *testing.T) {
+	cfg := testConfig(t)
+	reporter := &fakeReporter{podID: 42}
+	mgr := NewGatewayManager(cfg, &fakeStarter{nextPID: 4242}, NewPortAllocator(func(int) bool { return false }))
+	srv := httptest.NewServer(NewControlHandler(cfg, mgr, reporter))
+	defer srv.Close()
+
+	body := bytes.NewBufferString(`{"instance_id":12,"mode":"full","trigger":"manual"}`)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/skills/resync", body)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set(ControlTokenHeader, cfg.ControlToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/skills/resync error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
+	}
+	if reporter.skillsCalls != 1 {
+		t.Fatalf("skillsCalls = %d, want 1", reporter.skillsCalls)
+	}
+	if reporter.lastSkills.PodID != 42 || reporter.lastSkills.Mode != "full" {
+		t.Fatalf("skills payload = %+v", reporter.lastSkills)
+	}
+	if len(reporter.lastSkills.Instances) != 1 || reporter.lastSkills.Instances[0].InstanceID != 12 {
+		t.Fatalf("instances = %#v, want empty report for instance 12", reporter.lastSkills.Instances)
+	}
+}
+
 func TestDrainRejectsNewGatewaysAndReportsHeartbeat(t *testing.T) {
 	cfg := testConfig(t)
 	reporter := &fakeReporter{}
@@ -240,11 +273,28 @@ func (f *fakeStarter) startedSpec(index int) GatewayStartSpec {
 
 type fakeReporter struct {
 	lastHeartbeat HeartbeatPayload
+	lastSkills    SkillReportPayload
+	skillsCalls   int
+	skillsErr     error
+	podID         int
 }
 
 func (f *fakeReporter) ReportHeartbeat(_ context.Context, payload HeartbeatPayload) error {
 	f.lastHeartbeat = payload
 	return nil
+}
+
+func (f *fakeReporter) ReportSkills(_ context.Context, payload SkillReportPayload) error {
+	f.skillsCalls++
+	f.lastSkills = payload
+	return f.skillsErr
+}
+
+func (f *fakeReporter) PodID() int {
+	if f.podID != 0 {
+		return f.podID
+	}
+	return 9
 }
 
 func TestCreateGatewayWritesConfigPassesTokenAndDoesNotReportRunningWhenOriginProbeFails(t *testing.T) {
