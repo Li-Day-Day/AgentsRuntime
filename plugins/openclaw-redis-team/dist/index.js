@@ -434,12 +434,30 @@ function privateTaskEnvelopePath(cfg, alias) {
 }
 
 async function mkdirBestEffort(dir, mode, label) {
+  let existed = false;
+  try {
+    const stat = await fs.stat(dir);
+    if (!stat.isDirectory()) {
+      warnOnce("mkdir:" + dir, `${label}: ${dir} already exists but is not a directory`);
+      return false;
+    }
+    existed = true;
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      warnOnce("mkdir:" + dir, `${label}: unable to inspect ${dir}: ${err?.message || String(err)}`);
+      return false;
+    }
+  }
+  if (existed) return true;
   try {
     await fs.mkdir(dir, { recursive: true, mode });
   } catch (err) {
     warnOnce("mkdir:" + dir, `${label}: unable to create ${dir}: ${err?.message || String(err)}`);
     return false;
   }
+  // Team bootstrap owns repair of existing shared-directory permissions. A
+  // worker turn only creates a missing directory; repeatedly chmod-ing an NFS
+  // tree from every member both logs EPERM and can race another member.
   try {
     await fs.chmod(dir, mode);
   } catch (err) {
@@ -514,6 +532,42 @@ function assertTeamArtifactWriteScope(cfg, params) {
   }
 }
 
+function isLeaderMember(cfg) {
+  const role = trim(cfg?.role).toLowerCase();
+  const memberId = trim(cfg?.memberId).toLowerCase();
+  return role === "leader" || role.includes("leader") || memberId === "leader" || memberId.includes("leader");
+}
+
+function isReviewMember(cfg) {
+  const role = trim(cfg?.role).toLowerCase();
+  const memberId = trim(cfg?.memberId).toLowerCase();
+  return role.includes("review") || role.includes("qa") || memberId.includes("review") || memberId === "qa";
+}
+
+function artifactRootTaskId(params, activeEnvelope) {
+  const rootTaskId = preferredRootTaskId(
+    params?.rootTaskId,
+    params?.root_task_id,
+    activeEnvelope?.rootTaskId,
+    isClawManagerRootTaskRef(activeEnvelope?.taskId) ? activeEnvelope?.taskId : "",
+  );
+  if (!isClawManagerRootTaskRef(rootTaskId)) {
+    throw new Error("Team artifact writes require the active ClawManager rootTaskId; refusing an unscoped artifact path");
+  }
+  return rootTaskId;
+}
+
+function artifactAssignmentId(params, activeEnvelope) {
+  const assignmentId = trim(
+    params?.assignmentId || params?.assignment_id || params?.workId || params?.work_id ||
+    activeEnvelope?.assignmentId || activeEnvelope?.workId,
+  );
+  if (!assignmentId) {
+    throw new Error("Member artifact writes require assignmentId or workId");
+  }
+  return safeName(assignmentId);
+}
+
 async function assertNoArtifactSymlinkTraversal(root, candidate) {
   const relative = path.relative(root, candidate);
   if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
@@ -534,20 +588,36 @@ async function assertNoArtifactSymlinkTraversal(root, candidate) {
   }
 }
 
-function teamArtifactRoot(cfg, params, activeEnvelope, defaultScope) {
+function teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite = false) {
   const sharedRoot = path.resolve(cfg.sharedDir);
   const scope = trim(params?.scope).toLowerCase() || defaultScope;
-  if (scope === "team") return sharedRoot;
+  const kind = trim(params?.kind || params?.artifactKind || params?.artifact_kind).toLowerCase();
+  if (scope === "team") {
+    if (!forWrite) return sharedRoot;
+    assertTeamArtifactWriteScope(cfg, params);
+    const rootTaskId = artifactRootTaskId(params, activeEnvelope);
+    if (kind === "plan") {
+      if (!isLeaderMember(cfg)) throw new Error("Only the Team Leader may publish a Team plan");
+      return path.join(sharedRoot, "results", safeName(rootTaskId), "plan");
+    }
+    if (kind === "final") {
+      if (!isLeaderMember(cfg)) throw new Error("Only the Team Leader may publish the final Team delivery");
+      return path.join(sharedRoot, "results", safeName(rootTaskId));
+    }
+    if (kind === "review") {
+      if (!isLeaderMember(cfg) && !isReviewMember(cfg)) throw new Error("Only a Reviewer/QA member or Team Leader may publish a review report");
+      return path.join(sharedRoot, "results", safeName(rootTaskId), "reviews", artifactAssignmentId(params, activeEnvelope));
+    }
+    throw new Error("Team-scoped artifact writes require kind=plan, kind=review, or kind=final; use scope=member for working files");
+  }
   if (scope !== "member") throw new Error("Team artifact scope must be member or team");
-  const rootTaskId = safeName(
-    params?.rootTaskId || params?.root_task_id || activeEnvelope?.rootTaskId || activeEnvelope?.taskId || "unscoped",
-  );
-  return path.join(sharedRoot, "artifacts", rootTaskId, "members", safeName(cfg.memberId));
+  const rootTaskId = artifactRootTaskId(params, activeEnvelope);
+  return path.join(sharedRoot, "artifacts", safeName(rootTaskId), "members", safeName(cfg.memberId), artifactAssignmentId(params, activeEnvelope));
 }
 
-async function resolveTeamArtifactPath(cfg, params, activeEnvelope, defaultScope) {
+async function resolveTeamArtifactPath(cfg, params, activeEnvelope, defaultScope, forWrite = false) {
   const relative = normalizedArtifactRelativePath(params?.path);
-  const root = teamArtifactRoot(cfg, params, activeEnvelope, defaultScope);
+  const root = teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite);
   const candidate = path.resolve(root, ...relative.split("/"));
   const sharedRoot = path.resolve(cfg.sharedDir);
   const sharedRelative = path.relative(sharedRoot, candidate);
@@ -561,13 +631,13 @@ async function resolveTeamArtifactPath(cfg, params, activeEnvelope, defaultScope
 function sharedWorkspaceForTarget(cfg, inherited, targetMemberId, rootTaskId) {
   const source = inherited && typeof inherited === "object" ? inherited : {};
   const physicalPath = trim(source.physicalPath) || trim(cfg.sharedDir);
-  const taskRef = safeName(rootTaskId || "unscoped");
+  const taskRef = isClawManagerRootTaskRef(rootTaskId) ? safeName(rootTaskId) : "";
   const memberId = safeName(targetMemberId || cfg.memberId);
   return Object.assign({}, source, {
     physicalPath,
     canonicalPrefix: "/team",
-    memberArtifactPhysicalRoot: path.join(physicalPath, "artifacts", taskRef, "members", memberId),
-    memberArtifactCanonicalRoot: "/team/artifacts/" + taskRef + "/members/" + memberId,
+    memberArtifactPhysicalRoot: taskRef ? path.join(physicalPath, "artifacts", taskRef, "members", memberId) : "",
+    memberArtifactCanonicalRoot: taskRef ? "/team/artifacts/" + taskRef + "/members/" + memberId : "",
   });
 }
 
@@ -1084,6 +1154,25 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
   return guidance.join("\n");
 }
 
+async function collectRootTaskArtifactRefs(cfg, rootTaskId) {
+  if (!isClawManagerRootTaskRef(rootTaskId)) return [];
+  const root = path.resolve(cfg.sharedDir);
+  const taskKey = safeName(rootTaskId);
+  const candidates = [
+    path.join(root, "artifacts", taskKey),
+    path.join(root, "results", taskKey),
+  ];
+  const refs = [];
+  for (const candidate of candidates) {
+    for (const file of await listDirectoryArtifacts(candidate, 400 - refs.length)) {
+      const ref = canonicalArtifactRef(cfg, file);
+      if (!refs.includes(ref)) refs.push(ref);
+      if (refs.length >= 400) return refs;
+    }
+  }
+  return refs;
+}
+
 function extractContentText(value, depth = 0) {
   if (depth > 6 || value === undefined || value === null) return "";
   if (typeof value === "string") return value.trim();
@@ -1577,6 +1666,7 @@ function createRuntime(api) {
   let activeTaskCompleted = false;
   let activeTaskCompletionPending = false;
   let lastOutbound = null;
+  let activeArtifactRefs = [];
 
   async function withRedis(cfg, existingRedis, fn) {
     if (existingRedis) return fn(existingRedis);
@@ -2137,18 +2227,21 @@ function createRuntime(api) {
       const prevCompleted = activeTaskCompleted;
       const prevCompletionPending = activeTaskCompletionPending;
       const prevOutbound = lastOutbound;
+      const prevArtifactRefs = activeArtifactRefs;
       activeEnvelope = envelope;
       activeTaskCompleted = false;
       activeTaskCompletionPending = false;
       lastOutbound = null;
+      activeArtifactRefs = [];
       try {
         const result = await fn();
-        return { result, completed: activeTaskCompleted, completionPending: activeTaskCompletionPending, outbound: lastOutbound };
+        return { result, completed: activeTaskCompleted, completionPending: activeTaskCompletionPending, outbound: lastOutbound, artifactRefs: activeArtifactRefs };
       } finally {
         activeEnvelope = prevEnvelope;
         activeTaskCompleted = prevCompleted;
         activeTaskCompletionPending = prevCompletionPending;
         lastOutbound = prevOutbound;
+        activeArtifactRefs = prevArtifactRefs;
       }
     },
 
@@ -2177,9 +2270,10 @@ function createRuntime(api) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
       assertTeamArtifactWriteScope(cfg, params);
-      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "member");
+      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "member", true);
       await mkdirBestEffort(path.dirname(resolved.candidate), TEAM_SHARED_DIR_MODE, "Team artifact parent");
       await writeText(resolved.candidate, String(params?.content ?? ""));
+      if (activeEnvelope && !activeArtifactRefs.includes(resolved.canonical)) activeArtifactRefs.push(resolved.canonical);
       if (activeEnvelope && cfg.redisUrl && cfg.memberId && hasRequiredRedisTeamKeys(cfg)) {
         const responseLocale = trim(activeEnvelope.responseLocale || "zh-CN");
         const summary = responseLocale.toLowerCase().startsWith("zh")
@@ -2239,7 +2333,7 @@ function createRuntime(api) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
       assertTeamArtifactWriteScope(cfg, params);
-      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "member");
+      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "member", true);
       if (!(await mkdirBestEffort(resolved.candidate, TEAM_SHARED_DIR_MODE, "Team artifact directory"))) {
         throw new Error("Unable to create Team artifact directory: " + resolved.canonical);
       }
@@ -2380,7 +2474,12 @@ function createRuntime(api) {
       await ensureDirs(cfg);
       const resultDir = path.join(cfg.sharedDir, "results", safeName(resultTaskId));
       await mkdirBestEffort(resultDir, TEAM_SHARED_DIR_MODE, "shared result directory");
-      const artifactRefs = await validateArtifactRefs(cfg, params.artifactRefs);
+      const discoveredArtifactRefs = await collectRootTaskArtifactRefs(cfg, resultTaskId);
+      const artifactRefs = await validateArtifactRefs(cfg, [
+        ...(Array.isArray(params.artifactRefs) ? params.artifactRefs : []),
+        ...activeArtifactRefs,
+        ...discoveredArtifactRefs,
+      ]);
       const resultMarkdownPath = path.join(resultDir, "result.md");
       await writeText(resultMarkdownPath, resultMarkdown);
       artifactRefs.push(canonicalArtifactRef(cfg, resultMarkdownPath));
@@ -2736,8 +2835,10 @@ const completeParameters = {
 
 const artifactPathProperties = {
   path: { type: "string", description: "Relative path. Absolute paths and '..' traversal are rejected." },
-  scope: { type: "string", enum: ["member", "team"], description: "member is rooted at the current member's task artifact directory; team is rooted at the current Team shared directory and is writable only by the Leader." },
-  rootTaskId: { type: "string", description: "Optional root task ID; inherited from the active assignment when omitted." },
+  scope: { type: "string", enum: ["member", "team"], description: "member writes to /team/artifacts/<rootTaskId>/members/<memberId>/<assignmentId>. Team scope is only for a Leader plan/final delivery or a Reviewer/QA review report." },
+  kind: { type: "string", enum: ["plan", "review", "final"], description: "Required for scope=team. Produces the canonical results path returned by the tool; never invent a /team link." },
+  rootTaskId: { type: "string", description: "ClawManager root task ID. Inherited only from a valid active Team assignment; unscoped writes are rejected." },
+  assignmentId: { type: "string", description: "Required for member artifacts and review reports; inherited from the active assignment when omitted." },
 };
 
 const artifactWriteParameters = {
@@ -3303,6 +3404,8 @@ export default definePluginEntry({
                       deliveredViaCallback = true;
                       ctx.log?.info?.("redis-team: delivering reply for " + envelope.messageId);
                       const replyMessageId = "msg_" + randomUUID();
+                      const narrativeText = payload?.text || "";
+                      const contentHash = createHash("sha256").update(narrativeText).digest("hex");
                       const r = new RedisClient(cfg.redisUrl);
                       await r.connect();
                       try {
@@ -3320,7 +3423,17 @@ export default definePluginEntry({
                           root_message_id: envelope.rootMessageId || envelope.messageId,
                           workId: envelope.workId || envelope.assignmentId,
                           assignmentId: envelope.assignmentId || envelope.workId,
-                          text: payload?.text || "",
+                          // Agent prose is a collaboration event. Keep it separate from
+                          // tool-call JSON/ACK traffic so plans, handoffs, progress and
+                          // review explanations remain visible in the Team chat.
+                          eventKind: "agent_narrative",
+                          messageKind: "narrative",
+                          chatPolicy: "visible",
+                          visibleToChat: true,
+                          contentHash,
+                          text: narrativeText,
+                          content: narrativeText,
+                          summary: narrativeText.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Team narrative",
                           mediaUrls: payload?.mediaUrls,
                           mediaUrl: payload?.mediaUrl,
                         }));

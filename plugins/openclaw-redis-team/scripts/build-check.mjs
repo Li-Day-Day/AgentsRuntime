@@ -79,6 +79,10 @@ for (const token of [
   "assertTeamArtifactWriteScope",
   "assertResponseLocale",
   "sharedWorkspaceForTarget",
+  "artifactRootTaskId",
+  "collectRootTaskArtifactRefs",
+  "kind=plan, kind=review, or kind=final",
+  "eventKind: \"agent_narrative\"",
   "suppressed duplicate reply after submitted completion",
 ]) {
   if (!dist.includes(token)) throw new Error(`dist/index.js missing Redis Team completion token: ${token}`);
@@ -88,6 +92,9 @@ if (dist.includes("params.taskId === activeEnvelope.taskId")) {
 }
 if (dist.includes('path.join(cfg.sharedDir, ".openclaw-redis-team", "tasks"')) {
   throw new Error("member-scoped Redis Team envelopes must not require a shared NFS .openclaw-redis-team/tasks directory");
+}
+if (dist.includes('|| "unscoped"')) {
+  throw new Error("member Team artifacts must reject missing root task context instead of writing an unscoped path");
 }
 const deliverStart = dist.indexOf("deliver: async (payload) => {");
 const deliverEnd = dist.indexOf("onRecordError:", deliverStart);
