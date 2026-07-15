@@ -9,6 +9,7 @@ type GatewayStartSpec = gateway.GatewayStartSpec
 type HeartbeatPayload = gateway.HeartbeatPayload
 type ManagedProcess = gateway.ManagedProcess
 type PortRange = gateway.PortRange
+type SkillReportPayload = gateway.SkillReportPayload
 
 var NewGatewayManager = gateway.NewGatewayManager
 var NewPortAllocator = gateway.NewPortAllocator

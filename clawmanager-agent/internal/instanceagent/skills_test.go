@@ -128,6 +128,41 @@ func TestCreateSkillPackageUsesSpecContentWithSingleTopDirectory(t *testing.T) {
 	}
 }
 
+func TestScanSkillsSkipsCategoryDirectories(t *testing.T) {
+	root := t.TempDir()
+
+	categoryDir := filepath.Join(root, "social-media")
+	mustMkdir(t, categoryDir)
+	mustWriteFile(t, filepath.Join(categoryDir, "DESCRIPTION.md"), []byte("# Social\n"))
+
+	nestedSkillDir := filepath.Join(categoryDir, "xurl")
+	mustMkdir(t, nestedSkillDir)
+	mustWriteFile(t, filepath.Join(nestedSkillDir, "SKILL.md"), []byte("# xurl skill\n"))
+
+	topLevelSkillDir := filepath.Join(root, "dogfood")
+	mustMkdir(t, topLevelSkillDir)
+	mustWriteFile(t, filepath.Join(topLevelSkillDir, "SKILL.md"), []byte("# dogfood\n"))
+
+	skills, err := ScanSkills([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skills) != 2 {
+		t.Fatalf("expected 2 skills, got %d: %+v", len(skills), skills)
+	}
+
+	identifiers := []string{skills[0].Identifier, skills[1].Identifier}
+	sort.Strings(identifiers)
+	if identifiers[0] != "dogfood" || identifiers[1] != "xurl" {
+		t.Fatalf("unexpected skill identifiers: %v", identifiers)
+	}
+	for _, skill := range skills {
+		if skill.Identifier == "social-media" {
+			t.Fatalf("category directory should not be treated as a skill: %+v", skill)
+		}
+	}
+}
+
 func TestScanSkillsReadsSkillJSON(t *testing.T) {
 	root := t.TempDir()
 	skillDir := filepath.Join(root, "weather")

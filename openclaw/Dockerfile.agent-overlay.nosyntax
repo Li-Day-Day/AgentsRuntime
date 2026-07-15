@@ -1,0 +1,36 @@
+# Local/release-smoke: published OpenClaw (lite or pro) + new clawmanager-agent only.
+#
+# From repository root (runtimeagent/):
+#   # Lite pool
+#   docker build -f openclaw/Dockerfile.agent-overlay.nosyntax `
+#     --build-arg BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/openclaw-lite:latest `
+#     -t openclaw-lite:local .
+#
+#   # Pro dedicated
+#   docker build -f openclaw/Dockerfile.agent-overlay.nosyntax `
+#     --build-arg BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/openclaw:latest `
+#     -t openclaw:local .
+
+ARG BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/openclaw-lite:latest
+
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
+
+WORKDIR /src/clawmanager-agent
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG AGENT_VERSION=dev
+
+COPY clawmanager-agent ./
+RUN go mod download
+
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
+        go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+        -o /out/clawmanager-agent ./cmd/clawmanager-agent
+
+FROM ${BASE_IMAGE}
+
+COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+RUN chmod 755 /usr/local/bin/clawmanager-agent

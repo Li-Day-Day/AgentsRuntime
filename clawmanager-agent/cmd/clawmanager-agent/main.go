@@ -58,20 +58,48 @@ func main() {
 }
 
 func selectMode() agentMode {
-	if runtimeagent.RuntimeAgentModeEnabled() {
+	instanceRequested := instanceAgentRequested()
+	// Lite runtime-pod only when Pro instance credentials are not present.
+	if runtimeagent.RuntimeAgentModeEnabled() && !instanceRequested {
 		return modeRuntimePod
 	}
-	if strings.EqualFold(os.Getenv("CLAWMANAGER_AGENT_ENABLED"), "true") && strings.EqualFold(instanceRuntimeType(), "hermes") {
+	if instanceRequested && hermesInstanceAllowed() {
 		return modeInstance
 	}
 	return modeDisabled
 }
 
-func instanceRuntimeType() string {
-	for _, key := range []string{"CLAWMANAGER_RUNTIME_TYPE", "CLAWMANAGER_AGENT_RUNTIME_TYPE"} {
-		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-			return value
+func instanceAgentRequested() bool {
+	if !strings.EqualFold(strings.TrimSpace(os.Getenv("CLAWMANAGER_AGENT_ENABLED")), "true") {
+		return false
+	}
+	if strings.TrimSpace(os.Getenv("CLAWMANAGER_AGENT_INSTANCE_ID")) == "" {
+		return false
+	}
+	if strings.TrimSpace(os.Getenv("CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN")) == "" {
+		return false
+	}
+	return true
+}
+
+// hermesInstanceAllowed decides whether this Hermes-shipped binary should run
+// the Pro instance agent. ClawManager uses CLAWMANAGER_RUNTIME_TYPE=desktop|gateway
+// as a backend marker; that must not reject Pro instance mode.
+func hermesInstanceAllowed() bool {
+	product := strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_AGENT_RUNTIME_TYPE")))
+	if product == "" {
+		backend := strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_RUNTIME_TYPE")))
+		switch backend {
+		case "desktop", "gateway":
+			// Backend-only markers from ClawManager; ignore as product type.
+			product = ""
+		default:
+			product = backend
 		}
 	}
-	return ""
+	if product == "" {
+		// Credentials alone are enough inside the Hermes image (doc: Pro instance agent).
+		return true
+	}
+	return product == "hermes"
 }
