@@ -132,8 +132,18 @@ function nowIso() {
 function redisClientName(cfg, purpose) {
   return ["redis-team", safeName(cfg.teamId), safeName(cfg.memberId), purpose].join(":").slice(0, 512);
 }
-function completionIdFor(cfg, taskId) {
-  return ["completion", safeName(cfg.teamId), safeName(taskId), safeName(cfg.memberId)].join(":");
+function completionIdFor(cfg, taskId, assignmentId = "root", revision = 1) {
+  // A member can legitimately receive more than one assignment for one root
+  // task. Keep retries for the same assignment idempotent, but never let an
+  // accepted result for assignment A suppress a correction or result for B.
+  return [
+    "completion",
+    safeName(cfg.teamId),
+    safeName(taskId),
+    safeName(cfg.memberId),
+    safeName(assignmentId || "root"),
+    String(Math.max(1, intFrom(revision, 1))),
+  ].join(":");
 }
 function completionKey(cfg, completionId) {
   return keyPrefix(cfg) + ":completions:" + safeName(completionId);
@@ -546,10 +556,10 @@ function isReviewMember(cfg) {
 
 function artifactRootTaskId(params, activeEnvelope) {
   const rootTaskId = preferredRootTaskId(
-    params?.rootTaskId,
-    params?.root_task_id,
     activeEnvelope?.rootTaskId,
     isClawManagerRootTaskRef(activeEnvelope?.taskId) ? activeEnvelope?.taskId : "",
+    params?.rootTaskId,
+    params?.root_task_id,
   );
   if (!isClawManagerRootTaskRef(rootTaskId)) {
     throw new Error("Team artifact writes require the active ClawManager rootTaskId; refusing an unscoped artifact path");
@@ -559,8 +569,8 @@ function artifactRootTaskId(params, activeEnvelope) {
 
 function artifactAssignmentId(params, activeEnvelope) {
   const assignmentId = trim(
-    params?.assignmentId || params?.assignment_id || params?.workId || params?.work_id ||
-    activeEnvelope?.assignmentId || activeEnvelope?.workId,
+    activeEnvelope?.assignmentId || activeEnvelope?.workId ||
+    params?.assignmentId || params?.assignment_id || params?.workId || params?.work_id,
   );
   if (!assignmentId) {
     throw new Error("Member artifact writes require assignmentId or workId");
@@ -593,22 +603,31 @@ function teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite = 
   const scope = trim(params?.scope).toLowerCase() || defaultScope;
   const kind = trim(params?.kind || params?.artifactKind || params?.artifact_kind).toLowerCase();
   if (scope === "team") {
-    if (!forWrite) return sharedRoot;
-    assertTeamArtifactWriteScope(cfg, params);
+    // Preserve legacy canonical reads such as path="results/<root>/...".
+    // They already carry their full Team-relative path and do not need an
+    // active task envelope. Only the shorthand kind=... form needs root scope.
+    if (!forWrite && !kind) return sharedRoot;
     const rootTaskId = artifactRootTaskId(params, activeEnvelope);
+    // Reads and lists with a declared kind must resolve to precisely the same
+    // canonical directory as writes. Previously only writes honored kind,
+    // so kind=final,path=result.md was incorrectly read from /team/result.md.
+    if (forWrite) assertTeamArtifactWriteScope(cfg, params);
     if (kind === "plan") {
-      if (!isLeaderMember(cfg)) throw new Error("Only the Team Leader may publish a Team plan");
+      if (forWrite && !isLeaderMember(cfg)) throw new Error("Only the Team Leader may publish a Team plan");
       return path.join(sharedRoot, "results", safeName(rootTaskId), "plan");
     }
     if (kind === "final") {
-      if (!isLeaderMember(cfg)) throw new Error("Only the Team Leader may publish the final Team delivery");
+      if (forWrite && !isLeaderMember(cfg)) throw new Error("Only the Team Leader may publish the final Team delivery");
       return path.join(sharedRoot, "results", safeName(rootTaskId));
     }
     if (kind === "review") {
-      if (!isLeaderMember(cfg) && !isReviewMember(cfg)) throw new Error("Only a Reviewer/QA member or Team Leader may publish a review report");
+      if (forWrite && !isLeaderMember(cfg) && !isReviewMember(cfg)) throw new Error("Only a Reviewer/QA member or Team Leader may publish a review report");
       return path.join(sharedRoot, "results", safeName(rootTaskId), "reviews", artifactAssignmentId(params, activeEnvelope));
     }
-    throw new Error("Team-scoped artifact writes require kind=plan, kind=review, or kind=final; use scope=member for working files");
+    if (forWrite) {
+      throw new Error("Team-scoped artifact writes require kind=plan, kind=review, or kind=final; use scope=member for working files");
+    }
+    return sharedRoot;
   }
   if (scope !== "member") throw new Error("Team artifact scope must be member or team");
   const rootTaskId = artifactRootTaskId(params, activeEnvelope);
@@ -616,10 +635,30 @@ function teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite = 
 }
 
 async function resolveTeamArtifactPath(cfg, params, activeEnvelope, defaultScope, forWrite = false) {
+  const rawPath = trim(params?.path).replaceAll("\\", "/");
+  const sharedRoot = path.resolve(cfg.sharedDir);
+  // Accept a canonical path previously returned by this tool.  Re-applying
+  // the member prefix produced duplicated paths such as
+  // /team/artifacts/<root>/members/<member>/<assignment>/team/artifacts/...
+  // Validate it against the same scoped root, so this compatibility shortcut
+  // cannot widen write permissions.
+  if (rawPath.startsWith("/team/")) {
+    const candidate = path.resolve(sharedRoot, ...rawPath.slice("/team/".length).split("/"));
+    const allowedRoot = path.resolve(teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite));
+    const allowedRelative = path.relative(allowedRoot, candidate);
+    if (forWrite && (allowedRelative === ".." || allowedRelative.startsWith(".." + path.sep) || path.isAbsolute(allowedRelative))) {
+      throw new Error("Canonical Team artifact path is outside the active artifact scope");
+    }
+    const sharedRelative = path.relative(sharedRoot, candidate);
+    if (!sharedRelative || sharedRelative === ".." || sharedRelative.startsWith(".." + path.sep) || path.isAbsolute(sharedRelative)) {
+      throw new Error("Team artifact path escaped the current Team workspace");
+    }
+    await assertNoArtifactSymlinkTraversal(sharedRoot, candidate);
+    return { candidate, canonical: canonicalArtifactRef(cfg, candidate) };
+  }
   const relative = normalizedArtifactRelativePath(params?.path);
   const root = teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite);
   const candidate = path.resolve(root, ...relative.split("/"));
-  const sharedRoot = path.resolve(cfg.sharedDir);
   const sharedRelative = path.relative(sharedRoot, candidate);
   if (!sharedRelative || sharedRelative === ".." || sharedRelative.startsWith(".." + path.sep) || path.isAbsolute(sharedRelative)) {
     throw new Error("Team artifact path escaped the current Team workspace");
@@ -647,6 +686,10 @@ function canonicalArtifactRef(cfg, file) {
     throw new Error("artifact path escaped Redis Team shared directory: " + file);
   }
   return "/team/" + relative.split(path.sep).join("/");
+}
+
+function isCanonicalTeamArtifactRef(value) {
+  return /^\/team\/[^\s]+$/i.test(trim(value));
 }
 
 async function listDirectoryArtifacts(dir, limit = 200) {
@@ -717,17 +760,32 @@ async function validateArtifactRefs(cfg, refs) {
   for (const raw of Array.isArray(refs) ? refs : []) {
     const ref = trim(raw);
     if (!ref) continue;
-    const candidate = ref.startsWith("/team/")
-      ? path.resolve(root, ref.slice("/team/".length))
-      : path.resolve(ref);
+    // Accept canonical Team paths and legacy bare names, but do not turn an
+    // unreadable external path into a synthetic manifest that looks like a
+    // verified delivery. A bare absolute filename is a legacy Team-root alias
+    // (for example /review-report.md -> /team/review-report.md).
+    let candidate;
+    if (ref.startsWith("/team/")) {
+      candidate = path.resolve(root, ref.slice("/team/".length));
+    } else if (!path.isAbsolute(ref)) {
+      candidate = path.resolve(root, ref);
+    } else if (path.dirname(ref) === path.parse(ref).root) {
+      candidate = path.resolve(root, path.basename(ref));
+    } else {
+      warnOnce("artifact-ref-outside:" + ref, "redis-team: ignored external artifact reference: " + ref);
+      continue;
+    }
     const relative = path.relative(root, candidate);
     const insideShared = !(!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative));
+    if (!insideShared) {
+      warnOnce("artifact-ref-escape:" + ref, "redis-team: ignored artifact reference outside current Team: " + ref);
+      continue;
+    }
     let stat = null;
     try {
       stat = await fs.stat(candidate);
     } catch (err) {
-      const manifest = await writeArtifactManifest(cfg, candidate, ref, [], "artifact path was not readable during completion validation: " + (err?.message || String(err)));
-      if (!validated.includes(manifest)) validated.push(manifest);
+      warnOnce("artifact-ref-missing:" + ref, "redis-team: ignored unreadable artifact reference: " + ref);
       continue;
     }
     let canonical = "";
@@ -738,12 +796,10 @@ async function validateArtifactRefs(cfg, refs) {
         candidate,
         ref,
         files,
-        insideShared
-          ? "directory artifact reference normalized to a manifest"
-          : "external directory artifact reference normalized to a manifest; files may need explicit copy if ClawManager cannot access the original path",
+        "directory artifact reference normalized to a manifest",
       );
     } else if (stat.isFile()) {
-      canonical = insideShared ? canonicalArtifactRef(cfg, candidate) : await importExternalArtifactFile(cfg, candidate);
+      canonical = canonicalArtifactRef(cfg, candidate);
     } else {
       canonical = await writeArtifactManifest(cfg, candidate, ref, [], "artifact reference was neither a file nor a directory");
     }
@@ -982,8 +1038,18 @@ async function readStatuses(cfg, memberId) {
 async function writeTaskEnvelope(cfg, envelope) {
   if (!envelope?.taskId) return;
   await ensureDirs(cfg);
-  const aliases = new Set(taskIdAliases(envelope.taskId));
-  aliases.add(envelope.taskId);
+  const aliases = new Set();
+  for (const value of [
+    envelope.taskId,
+    envelope.rootTaskId,
+    envelope.messageId,
+    envelope.rootMessageId,
+    envelope.assignmentId,
+    envelope.workId,
+  ]) {
+    for (const alias of taskIdAliases(value)) aliases.add(alias);
+    if (trim(value)) aliases.add(trim(value));
+  }
   for (const alias of aliases) {
     await writeJsonBestEffort(privateTaskEnvelopePath(cfg, alias), envelope, "runtime private task envelope", 0o600, RUNTIME_PRIVATE_DIR_MODE);
     await writeJsonBestEffort(path.join(cfg.sharedDir, "tasks", safeName(alias) + ".json"), envelope, "legacy shared task envelope");
@@ -1140,11 +1206,11 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
   const guidance = [
     body,
     "",
-    "Redis Team delivery rule: finish this assignment by calling team_complete_task with status=\"succeeded\", a concise summary, and resultMarkdown containing the answer. A normal chat answer may stay private in OpenClaw and not reach ClawManager.",
+    "Redis Team delivery rule: finish this assignment by calling team_complete_task with status=\"succeeded\", a concise summary, and resultMarkdown containing the answer. A normal chat answer may stay private in OpenClaw and not reach ClawManager. Do not send the same completed deliverable with team_send as well: reserve team_send for a real handoff, question, or intermediate milestone.",
     "Progress visibility rule: when you create an execution plan or reach a meaningful milestone, call team_update_progress with status=\"running\", a concise summary, and eventKind set to leader_plan, worker_plan, worker_progress, or leader_synthesis as appropriate. Use assignment_check_result only when replying to a ClawManager Monitor envelope carrying a monitor checkId. Do not expose hidden reasoning or tool logs; only publish user-visible plans, phase summaries, blockers, verification notes, and recovery status.",
     `Output language rule: use ${locale} for every user-visible plan, assignment, progress summary, resultMarkdown, and final synthesis. Preserve source code, API names, file names, and necessary technical terms in their original form.`,
     "Shared artifact rule: prefer team_artifact_write/read/list/mkdir. These tools enforce current-Team isolation and cooperative permissions. The /team prefix is only the canonical link returned to ClawManager in pooled Lite runtimes.",
-    "Verification truth rule: if browser or DOM verification did not run or failed, label it unverified. A hand-written simulator or static inspection is not a browser pass. Changing an artifact after review invalidates that review and requires fresh validation.",
+    "Verification truth rule: if browser or DOM verification did not run because the sandbox/browser is unavailable, record browserVerification=unavailable and continue with available static/manual checks; do not fail or block an otherwise satisfactory delivery for that environment limitation alone. Never call that a browser pass. Fail only a reproducible product defect, and revalidate after changing an artifact.",
     "Risk waiver rule: a failed or stale required assignment blocks root success unless the Leader records assignmentId, reason, and accepted risk in team_complete_task. Never waive work that is still running or pending.",
     "Optional-work rule: optional work may be omitted, but every omitted optional assignment must be listed in skippedAssignments with assignmentId and a concrete reason.",
     "Never list, search, resolve, or scan the parent of the current Team shared directory, and never inspect sibling Team directories.",
@@ -1169,6 +1235,25 @@ async function collectRootTaskArtifactRefs(cfg, rootTaskId) {
       if (!refs.includes(ref)) refs.push(ref);
       if (refs.length >= 400) return refs;
     }
+  }
+  return refs;
+}
+
+async function collectMemberAssignmentArtifactRefs(cfg, rootTaskId, memberId, assignmentId) {
+  if (!isClawManagerRootTaskRef(rootTaskId) || !trim(memberId) || !trim(assignmentId)) return [];
+  const root = path.resolve(cfg.sharedDir);
+  const candidate = path.join(
+    root,
+    "artifacts",
+    safeName(rootTaskId),
+    "members",
+    safeName(memberId),
+    safeName(assignmentId),
+  );
+  const refs = [];
+  for (const file of await listDirectoryArtifacts(candidate, 400)) {
+    const ref = canonicalArtifactRef(cfg, file);
+    if (!refs.includes(ref)) refs.push(ref);
   }
   return refs;
 }
@@ -1682,13 +1767,53 @@ function createRuntime(api) {
   function activeTaskMatches(taskId) {
     if (!activeEnvelope) return false;
     if (!taskId) return true;
-    return taskIdsMatch(taskId, activeEnvelope.taskId) || taskIdsMatch(taskId, activeEnvelope.rootTaskId);
+    return taskMatchesEnvelope(activeEnvelope, taskId);
   }
 
   function taskMatchesEnvelope(envelope, taskId) {
     if (!envelope) return false;
     if (!taskId) return true;
-    return taskIdsMatch(taskId, envelope.taskId) || taskIdsMatch(taskId, envelope.rootTaskId);
+    return [
+      envelope.taskId,
+      envelope.rootTaskId,
+      envelope.messageId,
+      envelope.rootMessageId,
+      envelope.assignmentId,
+      envelope.workId,
+    ].some((candidate) => trim(candidate) && taskIdsMatch(taskId, candidate));
+  }
+
+  async function resolveActiveAssignmentEnvelope(cfg, params = {}) {
+    const aliases = [
+      params.taskId,
+      params.task_id,
+      params.rootTaskId,
+      params.root_task_id,
+      params.messageId,
+      params.message_id,
+      params.rootMessageId,
+      params.root_message_id,
+      params.sourceMessageId,
+      params.source_message_id,
+      params.assignmentId,
+      params.assignment_id,
+      params.workId,
+      params.work_id,
+    ].map(trim).filter(Boolean);
+    // The envelope installed by withActiveEnvelope is the authenticated
+    // contract for this Agent turn. Tool arguments are aliases/audit data and
+    // must never override it, even when the model repeats a descriptive or
+    // invented id (the exact Team 72 failure mode).
+    if (activeEnvelope) {
+      return activeEnvelope;
+    }
+    for (const alias of aliases) {
+      const persisted = await readTaskEnvelope(cfg, alias);
+      if (persisted && (aliases.some((candidate) => taskMatchesEnvelope(persisted, candidate)) || taskMatchesEnvelope(persisted, alias))) {
+        return persisted;
+      }
+    }
+    return null;
   }
 
   function completionTaskIdFor(envelope, taskId) {
@@ -1778,10 +1903,6 @@ function createRuntime(api) {
     const result = firstText(text, meta.resultMarkdown, meta.result, meta.summary);
     if (!envelope || !taskMatchesEnvelope(envelope, meta.taskId || envelope.taskId) || !result) return false;
     const taskId = completionTaskIdFor(envelope, meta.taskId || envelope.taskId);
-    const completionId = trim(meta.completionId) || completionIdFor(cfg, taskId);
-    const completionMessageId = trim(meta.messageId) || completionId;
-    const messageId = trim(meta.eventMessageId) || envelope.messageId || completionMessageId || ("msg_" + randomUUID());
-    const inReplyTo = trim(meta.inReplyTo) || envelope.messageId;
     const resultMarkdown = typeof meta.resultMarkdown === "string" && meta.resultMarkdown.trim()
       ? meta.resultMarkdown
       : result;
@@ -1797,8 +1918,23 @@ function createRuntime(api) {
     const completionStatus = ["failed", "cancelled"].includes(trim(meta.completionStatus).toLowerCase())
       ? "failed"
       : "succeeded";
-    const workId = trim(meta.workId) || trim(envelope.workId) || trim(envelope.assignmentId) || undefined;
-    const assignmentId = trim(meta.assignmentId) || trim(envelope.assignmentId) || trim(envelope.workId) || undefined;
+    const envelopeAssignmentId = trim(envelope.assignmentId) || trim(envelope.workId);
+    const reportedWorkId = trim(meta.workId) || trim(meta.assignmentId);
+    // The envelope is the authoritative assignment contract. A Worker may use
+    // a descriptive workId in prose, but it must not fork a second Kanban
+    // card or bind its completion to a different assignment.
+    const assignmentId = envelopeAssignmentId || reportedWorkId || undefined;
+    const workId = assignmentId;
+    const revision = Math.max(1, intFrom(meta.revision ?? envelope.revision, 1));
+    const completionScope = currentIsLeader ? "root" : assignmentId || "root";
+    // Completion idempotency belongs to the authenticated assignment contract,
+    // not an arbitrary id an Agent happened to repeat in its tool arguments.
+    // This makes same-assignment retries stable while allowing a correction,
+    // second review, or a later phase to complete independently.
+    const completionId = completionIdFor(cfg, taskId, completionScope, revision);
+    const completionMessageId = trim(meta.messageId) || completionId;
+    const messageId = trim(meta.eventMessageId) || envelope.messageId || completionMessageId || ("msg_" + randomUUID());
+    const inReplyTo = trim(meta.inReplyTo) || envelope.messageId;
 
     const attemptId = trim(meta.attemptId) || ("attempt_" + randomUUID());
     const workflowFinal = meta.workflowFinal === undefined ? currentIsLeader : boolFrom(meta.workflowFinal, false);
@@ -1809,6 +1945,7 @@ function createRuntime(api) {
       availability: "busy",
       runtimeStatus: "completion_pending",
       currentTaskId: taskId,
+      currentAssignmentId: assignmentId,
       progress: 99,
       lastSummary: summary,
       artifactRefs,
@@ -1827,6 +1964,8 @@ function createRuntime(api) {
         rootTaskTerminal: leaderMediated ? (!assignmentResultOnly && currentIsLeader) : undefined,
         workId,
         assignmentId,
+        reportedWorkId: reportedWorkId && reportedWorkId !== assignmentId ? reportedWorkId : undefined,
+        revision,
         sourceMessageId: envelope.messageId,
         source_message_id: envelope.messageId,
         taskId,
@@ -1873,6 +2012,9 @@ function createRuntime(api) {
       acknowledgement: terminal?.ack,
       redis: meta.redis,
     });
+    if (decision === "accepted" && typeof meta.onAccepted === "function") {
+      await meta.onAccepted();
+    }
     if (decision === "submitted" || decision === "deferred") {
       void (async () => {
         const lateRedis = new RedisClient(cfg.redisUrl);
@@ -1894,22 +2036,30 @@ function createRuntime(api) {
                 acknowledgement,
                 redis: lateRedis,
               });
+              if (lateDecision === "accepted" && typeof meta.onAccepted === "function") {
+                await meta.onAccepted();
+              }
             }
           }
           if (lateDecision === "deferred") {
             const completionState = await waitForTerminalCompletionState(lateRedis, cfg, completionId, 300000);
-            if (completionState) await persistCompletionDecision({
-              cfg,
-              taskId,
-              completionId,
-              attemptId,
-              streamId: terminal?.streamId,
-              completionStatus,
-              summary,
-              artifactRefs,
-              acknowledgement: completionState,
-              redis: lateRedis,
-            });
+            if (completionState) {
+              lateDecision = await persistCompletionDecision({
+                cfg,
+                taskId,
+                completionId,
+                attemptId,
+                streamId: terminal?.streamId,
+                completionStatus,
+                summary,
+                artifactRefs,
+                acknowledgement: completionState,
+                redis: lateRedis,
+              });
+              if (lateDecision === "accepted" && typeof meta.onAccepted === "function") {
+                await meta.onAccepted();
+              }
+            }
           }
         } finally {
           lateRedis.close();
@@ -2210,7 +2360,48 @@ function createRuntime(api) {
     if (!status || !envelope?.taskId) return false;
     const statusTaskId = status.currentTaskId || status.runtimeTaskId;
     if (!taskIdsMatch(statusTaskId, envelope.taskId) && !taskIdsMatch(statusTaskId, envelope.rootTaskId)) return false;
+    const envelopeAssignmentId = trim(envelope.assignmentId) || trim(envelope.workId);
+    const statusAssignmentId = trim(status.currentAssignmentId || status.assignmentId || status.workId);
+    if (envelopeAssignmentId && (!statusAssignmentId || !taskIdsMatch(statusAssignmentId, envelopeAssignmentId))) return false;
     return ["succeeded", "failed"].includes(String(status.runtimeStatus || "").toLowerCase());
+  }
+
+  async function reportTerminalMonitor(cfg, envelope) {
+    const status = await readStatuses(cfg, cfg.memberId);
+    if (!status || !envelope) return false;
+    const terminalStatus = ["failed", "cancelled"].includes(trim(status.runtimeStatus).toLowerCase()) ? "failed" : "succeeded";
+    const rootTaskId = preferredRootTaskId(envelope.rootTaskId, envelope.taskId);
+    const assignmentId = trim(envelope.assignmentId) || trim(envelope.workId);
+    const checkId = trim(envelope.metadata?.checkId || envelope.metadata?.check_id || envelope.messageId);
+    await withRedis(cfg, null, async (redis) => {
+      await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "task_progress", envelope, {
+        eventKind: "assignment_check_result",
+        taskId: rootTaskId,
+        rootTaskId,
+        rootMessageId: envelope.rootMessageId || envelope.messageId,
+        assignmentId: assignmentId || undefined,
+        workId: assignmentId || undefined,
+        canonicalWorkId: assignmentId || undefined,
+        sourceMessageId: envelope.messageId,
+        revision: Math.max(1, intFrom(envelope.revision, 1)),
+        status: terminalStatus,
+        runtimeStatus: terminalStatus,
+        availability: terminalStatus === "succeeded" ? "idle" : "blocked",
+        progress: terminalStatus === "succeeded" ? 100 : status.progress,
+        summary: trim(status.lastSummary) || (terminalStatus === "succeeded" ? "该分配已在 Runtime 中完成。" : "该分配已在 Runtime 中失败。"),
+        artifactRefs: Array.isArray(status.artifactRefs) ? status.artifactRefs : [],
+        checkId,
+        checkSequence: envelope.metadata?.checkSequence || envelope.metadata?.check_sequence,
+        requestedAt: envelope.metadata?.requestedAt || envelope.metadata?.requested_at,
+        respondedAt: nowIso(),
+        terminalEvidence: true,
+        visibleToChat: false,
+        nonAuthoritative: true,
+        rootTaskTerminal: false,
+      }));
+    });
+    await writeLocalStatus(cfg, { lastContextAt: nowIso() });
+    return true;
   }
 
   return {
@@ -2342,10 +2533,10 @@ function createRuntime(api) {
 
     async updateProgress(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
-      const taskId = trim(params?.taskId);
+      const reportedTaskId = trim(params?.taskId || params?.task_id);
       const progressStatus = trim(params?.status).toLowerCase();
-      if (!taskId || !progressStatus) {
-        throw new Error("team_update_progress requires taskId and status");
+      if (!progressStatus) {
+        throw new Error("team_update_progress requires status; task and assignment identity are inherited from the active Team assignment when available");
       }
       if (!["idle", "busy", "running", "blocked", "waiting_review", "waiting_completion"].includes(progressStatus)) {
         throw new Error("terminal status must use team_complete_task");
@@ -2353,7 +2544,12 @@ function createRuntime(api) {
       const progress = typeof params.progress === "number"
         ? Math.min(99, Math.max(0, params.progress))
         : undefined;
-      const currentEnvelope = activeTaskMatches(taskId) ? activeEnvelope : null;
+      // Context-only monitor notifications are dispatched outside the normal
+      // active turn. Recover the persisted envelope so their acknowledgement
+      // cannot lose (or invent) the canonical assignment identity.
+      const currentEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
+      const taskId = preferredRootTaskId(currentEnvelope?.rootTaskId, currentEnvelope?.taskId) || reportedTaskId;
+      if (!taskId) throw new Error("team_update_progress could not resolve an active Team task");
       let eventKind = trim(params.eventKind || params.event_kind).toLowerCase();
       const monitorEnvelope =
         trim(currentEnvelope?.intent).toLowerCase() === "assignment_status_check" ||
@@ -2371,6 +2567,16 @@ function createRuntime(api) {
       }
       const checkId = trim(params.checkId || params.check_id || currentEnvelope?.metadata?.checkId || currentEnvelope?.messageId);
       const checkSequence = params.checkSequence ?? params.check_sequence ?? currentEnvelope?.metadata?.checkSequence;
+      const envelopeAssignmentId = trim(currentEnvelope?.assignmentId) || trim(currentEnvelope?.workId);
+      const reportedWorkId = trim(params.workId || params.work_id || params.assignmentId || params.assignment_id);
+      const canonicalAssignmentId = envelopeAssignmentId || reportedWorkId;
+      const canonicalWorkId = canonicalAssignmentId || undefined;
+      // artifact_changed is transport-level and can be digested. Carry the
+      // current canonical refs on the visible business-progress event too.
+      const artifactRefs = [...new Set([
+        ...(Array.isArray(params.artifactRefs) ? params.artifactRefs : []),
+        ...activeArtifactRefs,
+      ].filter((value) => typeof value === "string" && isCanonicalTeamArtifactRef(value)))];
       params = Object.assign(
         {},
         params,
@@ -2382,9 +2588,12 @@ function createRuntime(api) {
           progress,
           rootTaskId: params.rootTaskId || params.root_task_id || currentEnvelope?.rootTaskId || currentEnvelope?.taskId,
           rootMessageId: params.rootMessageId || params.root_message_id || currentEnvelope?.rootMessageId || currentEnvelope?.messageId,
-          workId: params.workId || params.work_id || currentEnvelope?.workId || currentEnvelope?.assignmentId,
-          assignmentId: params.assignmentId || params.assignment_id || currentEnvelope?.assignmentId || currentEnvelope?.workId,
-          canonicalWorkId: params.canonicalWorkId || params.canonical_work_id || params.assignmentId || params.assignment_id || currentEnvelope?.assignmentId || currentEnvelope?.workId,
+          workId: canonicalWorkId,
+          assignmentId: canonicalAssignmentId || undefined,
+          canonicalWorkId,
+          reportedTaskId: reportedTaskId && !taskMatchesEnvelope(currentEnvelope, reportedTaskId) ? reportedTaskId : undefined,
+          reportedWorkId: reportedWorkId && reportedWorkId !== canonicalAssignmentId ? reportedWorkId : undefined,
+          sourceMessageId: currentEnvelope?.messageId || params.sourceMessageId || params.source_message_id,
           phaseId: params.phaseId || params.phase_id || params.phase || currentEnvelope?.phaseId || currentEnvelope?.currentPhaseId,
           revision: Math.max(1, intFrom(params.revision ?? currentEnvelope?.revision, 1)),
           required: params.required === undefined ? currentEnvelope?.required !== false : boolFrom(params.required, true),
@@ -2402,6 +2611,7 @@ function createRuntime(api) {
               ? !passiveMonitorProgress
               : params.visibleToChat !== false && params.visible_to_chat !== false,
           responseLocale,
+          artifactRefs,
           checkId: passiveMonitorProgress ? checkId : undefined,
           checkSequence: passiveMonitorProgress ? checkSequence : undefined,
           requestedAt: passiveMonitorProgress ? (params.requestedAt || params.requested_at || currentEnvelope?.metadata?.requestedAt) : undefined,
@@ -2425,9 +2635,10 @@ function createRuntime(api) {
       const status = await writeLocalStatus(cfg, {
         availability: progressStatus === "idle" ? "idle" : progressStatus,
         currentTaskId: taskId,
+        currentAssignmentId: canonicalAssignmentId || undefined,
         progress,
         lastSummary: params.summary || params.status,
-        artifactRefs: Array.isArray(params.artifactRefs) ? params.artifactRefs : [],
+        artifactRefs,
       });
 
       if (cfg.enabled && cfg.redisUrl && cfg.memberId && hasRequiredRedisTeamKeys(cfg)) {
@@ -2444,19 +2655,21 @@ function createRuntime(api) {
 
     async completeTask(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
-      const taskId = trim(params?.taskId);
+      const reportedTaskId = trim(params?.taskId || params?.task_id);
       const completionStatus = trim(params?.status).toLowerCase();
       const summary = trim(params?.summary);
-      if (!taskId || !completionStatus || !summary) {
-        throw new Error("team_complete_task requires taskId, status and summary");
+      if (!completionStatus || !summary) {
+        throw new Error("team_complete_task requires status and summary; task and assignment identity are inherited from the active Team assignment when available");
       }
       if (!["succeeded", "failed", "cancelled"].includes(completionStatus)) {
         throw new Error("team_complete_task status must be succeeded, failed or cancelled");
       }
-      const completionEnvelope = activeTaskMatches(taskId)
-        ? activeEnvelope
-        : await readTaskEnvelope(cfg, taskId);
-      const resultTaskId = completionTaskIdFor(completionEnvelope, params.rootTaskId || params.root_task_id || taskId) || taskId;
+      const completionEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
+      const resultTaskId = completionTaskIdFor(
+        completionEnvelope,
+        params.rootTaskId || params.root_task_id || reportedTaskId,
+      ) || reportedTaskId;
+      if (!resultTaskId) throw new Error("team_complete_task could not resolve an active Team task");
       params = Object.assign({}, params, {
         taskId: resultTaskId,
         task_id: resultTaskId,
@@ -2467,36 +2680,52 @@ function createRuntime(api) {
         status: completionStatus,
         summary,
         responseLocale: params.responseLocale || params.response_locale || completionEnvelope?.responseLocale || "zh-CN",
+        reportedTaskId: reportedTaskId && !taskMatchesEnvelope(completionEnvelope, reportedTaskId) ? reportedTaskId : undefined,
       });
       const resultMarkdown = trim(params.resultMarkdown) || params.summary;
       const responseLocale = params.responseLocale || params.response_locale || completionEnvelope?.responseLocale || "zh-CN";
       assertResponseLocale(responseLocale, summary + "\n" + resultMarkdown, "Team completion");
       await ensureDirs(cfg);
-      const resultDir = path.join(cfg.sharedDir, "results", safeName(resultTaskId));
-      await mkdirBestEffort(resultDir, TEAM_SHARED_DIR_MODE, "shared result directory");
-      const discoveredArtifactRefs = await collectRootTaskArtifactRefs(cfg, resultTaskId);
+      const completionAssignmentId = trim(
+        params.assignmentId || params.assignment_id || completionEnvelope?.assignmentId || completionEnvelope?.workId,
+      );
+      // A member confirmation must only describe that member's current
+      // assignment. Scanning the whole Team root made a Reviewer claim the
+      // Leader's plan and every other member's result as its own delivery.
+      const discoveredArtifactRefs = isLeaderMember(cfg)
+        ? await collectRootTaskArtifactRefs(cfg, resultTaskId)
+        : await collectMemberAssignmentArtifactRefs(cfg, resultTaskId, cfg.memberId, completionAssignmentId);
       const artifactRefs = await validateArtifactRefs(cfg, [
         ...(Array.isArray(params.artifactRefs) ? params.artifactRefs : []),
         ...activeArtifactRefs,
         ...discoveredArtifactRefs,
       ]);
-      const resultMarkdownPath = path.join(resultDir, "result.md");
-      await writeText(resultMarkdownPath, resultMarkdown);
-      artifactRefs.push(canonicalArtifactRef(cfg, resultMarkdownPath));
-      await writeJson(
-        path.join(resultDir, "result.json"),
-        Object.assign({}, params, { resultMarkdown, artifactRefs, completedAt: nowIso() }),
-      );
       const runtimeStatus = "completion_pending";
       let status = await writeLocalStatus(cfg, {
         availability: "busy",
         runtimeStatus,
         currentTaskId: resultTaskId,
+        currentAssignmentId: completionAssignmentId || undefined,
         progress: params.status === "succeeded" ? 99 : undefined,
         lastSummary: params.summary,
         artifactRefs,
       });
       let completionResult = null;
+      let acceptedFinalMirrorWritten = false;
+      const persistAcceptedFinalMirror = async () => {
+        if (acceptedFinalMirrorWritten || completionStatus !== "succeeded" || !isLeaderMember(cfg)) return;
+        acceptedFinalMirrorWritten = true;
+        const resultDir = path.join(cfg.sharedDir, "results", safeName(resultTaskId));
+        await mkdirBestEffort(resultDir, TEAM_SHARED_DIR_MODE, "shared result directory");
+        const resultMarkdownPath = path.join(resultDir, "result.md");
+        await writeText(resultMarkdownPath, resultMarkdown);
+        const resultMarkdownRef = canonicalArtifactRef(cfg, resultMarkdownPath);
+        if (!artifactRefs.includes(resultMarkdownRef)) artifactRefs.push(resultMarkdownRef);
+        await writeJson(
+          path.join(resultDir, "result.json"),
+          Object.assign({}, params, { resultMarkdown, artifactRefs, completedAt: nowIso(), completionDecision: "accepted" }),
+        );
+      };
 
       if (cfg.enabled && cfg.redisUrl && cfg.memberId && hasRequiredRedisTeamKeys(cfg)) {
         const redis = new RedisClient(cfg.redisUrl);
@@ -2528,6 +2757,7 @@ function createRuntime(api) {
                 ledgerVersion: params.ledgerVersion ?? params.ledger_version ?? completionEnvelope?.ledgerVersion,
                 currentPhaseId: params.currentPhaseId || params.current_phase_id || completionEnvelope?.currentPhaseId,
                 completionStatus: params.status,
+                onAccepted: persistAcceptedFinalMirror,
               });
           } else {
             throw new Error("team_complete_task could not resolve the active task envelope: " + params.taskId);
@@ -2543,6 +2773,7 @@ function createRuntime(api) {
     completeActiveTask,
     failActiveTask,
     isTaskTerminal,
+    reportTerminalMonitor,
   };
 }
 
@@ -2746,9 +2977,9 @@ const teamStatusParameters = {
 const progressParameters = {
   type: "object",
   additionalProperties: false,
-  required: ["taskId", "status"],
+  required: ["status"],
   properties: {
-    taskId: { type: "string" },
+    taskId: { type: "string", description: "Optional task/root/assignment alias. Omit it in an active Team turn rather than inventing an id; the Runtime restores the canonical assignment envelope." },
     status: {
       type: "string",
       enum: ["idle", "busy", "running", "blocked", "waiting_review", "waiting_completion"],
@@ -2783,9 +3014,9 @@ const progressParameters = {
 const completeParameters = {
   type: "object",
   additionalProperties: false,
-  required: ["taskId", "status", "summary"],
+  required: ["status", "summary"],
   properties: {
-    taskId: { type: "string" },
+    taskId: { type: "string", description: "Optional task/root/assignment alias. Omit it in an active Team turn rather than inventing an id; the Runtime restores the canonical assignment envelope." },
     status: { type: "string", enum: ["succeeded", "failed", "cancelled"] },
     summary: { type: "string" },
     resultMarkdown: { type: "string" },
@@ -2980,7 +3211,7 @@ export default definePluginEntry({
     api.registerTool({
       name: "team_update_progress",
       label: "Team Update Progress",
-      description: "Update this member's structured task status.",
+      description: "Update this member's structured task status. Active Team assignment identity is inherited automatically; do not invent assignment or work ids.",
       parameters: progressParameters,
       async execute(_id, params) {
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, status: await runtime.updateProgress(params || {}) }, null, 2) }] };
@@ -2989,7 +3220,7 @@ export default definePluginEntry({
     api.registerTool({
       name: "team_complete_task",
       label: "Team Complete Task",
-      description: "Mark a team task complete or failed.",
+      description: "Submit completion for the active Team assignment or Leader root task. Active identity is inherited automatically; do not invent assignment or work ids.",
       parameters: completeParameters,
       async execute(_id, params) {
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, ...(await runtime.completeTask(params || {})) }, null, 2) }] };
@@ -3271,8 +3502,20 @@ export default definePluginEntry({
                   }
 
                   if (contextOnly) {
+                    const monitorIntent =
+                      trim(envelope.intent).toLowerCase() === "assignment_status_check" ||
+                      trim(envelope.metadata?.monitorType || envelope.metadata?.monitor_type).toLowerCase() === "assignment_status_check";
+                    // Do not wake a model for a stale monitor packet after its
+                    // assignment has already reached a terminal local status.
+                    // In particular, never turn an accepted result back into
+                    // a visible `running` progress event.
+                    if (monitorIntent && await runtime.isTaskTerminal(cfg, envelope)) {
+                      ctx.log?.info?.("redis-team: answered terminal monitor check without waking the model " + envelope.messageId);
+                      await runtime.reportTerminalMonitor(cfg, envelope);
+                      return;
+                    }
                     try {
-                      await dispatchInboundDirectDmWithRuntime({
+                      await runtime.withActiveEnvelope(envelope, async () => dispatchInboundDirectDmWithRuntime({
                         cfg: ctx.cfg,
                         runtime: { channel: ctx.channelRuntime },
                         channel: CHANNEL_ID,
@@ -3319,7 +3562,7 @@ export default definePluginEntry({
                               (err?.message || String(err)),
                           );
                         },
-                      });
+                      }));
                     } catch (err) {
                       ctx.log?.warn?.(
                         "redis-team: context notification dispatch skipped after error: " +
