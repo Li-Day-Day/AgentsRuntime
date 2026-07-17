@@ -1,3 +1,6 @@
 AGENT.md
 .tmp/
+runtimeagent/
+clawmanager-agent/clawmanager-agent-linux
+.tmp-openclaw-patch.json
 /runtime-team-optimization-docs/

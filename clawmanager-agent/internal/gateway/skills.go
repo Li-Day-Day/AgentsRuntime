@@ -11,14 +11,38 @@ import (
 	"time"
 )
 
+const skillDiscoveryMaxDepth = 2
+
+type skillDiscovery struct {
+	RelativePath string
+	SkillRoot    string
+}
+
 func BuildSkillReportPayload(cfg Config, manager *GatewayManager, podID int, mode string) SkillReportPayload {
+	return BuildSkillReportPayloadForInstance(cfg, manager, podID, mode, 0)
+}
+
+func BuildSkillReportPayloadForInstance(cfg Config, manager *GatewayManager, podID int, mode string, instanceID int) SkillReportPayload {
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		mode = "full"
+	}
 	states := manager.GatewayStates()
 	instances := make([]SkillInstanceReport, 0, len(states))
 	for _, state := range states {
+		if instanceID > 0 && state.InstanceID != instanceID {
+			continue
+		}
 		instances = append(instances, SkillInstanceReport{
 			InstanceID:    state.InstanceID,
 			WorkspacePath: state.WorkspacePath,
 			Skills:        scanWorkspaceSkills(state.WorkspacePath),
+		})
+	}
+	if instanceID > 0 && len(instances) == 0 {
+		instances = append(instances, SkillInstanceReport{
+			InstanceID: instanceID,
+			Skills:     []SkillRecord{},
 		})
 	}
 	return SkillReportPayload{
@@ -42,20 +66,13 @@ func scanWorkspaceSkills(workspacePath string) []SkillRecord {
 	seen := map[string]bool{}
 	var skills []SkillRecord
 	for _, root := range roots {
-		entries, err := os.ReadDir(root)
-		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
-			if !entry.IsDir() {
+		discoveries := discoverSkillDirs(root, skillDiscoveryMaxDepth)
+		for _, discovery := range discoveries {
+			if seen[discovery.SkillRoot] {
 				continue
 			}
-			installPath := filepath.Join(root, entry.Name())
-			if seen[installPath] {
-				continue
-			}
-			seen[installPath] = true
-			skills = append(skills, readSkillRecord(installPath, entry.Name()))
+			seen[discovery.SkillRoot] = true
+			skills = append(skills, readSkillRecord(discovery.SkillRoot, discovery.RelativePath))
 		}
 	}
 	sort.Slice(skills, func(i, j int) bool {
@@ -64,7 +81,63 @@ func scanWorkspaceSkills(workspacePath string) []SkillRecord {
 	return skills
 }
 
+func discoverSkillDirs(root string, maxDepth int) []skillDiscovery {
+	root = filepath.Clean(strings.TrimSpace(root))
+	if root == "" {
+		return nil
+	}
+	if maxDepth <= 0 {
+		maxDepth = skillDiscoveryMaxDepth
+	}
+	result := make([]skillDiscovery, 0)
+	var walk func(currentRoot, relativePrefix string, depth int)
+	walk = func(currentRoot, relativePrefix string, depth int) {
+		entries, err := os.ReadDir(currentRoot)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			name := strings.TrimSpace(entry.Name())
+			if name == "" || strings.HasPrefix(name, ".") || name == ".tmp" || !entry.IsDir() {
+				continue
+			}
+			skillRoot := filepath.Join(currentRoot, name)
+			relativePath := name
+			if relativePrefix != "" {
+				relativePath = relativePrefix + "/" + name
+			}
+			relativePath = strings.Trim(strings.ReplaceAll(relativePath, "\\", "/"), "/")
+			if relativePath == "" || strings.Contains(relativePath, "..") {
+				continue
+			}
+			if hasSkillManifest(skillRoot) {
+				result = append(result, skillDiscovery{
+					RelativePath: relativePath,
+					SkillRoot:    skillRoot,
+				})
+				continue
+			}
+			if depth < maxDepth {
+				walk(skillRoot, relativePath, depth+1)
+			}
+		}
+	}
+	walk(root, "", 1)
+	return result
+}
+
+func hasSkillManifest(skillRoot string) bool {
+	for _, name := range []string{"SKILL.md", "skill.json", "openclaw.skill.json"} {
+		info, err := os.Stat(filepath.Join(skillRoot, name))
+		if err == nil && !info.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
 func readSkillRecord(installPath, fallbackID string) SkillRecord {
+	fallbackID = strings.Trim(strings.ReplaceAll(strings.TrimSpace(fallbackID), "\\", "/"), "/")
 	record := SkillRecord{
 		SkillID:     fallbackID,
 		Identifier:  fallbackID,

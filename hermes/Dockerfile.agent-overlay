@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.7
+#
+# Local/release-smoke image: keep the published Hermes Lite runtime as-is,
+# only rebuild and replace clawmanager-agent (the ClawManager control plane).
+#
+# Build from repository root (runtimeagent/):
+#   docker build -f hermes/Dockerfile.agent-overlay \
+#     --build-arg BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/hermes-lite:latest \
+#     -t hermes-lite:local .
+
+ARG BASE_IMAGE=ghcr.io/yuan-lab-llm/agentsruntime/hermes-lite:latest
+
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
+
+WORKDIR /src/clawmanager-agent
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG AGENT_VERSION=dev
+
+COPY clawmanager-agent ./
+RUN go mod download
+
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${arch}" \
+        go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+        -o /out/clawmanager-agent ./cmd/clawmanager-agent
+
+FROM ${BASE_IMAGE}
+
+COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
+RUN chmod 755 /usr/local/bin/clawmanager-agent

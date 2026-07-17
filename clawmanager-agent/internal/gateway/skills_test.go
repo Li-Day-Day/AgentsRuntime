@@ -33,3 +33,22 @@ func TestScanWorkspaceSkillsIncludesHermesSkillRoot(t *testing.T) {
 		t.Fatalf("Identifier = %q, want hermes-weather", skills[0].Identifier)
 	}
 }
+
+func TestScanWorkspaceSkillsIncludesNestedCategorySkill(t *testing.T) {
+	workspace := t.TempDir()
+	skillDir := filepath.Join(workspace, "home", ".hermes", "skills", "productivity", "my-skill")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("# my skill\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	skills := scanWorkspaceSkills(workspace)
+	if len(skills) != 1 {
+		t.Fatalf("skills len = %d, want 1: %#v", len(skills), skills)
+	}
+	if skills[0].Identifier != "productivity/my-skill" {
+		t.Fatalf("Identifier = %q, want productivity/my-skill", skills[0].Identifier)
+	}
+}

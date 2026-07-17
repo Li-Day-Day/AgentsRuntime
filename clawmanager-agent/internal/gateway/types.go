@@ -254,3 +254,10 @@ type SkillRecord struct {
 type HeartbeatReporter interface {
 	ReportHeartbeat(context.Context, HeartbeatPayload) error
 }
+
+// SkillsReporter is implemented by the runtime agent process control plane uses
+// when ClawManager requests an on-demand skill inventory resync.
+type SkillsReporter interface {
+	ReportSkills(context.Context, SkillReportPayload) error
+	PodID() int
+}
