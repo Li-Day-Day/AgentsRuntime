@@ -19,6 +19,7 @@ const PROTOCOL_VERSION = 3;
 const COMPLETION_SOURCE = "team_complete_task";
 const TEAM_SHARED_DIR_MODE = 0o2775;
 const RUNTIME_PRIVATE_DIR_MODE = 0o700;
+const ACTIVE_ASSIGNMENT_LEASE_MS = 6 * 60 * 60 * 1000;
 const SYSTEM_REPLY_TARGETS = new Set([
   "clawmanager",
   "manager",
@@ -443,6 +444,10 @@ function privateTaskEnvelopePath(cfg, alias) {
   return path.join(runtimeStateDir(cfg), "tasks", safeName(alias) + ".json");
 }
 
+function privateActiveAssignmentPath(cfg) {
+  return path.join(runtimeStateDir(cfg), "active-assignment.json");
+}
+
 async function mkdirBestEffort(dir, mode, label) {
   let existed = false;
   try {
@@ -535,9 +540,12 @@ function normalizedArtifactRelativePath(value) {
 
 function assertTeamArtifactWriteScope(cfg, params) {
   const scope = trim(params?.scope).toLowerCase() || "member";
+  const kind = trim(params?.kind || params?.artifactKind || params?.artifact_kind).toLowerCase();
   const role = trim(cfg?.role).toLowerCase();
   const memberId = trim(cfg?.memberId).toLowerCase();
-  if (scope === "team" && role !== "leader" && !role.includes("leader") && memberId !== "leader" && !memberId.includes("leader")) {
+  const leader = role === "leader" || role.includes("leader") || memberId === "leader" || memberId.includes("leader");
+  const reviewer = role.includes("review") || role.includes("qa") || memberId.includes("review") || memberId === "qa";
+  if (scope === "team" && !leader && !(kind === "review" && reviewer)) {
     throw new Error("Only the Team Leader may write team-scoped artifacts; members must use scope=member");
   }
 }
@@ -806,6 +814,19 @@ async function validateArtifactRefs(cfg, refs) {
     if (!validated.includes(canonical)) validated.push(canonical);
   }
   return validated;
+}
+
+function canonicalTeamArtifactRefsFromText(text) {
+  const refs = [];
+  const seen = new Set();
+  const pattern = /\/team\/[^\s)\]}>`,"']+/g;
+  for (const match of String(text || "").match(pattern) || []) {
+    const ref = match.replace(/[.,;:!?。；：，、！]+$/u, "");
+    if (!ref || ref.endsWith("/") || seen.has(ref)) continue;
+    seen.add(ref);
+    refs.push(ref);
+  }
+  return refs;
 }
 
 async function readJson(file) {
@@ -1474,22 +1495,43 @@ async function sessionFilesFromDispatchResult(dispatchResult) {
 }
 
 async function readLatestAssistantTextFromDispatch(dispatchResult) {
+  const texts = await readAssistantTextsFromDispatch(dispatchResult);
+  return texts.length ? texts[texts.length - 1] : "";
+}
+
+function sessionRecordTimestampMs(record) {
+  const value = record?.timestamp || record?.createdAt || record?.created_at || record?.data?.timestamp;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+async function readAssistantTextsFromDispatch(dispatchResult, sinceMs = 0) {
+  const collected = [];
+  const seen = new Set();
   for (const file of await sessionFilesFromDispatchResult(dispatchResult)) {
     const text = await readTextTail(file);
     if (!text) continue;
-    let latest = "";
     for (const line of text.split(/\r?\n/)) {
       const raw = line.trim();
       if (!raw) continue;
       try {
         const record = JSON.parse(raw);
+        if (sinceMs > 0) {
+          const recordMs = sessionRecordTimestampMs(record);
+          if (recordMs > 0 && recordMs + 1000 < sinceMs) continue;
+        }
         const candidate = usableFallbackAssistantText(assistantTextFromRecord(record));
-        if (candidate) latest = candidate;
+        if (!candidate) continue;
+        const hash = createHash("sha256").update(candidate).digest("hex");
+        if (seen.has(hash)) continue;
+        seen.add(hash);
+        collected.push(candidate);
       } catch {}
     }
-    if (latest) return latest;
+    if (collected.length) return collected.slice(-12);
   }
-  return "";
+  return [];
 }
 
 function fieldsToObject(fields) {
@@ -1600,6 +1642,72 @@ async function waitForCompletionAcknowledgement(redis, cfg, completionId, attemp
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   return null;
+}
+
+function statusIsActiveAssignment(status) {
+  const availability = trim(status?.availability).toLowerCase();
+  const runtimeStatus = trim(status?.runtimeStatus).toLowerCase();
+  return ["busy", "running", "working", "waiting_review", "waiting_completion", "completion_pending"].includes(availability) ||
+    ["busy", "running", "working", "waiting_review", "waiting_completion", "completion_pending"].includes(runtimeStatus);
+}
+
+async function writeActiveAssignmentEnvelope(cfg, envelope) {
+  if (!envelope?.taskId) return;
+  await ensureDirs(cfg);
+  const recordedAt = nowIso();
+  await writeJsonBestEffort(
+    privateActiveAssignmentPath(cfg),
+    Object.assign({}, envelope, {
+      activeAssignmentContext: {
+        teamId: String(cfg.teamId || ""),
+        memberId: String(cfg.memberId || ""),
+        recordedAt,
+        expiresAt: new Date(Date.now() + ACTIVE_ASSIGNMENT_LEASE_MS).toISOString(),
+        terminal: false,
+      },
+    }),
+    "runtime active assignment",
+    0o600,
+    RUNTIME_PRIVATE_DIR_MODE,
+  );
+}
+
+async function markActiveAssignmentTerminal(cfg, taskId, assignmentId, runtimeStatus) {
+  const file = privateActiveAssignmentPath(cfg);
+  const current = await readJson(file);
+  if (!current || !taskIdsMatch(current.taskId || current.rootTaskId, taskId)) return;
+  const currentAssignmentId = trim(current.assignmentId || current.workId);
+  if (assignmentId && currentAssignmentId && !taskIdsMatch(currentAssignmentId, assignmentId)) return;
+  current.activeAssignmentContext = Object.assign({}, current.activeAssignmentContext, {
+    teamId: String(cfg.teamId || ""),
+    memberId: String(cfg.memberId || ""),
+    terminal: true,
+    terminalStatus: runtimeStatus || "succeeded",
+    terminalAt: nowIso(),
+  });
+  await writeJsonBestEffort(file, current, "runtime terminal assignment", 0o600, RUNTIME_PRIVATE_DIR_MODE);
+}
+
+async function readActiveAssignmentEnvelope(cfg, options = {}) {
+  await ensureDirs(cfg);
+  const envelope = await readJson(privateActiveAssignmentPath(cfg));
+  if (!envelope?.taskId) return null;
+  const context = envelope.activeAssignmentContext || {};
+  if (trim(context.teamId) && trim(context.teamId) !== trim(cfg.teamId)) return null;
+  if (trim(context.memberId) && trim(context.memberId) !== trim(cfg.memberId)) return null;
+  if (context.terminal === true && !options.includeTerminal) return null;
+  const expiresAt = Date.parse(context.expiresAt || "");
+  if (Number.isFinite(expiresAt) && expiresAt < Date.now()) return null;
+  const status = await readStatuses(cfg, cfg.memberId);
+  if (status) {
+    const statusTaskId = trim(status.currentTaskId || status.runtimeTaskId);
+    if (statusTaskId && !taskIdsMatch(statusTaskId, envelope.taskId) && !taskIdsMatch(statusTaskId, envelope.rootTaskId)) return null;
+    const statusAssignmentId = trim(status.currentAssignmentId || status.assignmentId || status.workId);
+    const envelopeAssignmentId = trim(envelope.assignmentId || envelope.workId);
+    if (statusAssignmentId && envelopeAssignmentId && !taskIdsMatch(statusAssignmentId, envelopeAssignmentId)) return null;
+    if (["succeeded", "failed", "cancelled"].includes(trim(status.runtimeStatus).toLowerCase()) && !options.includeTerminal) return null;
+  }
+  return envelope;
 }
 
 async function waitForTerminalCompletionState(redis, cfg, completionId, timeoutMs = 300000) {
@@ -1783,7 +1891,7 @@ function createRuntime(api) {
     ].some((candidate) => trim(candidate) && taskIdsMatch(taskId, candidate));
   }
 
-  async function resolveActiveAssignmentEnvelope(cfg, params = {}) {
+  async function resolveActiveAssignmentEnvelope(cfg, params = {}, options = {}) {
     const aliases = [
       params.taskId,
       params.task_id,
@@ -1811,6 +1919,19 @@ function createRuntime(api) {
       const persisted = await readTaskEnvelope(cfg, alias);
       if (persisted && (aliases.some((candidate) => taskMatchesEnvelope(persisted, candidate)) || taskMatchesEnvelope(persisted, alias))) {
         return persisted;
+      }
+    }
+    const persistedActive = await readActiveAssignmentEnvelope(cfg, options);
+    if (persistedActive) return persistedActive;
+    // Forward compatibility for images created before active-assignment.json:
+    // recover only the one task named by this member's non-terminal status.
+    // Never scan another Team or guess among multiple assignments.
+    const status = await readStatuses(cfg, cfg.memberId);
+    if (statusIsActiveAssignment(status) || options.includeTerminal) {
+      const statusTaskId = trim(status.currentTaskId || status.runtimeTaskId);
+      if (statusTaskId) {
+        const persisted = await readTaskEnvelope(cfg, statusTaskId);
+        if (persisted) return persisted;
       }
     }
     return null;
@@ -1847,6 +1968,7 @@ function createRuntime(api) {
   async function persistCompletionDecision({
     cfg,
     taskId,
+    assignmentId,
     completionId,
     attemptId,
     streamId,
@@ -1857,6 +1979,19 @@ function createRuntime(api) {
     redis,
   }) {
     const decision = trim(acknowledgement?.decision).toLowerCase();
+    const currentStatus = await readStatuses(cfg, cfg.memberId);
+    const currentTaskId = trim(currentStatus?.currentTaskId || currentStatus?.runtimeTaskId);
+    const currentAssignmentId = trim(currentStatus?.currentAssignmentId || currentStatus?.assignmentId || currentStatus?.workId);
+    const alreadyTerminal =
+      ["succeeded", "failed", "cancelled"].includes(trim(currentStatus?.runtimeStatus).toLowerCase()) &&
+      (!currentTaskId || taskIdsMatch(currentTaskId, taskId)) &&
+      (isLeaderMember(cfg) || !assignmentId || !currentAssignmentId || taskIdsMatch(currentAssignmentId, assignmentId));
+    // A delayed/stale acknowledgement must never roll an accepted local
+    // assignment back to running. Treat it as the terminal state already
+    // observed; the backend independently protects the root ledger as well.
+    if (decision && decision !== "accepted" && alreadyTerminal) {
+      return "accepted";
+    }
     if (decision === "accepted") {
       await withRedis(cfg, redis, async (client) => {
         await client.command("SET", completionKey(cfg, completionId), streamId || attemptId, "EX", 604800);
@@ -1869,6 +2004,7 @@ function createRuntime(api) {
         lastSummary: summary,
         artifactRefs,
       });
+      await markActiveAssignmentTerminal(cfg, taskId, assignmentId, completionStatus);
       if (!activeEnvelope || taskMatchesEnvelope(activeEnvelope, taskId)) {
         activeTaskCompleted = true;
         activeTaskCompletionPending = false;
@@ -2003,6 +2139,7 @@ function createRuntime(api) {
     const decision = await persistCompletionDecision({
       cfg,
       taskId,
+      assignmentId,
       completionId,
       attemptId,
       streamId: terminal?.streamId,
@@ -2027,6 +2164,7 @@ function createRuntime(api) {
               lateDecision = await persistCompletionDecision({
                 cfg,
                 taskId,
+                assignmentId,
                 completionId,
                 attemptId,
                 streamId: terminal?.streamId,
@@ -2047,6 +2185,7 @@ function createRuntime(api) {
               lateDecision = await persistCompletionDecision({
                 cfg,
                 taskId,
+                assignmentId,
                 completionId,
                 attemptId,
                 streamId: terminal?.streamId,
@@ -2150,6 +2289,14 @@ function createRuntime(api) {
         envelope ? taskEvent(cfg, "task_failed", envelope, base) : eventFor(cfg, "task_failed", base),
       );
     });
+    if (envelope) {
+      await markActiveAssignmentTerminal(
+        cfg,
+        taskId || envelope.taskId,
+        trim(envelope.assignmentId || envelope.workId),
+        "failed",
+      );
+    }
     if (envelope && activeTaskMatches(taskId || envelope.taskId)) activeTaskCompleted = true;
     return false;
   }
@@ -2413,7 +2560,7 @@ function createRuntime(api) {
       return activeTaskMatches(taskId) && activeTaskCompletionPending;
     },
 
-    async withActiveEnvelope(envelope, fn) {
+    async withActiveEnvelope(envelope, fn, configOverride) {
       const prevEnvelope = activeEnvelope;
       const prevCompleted = activeTaskCompleted;
       const prevCompletionPending = activeTaskCompletionPending;
@@ -2424,10 +2571,30 @@ function createRuntime(api) {
       activeTaskCompletionPending = false;
       lastOutbound = null;
       activeArtifactRefs = [];
+      // The consumer already resolved the concrete account. Reuse that
+      // configuration so one account cannot persist another account's active
+      // assignment when several Redis Team accounts share a Runtime process.
+      const config = configOverride || readChannelConfig(runtimeApi.config || {});
+      const contextOnly = isContextOnlyEnvelope(envelope);
+      const previousPersistedEnvelope = contextOnly ? await readJson(privateActiveAssignmentPath(config)) : null;
       try {
+        await writeActiveAssignmentEnvelope(config, envelope);
         const result = await fn();
         return { result, completed: activeTaskCompleted, completionPending: activeTaskCompletionPending, outbound: lastOutbound, artifactRefs: activeArtifactRefs };
       } finally {
+        if (contextOnly) {
+          if (previousPersistedEnvelope) {
+            await writeJsonBestEffort(
+              privateActiveAssignmentPath(config),
+              previousPersistedEnvelope,
+              "restored runtime active assignment",
+              0o600,
+              RUNTIME_PRIVATE_DIR_MODE,
+            );
+          } else {
+            await fs.unlink(privateActiveAssignmentPath(config)).catch(() => {});
+          }
+        }
         activeEnvelope = prevEnvelope;
         activeTaskCompleted = prevCompleted;
         activeTaskCompletionPending = prevCompletionPending;
@@ -2461,17 +2628,18 @@ function createRuntime(api) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
       assertTeamArtifactWriteScope(cfg, params);
-      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "member", true);
+      const currentEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
+      const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "member", true);
       await mkdirBestEffort(path.dirname(resolved.candidate), TEAM_SHARED_DIR_MODE, "Team artifact parent");
       await writeText(resolved.candidate, String(params?.content ?? ""));
-      if (activeEnvelope && !activeArtifactRefs.includes(resolved.canonical)) activeArtifactRefs.push(resolved.canonical);
-      if (activeEnvelope && cfg.redisUrl && cfg.memberId && hasRequiredRedisTeamKeys(cfg)) {
-        const responseLocale = trim(activeEnvelope.responseLocale || "zh-CN");
+      if (currentEnvelope && !activeArtifactRefs.includes(resolved.canonical)) activeArtifactRefs.push(resolved.canonical);
+      if (currentEnvelope && cfg.redisUrl && cfg.memberId && hasRequiredRedisTeamKeys(cfg)) {
+        const responseLocale = trim(currentEnvelope.responseLocale || "zh-CN");
         const summary = responseLocale.toLowerCase().startsWith("zh")
           ? "已更新团队产物：" + resolved.canonical
           : "Team artifact updated: " + resolved.canonical;
         await withRedis(cfg, null, async (redis) => {
-          await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "artifact_changed", activeEnvelope, {
+          await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "artifact_changed", currentEnvelope, {
             eventKind: "artifact_changed",
             artifactChanged: true,
             artifactRefs: [resolved.canonical],
@@ -2479,7 +2647,7 @@ function createRuntime(api) {
             runtimeStatus: "running",
             rootTaskTerminal: false,
             nonAuthoritative: true,
-            reviewRequired: boolFrom(activeEnvelope.reviewRequired, false),
+            reviewRequired: boolFrom(currentEnvelope.reviewRequired, false),
             responseLocale,
             summary,
           }));
@@ -2491,7 +2659,8 @@ function createRuntime(api) {
     async artifactRead(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
-      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "team");
+      const currentEnvelope = activeEnvelope || await resolveActiveAssignmentEnvelope(cfg, params || {});
+      const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "team");
       const stat = await fs.stat(resolved.candidate);
       if (!stat.isFile()) throw new Error("Team artifact is not a file: " + resolved.canonical);
       const maxBytes = Math.min(1024 * 1024, Math.max(1, intFrom(params?.maxBytes, 256 * 1024)));
@@ -2502,7 +2671,8 @@ function createRuntime(api) {
     async artifactList(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
-      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "team");
+      const currentEnvelope = activeEnvelope || await resolveActiveAssignmentEnvelope(cfg, params || {});
+      const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "team");
       const limit = Math.min(200, Math.max(1, intFrom(params?.limit, 100)));
       const entries = await fs.readdir(resolved.candidate, { withFileTypes: true });
       const result = [];
@@ -2524,7 +2694,8 @@ function createRuntime(api) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
       assertTeamArtifactWriteScope(cfg, params);
-      const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "member", true);
+      const currentEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
+      const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "member", true);
       if (!(await mkdirBestEffort(resolved.candidate, TEAM_SHARED_DIR_MODE, "Team artifact directory"))) {
         throw new Error("Unable to create Team artifact directory: " + resolved.canonical);
       }
@@ -2547,9 +2718,12 @@ function createRuntime(api) {
       // Context-only monitor notifications are dispatched outside the normal
       // active turn. Recover the persisted envelope so their acknowledgement
       // cannot lose (or invent) the canonical assignment identity.
-      const currentEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
+      const currentEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {}, { includeTerminal: true });
       const taskId = preferredRootTaskId(currentEnvelope?.rootTaskId, currentEnvelope?.taskId) || reportedTaskId;
       if (!taskId) throw new Error("team_update_progress could not resolve an active Team task");
+      if (currentEnvelope && await isTaskTerminal(cfg, currentEnvelope)) {
+        return readStatuses(cfg, cfg.memberId);
+      }
       let eventKind = trim(params.eventKind || params.event_kind).toLowerCase();
       const monitorEnvelope =
         trim(currentEnvelope?.intent).toLowerCase() === "assignment_status_check" ||
@@ -2664,12 +2838,20 @@ function createRuntime(api) {
       if (!["succeeded", "failed", "cancelled"].includes(completionStatus)) {
         throw new Error("team_complete_task status must be succeeded, failed or cancelled");
       }
-      const completionEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
+      const completionEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {}, { includeTerminal: true });
       const resultTaskId = completionTaskIdFor(
         completionEnvelope,
         params.rootTaskId || params.root_task_id || reportedTaskId,
       ) || reportedTaskId;
       if (!resultTaskId) throw new Error("team_complete_task could not resolve an active Team task");
+      if (completionEnvelope && await isTaskTerminal(cfg, completionEnvelope)) {
+        const status = await readStatuses(cfg, cfg.memberId);
+        return {
+          status,
+          artifactRefs: Array.isArray(status?.artifactRefs) ? status.artifactRefs : [],
+          completion: { decision: "accepted", reason: "already_terminal", published: false },
+        };
+      }
       params = Object.assign({}, params, {
         taskId: resultTaskId,
         task_id: resultTaskId,
@@ -2699,6 +2881,7 @@ function createRuntime(api) {
         ...(Array.isArray(params.artifactRefs) ? params.artifactRefs : []),
         ...activeArtifactRefs,
         ...discoveredArtifactRefs,
+        ...canonicalTeamArtifactRefsFromText(resultMarkdown),
       ]);
       const runtimeStatus = "completion_pending";
       let status = await writeLocalStatus(cfg, {
@@ -2878,6 +3061,7 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
               continue;
             }
             await writeTaskEnvelope(cfg, envelope);
+            await writeActiveAssignmentEnvelope(cfg, envelope);
             await xaddJson(
               redis,
               eventsKey(cfg),
@@ -3562,7 +3746,7 @@ export default definePluginEntry({
                               (err?.message || String(err)),
                           );
                         },
-                      }));
+                      }), cfg);
                     } catch (err) {
                       ctx.log?.warn?.(
                         "redis-team: context notification dispatch skipped after error: " +
@@ -3586,6 +3770,7 @@ export default definePluginEntry({
                     availability: "busy",
                     runtimeStatus: "running",
                     currentTaskId: taskId,
+                    currentAssignmentId: envelope.assignmentId || envelope.workId || undefined,
                     lastSummary: "Redis Team task started",
                   });
                   await emitTaskEvent("task_started", {
@@ -3596,6 +3781,53 @@ export default definePluginEntry({
 
                   let dispatchFailed = false;
                   let deliveredViaCallback = false;
+                  const dispatchStartedAt = Date.now();
+                  const emittedNarrativeHashes = new Set();
+                  const emitAgentNarrative = async (narrativeText, source, media = {}) => {
+                    narrativeText = trim(narrativeText);
+                    if (!narrativeText) return false;
+                    assertResponseLocale(envelope.responseLocale || "zh-CN", narrativeText, "Team reply");
+                    const contentHash = createHash("sha256").update(narrativeText).digest("hex");
+                    if (emittedNarrativeHashes.has(contentHash)) return false;
+                    emittedNarrativeHashes.add(contentHash);
+                    const stableId = "agent-narrative:" + safeName(envelope.messageId) + ":" + contentHash.slice(0, 24);
+                    const r = new RedisClient(cfg.redisUrl);
+                    await r.connect();
+                    try {
+                      await xaddJson(r, eventsKey(cfg), eventFor(cfg, "reply", {
+                        eventId: stableId,
+                        messageId: stableId,
+                        message_id: stableId,
+                        inReplyTo: envelope.messageId,
+                        sourceMessageId: envelope.messageId,
+                        source_message_id: envelope.messageId,
+                        taskId: envelope.taskId,
+                        task_id: envelope.taskId,
+                        rootTaskId: envelope.rootTaskId || envelope.taskId,
+                        root_task_id: envelope.rootTaskId || envelope.taskId,
+                        rootMessageId: envelope.rootMessageId || envelope.messageId,
+                        root_message_id: envelope.rootMessageId || envelope.messageId,
+                        workId: envelope.workId || envelope.assignmentId,
+                        assignmentId: envelope.assignmentId || envelope.workId,
+                        canonicalWorkId: envelope.assignmentId || envelope.workId,
+                        phaseId: envelope.phaseId || envelope.currentPhaseId,
+                        eventKind: "agent_narrative",
+                        messageKind: "narrative",
+                        chatPolicy: "visible",
+                        visibleToChat: true,
+                        contentHash,
+                        narrativeSource: source || "runtime_session",
+                        text: narrativeText,
+                        content: narrativeText,
+                        summary: narrativeText.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Team narrative",
+                        mediaUrls: media.mediaUrls,
+                        mediaUrl: media.mediaUrl,
+                      }));
+                    } finally {
+                      r.close();
+                    }
+                    return true;
+                  };
                   const stopHeartbeat = startAssignmentHeartbeat({
                     envelope,
                     emitTaskEvent,
@@ -3646,43 +3878,7 @@ export default definePluginEntry({
                       assertResponseLocale(envelope.responseLocale || "zh-CN", payload?.text || "", "Team reply");
                       deliveredViaCallback = true;
                       ctx.log?.info?.("redis-team: delivering reply for " + envelope.messageId);
-                      const replyMessageId = "msg_" + randomUUID();
-                      const narrativeText = payload?.text || "";
-                      const contentHash = createHash("sha256").update(narrativeText).digest("hex");
-                      const r = new RedisClient(cfg.redisUrl);
-                      await r.connect();
-                      try {
-                        await xaddJson(r, eventsKey(cfg), eventFor(cfg, "reply", {
-                          messageId: replyMessageId,
-                          message_id: replyMessageId,
-                          inReplyTo: envelope.messageId,
-                          sourceMessageId: envelope.messageId,
-                          source_message_id: envelope.messageId,
-                          taskId: envelope.taskId,
-                          task_id: envelope.taskId,
-                          rootTaskId: envelope.rootTaskId || envelope.taskId,
-                          root_task_id: envelope.rootTaskId || envelope.taskId,
-                          rootMessageId: envelope.rootMessageId || envelope.messageId,
-                          root_message_id: envelope.rootMessageId || envelope.messageId,
-                          workId: envelope.workId || envelope.assignmentId,
-                          assignmentId: envelope.assignmentId || envelope.workId,
-                          // Agent prose is a collaboration event. Keep it separate from
-                          // tool-call JSON/ACK traffic so plans, handoffs, progress and
-                          // review explanations remain visible in the Team chat.
-                          eventKind: "agent_narrative",
-                          messageKind: "narrative",
-                          chatPolicy: "visible",
-                          visibleToChat: true,
-                          contentHash,
-                          text: narrativeText,
-                          content: narrativeText,
-                          summary: narrativeText.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Team narrative",
-                          mediaUrls: payload?.mediaUrls,
-                          mediaUrl: payload?.mediaUrl,
-                        }));
-                      } finally {
-                        r.close();
-                      }
+                      await emitAgentNarrative(payload?.text || "", "deliver_callback", payload || {});
                     },
                     onRecordError: (err) => {
                       ctx.log?.error?.(
@@ -3711,16 +3907,23 @@ export default definePluginEntry({
                     },
                     });
                     return { dispatchResult };
-                    });
+                    }, cfg);
                   } finally {
                     stopHeartbeat();
                   }
 
                   let fallbackCompleted = false;
                   let fallbackPending = false;
+                  const assistantNarratives = await readAssistantTextsFromDispatch(
+                    activeResult?.result?.dispatchResult,
+                    dispatchStartedAt,
+                  );
+                  const fallbackText = assistantNarratives.length
+                    ? assistantNarratives[assistantNarratives.length - 1]
+                    : await readLatestAssistantTextFromDispatch(activeResult?.result?.dispatchResult);
+                  const terminalAfterDispatch = await runtime.isTaskTerminal(cfg, envelope);
                   if (!dispatchFailed && !activeResult?.completed && !activeResult?.outbound && !deliveredViaCallback) {
-                    const fallbackText = await readLatestAssistantTextFromDispatch(activeResult?.result?.dispatchResult);
-                    if (await shouldUseAssistantSessionFallback(cfg, envelope, fallbackText)) {
+                    if (!terminalAfterDispatch && await shouldUseAssistantSessionFallback(cfg, envelope, fallbackText)) {
                       const usableFallbackText = usableFallbackAssistantText(fallbackText);
                       const fallbackResult = await runtime.completeActiveTask(usableFallbackText, {
                         cfg,
@@ -3737,8 +3940,20 @@ export default definePluginEntry({
                     }
                   }
 
+                  // OpenClaw can execute tools in a runtime/plugin instance that
+                  // does not invoke this channel's deliver callback. Recover the
+                  // user-visible assistant prose from the current dispatch only.
+                  // If the final text became a completion, omit that last copy;
+                  // the structured completion event is the canonical delivery.
+                  const narrativeLimit = (fallbackCompleted || fallbackPending || terminalAfterDispatch)
+                    ? Math.max(0, assistantNarratives.length - 1)
+                    : assistantNarratives.length;
+                  for (const narrative of assistantNarratives.slice(0, narrativeLimit)) {
+                    await emitAgentNarrative(narrative, "assistant_session");
+                  }
+
                   if (!dispatchFailed && !activeResult?.completed && !activeResult?.completionPending && !fallbackCompleted && !fallbackPending) {
-                    if (await runtime.isTaskTerminal(cfg, envelope)) {
+                    if (terminalAfterDispatch || await runtime.isTaskTerminal(cfg, envelope)) {
                       ctx.log?.info?.(
                         "redis-team: task " + envelope.taskId + " already terminal after dispatch",
                       );

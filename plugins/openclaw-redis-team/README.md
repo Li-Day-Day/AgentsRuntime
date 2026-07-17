@@ -12,6 +12,9 @@ This plugin connects an OpenClaw runtime managed by ClawManager to a Redis Strea
   `team_artifact_mkdir` for current-Team scoped artifact operations.
 - Writes small events to Redis and writes durable task/status/result files under the shared Team directory.
 - Attempts to run inbound tasks through OpenClaw embedded agent runtime helper when available.
+- Persists one member-scoped active assignment lease under the private runtime
+  state directory so tool execution can recover the authenticated Redis
+  envelope even when OpenClaw runs tools in a different plugin instance.
 
 ## Required environment
 
@@ -68,6 +71,14 @@ marks the task terminal and locks the stable `completionId` only after
 ClawManager returns an `accepted` acknowledgement. Deferred and rejected
 attempts keep the assignment retryable. Runtime errors still emit a structured
 `task_failed` event.
+
+Task/work ids supplied by the model are aliases only. The authenticated Redis
+envelope is authoritative. When no alias is supplied, the plugin first uses the
+private active-assignment lease and then, for backward compatibility, the one
+non-terminal task named by the current member status. It never scans sibling
+Teams or guesses between multiple assignments. Once an assignment is terminal,
+late progress and stale completion acknowledgements cannot return its local
+status to running.
 
 Every explicit completion atomically writes `results/<taskId>/result.json` and
 `results/<taskId>/result.md`, even when the caller only provides a summary. The
