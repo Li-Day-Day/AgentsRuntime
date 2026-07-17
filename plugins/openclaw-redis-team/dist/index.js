@@ -159,6 +159,9 @@ function completionAckKey(cfg, completionId, attemptId) {
 function completionStateKey(cfg, completionId) {
   return keyPrefix(cfg) + ":completion-state:" + redisKeyPart(completionId);
 }
+function rootWorkflowStateKey(cfg, rootTaskId) {
+  return keyPrefix(cfg) + ":root:" + redisKeyPart(rootTaskId) + ":state";
+}
 function deriveTeamIdFromKey(value) {
   const raw = trim(value);
   const match = raw.match(/^claw:team:([^:]+):/);
@@ -496,12 +499,27 @@ async function writeJson(file, value, fileMode = 0o664, dirMode = TEAM_SHARED_DI
   await fs.rename(tmp, file);
   await fs.chmod(file, fileMode);
 }
-function assertResponseLocale(locale, text, label) {
+function analyzeResponseLocale(locale, text) {
   const normalizedLocale = trim(locale).toLowerCase();
   const body = String(text || "");
-  if (normalizedLocale.startsWith("zh") && body.trim() && !/[\u3400-\u9fff]/u.test(body)) {
-    throw new Error(`${label || "Team output"} must use ${locale || "zh-CN"}; rewrite the user-visible prose in Chinese while preserving code and technical names.`);
+  if (!body.trim() || !normalizedLocale) return { matched: true, mismatch: false, locale: normalizedLocale || undefined };
+  const mismatch = normalizedLocale.startsWith("zh") && !/[\u3400-\u9fff]/u.test(body);
+  return { matched: !mismatch, mismatch, locale: normalizedLocale };
+}
+
+// Locale is a presentation preference, not a business-state contract. Agents
+// can legitimately include English technical prose even when the root task
+// prefers zh-CN. Returning a diagnostic keeps the content visible without
+// turning an accepted assignment into a runtime failure.
+function assertResponseLocale(locale, text, label) {
+  const analysis = analyzeResponseLocale(locale, text);
+  if (analysis.mismatch) {
+    warnOnce(
+      "locale:" + trim(label || "Team output") + ":" + createHash("sha256").update(String(text || "")).digest("hex").slice(0, 16),
+      `${label || "Team output"} did not match preferred locale ${locale || "zh-CN"}; preserving the original content as a non-blocking diagnostic.`,
+    );
   }
+  return analysis;
 }
 
 async function writeJsonBestEffort(file, value, label, fileMode = 0o664, dirMode = TEAM_SHARED_DIR_MODE) {
@@ -814,6 +832,40 @@ async function validateArtifactRefs(cfg, refs) {
     if (!validated.includes(canonical)) validated.push(canonical);
   }
   return validated;
+}
+
+async function artifactMetadataForRefs(cfg, refs) {
+  const metadata = [];
+  const sharedRoot = path.resolve(cfg.sharedDir);
+  let remainingHashBudget = 16 * 1024 * 1024;
+  for (const ref of (Array.isArray(refs) ? refs : []).slice(0, 64)) {
+    const normalized = trim(ref).replaceAll("\\", "/");
+    if (!normalized.startsWith("/team/")) continue;
+    const candidate = path.resolve(sharedRoot, normalized.slice("/team/".length));
+    if (candidate !== sharedRoot && !candidate.startsWith(sharedRoot + path.sep)) continue;
+    try {
+      const stat = await fs.stat(candidate);
+      if (!stat.isFile()) continue;
+      const entry = {
+        path: normalized,
+        size: stat.size,
+        modifiedAt: stat.mtime.toISOString(),
+      };
+      if (stat.size <= 8 * 1024 * 1024 && stat.size <= remainingHashBudget) {
+        entry.contentHash = createHash("sha256").update(await fs.readFile(candidate)).digest("hex");
+        remainingHashBudget -= stat.size;
+      }
+      metadata.push(entry);
+    } catch {}
+  }
+  return metadata;
+}
+
+function teamResultContentHash(resultMarkdown, artifactRefs = []) {
+  const normalized = String(resultMarkdown || "").trim().split(/\s+/).filter(Boolean).join(" ");
+  const refs = [...new Set((Array.isArray(artifactRefs) ? artifactRefs : []).map(trim).filter(Boolean))].sort();
+  if (!normalized && refs.length === 0) return "";
+  return "sha256:" + createHash("sha256").update(normalized + "\nrefs=" + refs.join("|")).digest("hex");
 }
 
 function canonicalTeamArtifactRefsFromText(text) {
@@ -1241,6 +1293,16 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
   return guidance.join("\n");
 }
 
+function isWorkflowReminderEnvelope(envelope) {
+  const intent = trim(envelope?.intent || envelope?.metadata?.intent || envelope?.type).toLowerCase();
+  const kind = trim(envelope?.metadata?.eventKind || envelope?.metadata?.event_kind).toLowerCase();
+  return [
+    "leader_workflow_decision",
+    "leader_decision_reminder",
+    "leader_synthesis_reminder",
+  ].includes(intent) || ["leader_decision_reminder", "leader_synthesis_reminder"].includes(kind);
+}
+
 async function collectRootTaskArtifactRefs(cfg, rootTaskId) {
   if (!isClawManagerRootTaskRef(rootTaskId)) return [];
   const root = path.resolve(cfg.sharedDir);
@@ -1644,6 +1706,42 @@ async function waitForCompletionAcknowledgement(redis, cfg, completionId, attemp
   return null;
 }
 
+async function workflowReminderIsStale(cfg, envelope, log = console) {
+  if (!isWorkflowReminderEnvelope(envelope)) return false;
+  const rootTaskId = preferredRootTaskId(envelope?.rootTaskId, envelope?.taskId);
+  if (!rootTaskId || !cfg?.redisUrl) return false;
+  const redis = new RedisClient(cfg.redisUrl);
+  try {
+    await redis.connect();
+    const raw = await redis.command("GET", rootWorkflowStateKey(cfg, rootTaskId));
+    if (!raw) return false;
+    const current = JSON.parse(String(raw));
+    const currentLedger = Number(current?.ledgerVersion || 0);
+    const reminderLedger = Number(envelope?.ledgerVersion || envelope?.metadata?.ledgerVersion || 0);
+    const terminal = current?.terminal === true ||
+      ["succeeded", "failed", "cancelled", "completed"].includes(trim(current?.status || current?.workflowState).toLowerCase());
+    if (terminal || (currentLedger > 0 && reminderLedger > 0 && currentLedger > reminderLedger)) {
+      log?.info?.(
+        "redis-team: suppressed stale workflow reminder " +
+          envelope.messageId +
+          " at ledger " +
+          reminderLedger +
+          " (current " +
+          currentLedger +
+          ")",
+      );
+      return true;
+    }
+  } catch (err) {
+    // Compatibility is fail-open: old ClawManager versions do not publish this
+    // key, and a transient Redis read must not suppress a valid Leader wake-up.
+    log?.warn?.("redis-team: unable to validate workflow reminder freshness: " + (err?.message || String(err)));
+  } finally {
+    redis.close();
+  }
+  return false;
+}
+
 function statusIsActiveAssignment(status) {
   const availability = trim(status?.availability).toLowerCase();
   const runtimeStatus = trim(status?.runtimeStatus).toLowerCase();
@@ -1975,6 +2073,7 @@ function createRuntime(api) {
     completionStatus,
     summary,
     artifactRefs,
+    resultContentHash,
     acknowledgement,
     redis,
   }) {
@@ -2003,6 +2102,10 @@ function createRuntime(api) {
         progress: completionStatus === "succeeded" ? 100 : 0,
         lastSummary: summary,
         artifactRefs,
+        resultContentHash:
+          trim(acknowledgement?.reason).toLowerCase() === "already_accepted" && trim(currentStatus?.resultContentHash)
+            ? currentStatus.resultContentHash
+            : resultContentHash || currentStatus?.resultContentHash,
       });
       await markActiveAssignmentTerminal(cfg, taskId, assignmentId, completionStatus);
       if (!activeEnvelope || taskMatchesEnvelope(activeEnvelope, taskId)) {
@@ -2046,6 +2149,8 @@ function createRuntime(api) {
     const responseLocale = meta.responseLocale || envelope?.responseLocale || "zh-CN";
     assertResponseLocale(responseLocale, summary + "\n" + resultMarkdown, "Team completion");
     const artifactRefs = Array.isArray(meta.artifactRefs) ? meta.artifactRefs : [];
+    const resultContentHash = trim(meta.contentHash) || teamResultContentHash(resultMarkdown, artifactRefs);
+    const artifactMetadata = await artifactMetadataForRefs(cfg, artifactRefs);
     const roster = await readTeamRoster(cfg);
     const leaderMediated = isLeaderMediatedRoster(roster);
     const currentMember = currentRosterMember(cfg, roster);
@@ -2124,7 +2229,10 @@ function createRuntime(api) {
         summary,
         result,
         resultMarkdown,
+        contentHash: resultContentHash,
         artifactRefs,
+        artifactMetadata,
+        reviewedArtifactRefs: Array.isArray(meta.reviewedArtifactRefs) ? meta.reviewedArtifactRefs : undefined,
       });
       const streamId = await xaddJson(redis, eventsKey(cfg), proposal);
       const ack = await waitForCompletionAcknowledgement(
@@ -2146,6 +2254,7 @@ function createRuntime(api) {
       completionStatus,
       summary,
       artifactRefs,
+      resultContentHash,
       acknowledgement: terminal?.ack,
       redis: meta.redis,
     });
@@ -2171,6 +2280,7 @@ function createRuntime(api) {
                 completionStatus,
                 summary,
                 artifactRefs,
+                resultContentHash,
                 acknowledgement,
                 redis: lateRedis,
               });
@@ -2192,6 +2302,7 @@ function createRuntime(api) {
                 completionStatus,
                 summary,
                 artifactRefs,
+                resultContentHash,
                 acknowledgement: completionState,
                 redis: lateRedis,
               });
@@ -2664,8 +2775,24 @@ function createRuntime(api) {
       const stat = await fs.stat(resolved.candidate);
       if (!stat.isFile()) throw new Error("Team artifact is not a file: " + resolved.canonical);
       const maxBytes = Math.min(1024 * 1024, Math.max(1, intFrom(params?.maxBytes, 256 * 1024)));
-      if (stat.size > maxBytes) throw new Error("Team artifact exceeds maxBytes: " + stat.size);
-      return { path: resolved.canonical, bytes: stat.size, content: await fs.readFile(resolved.candidate, "utf8") };
+      const offset = Math.max(0, Math.min(stat.size, intFrom(params?.offset, 0)));
+      const length = Math.max(0, Math.min(maxBytes, stat.size - offset));
+      const handle = await fs.open(resolved.candidate, "r");
+      try {
+        const buffer = Buffer.alloc(length);
+        if (length > 0) await handle.read(buffer, 0, length, offset);
+        const nextOffset = offset + length;
+        return {
+          path: resolved.canonical,
+          bytes: stat.size,
+          content: buffer.toString("utf8"),
+          offset,
+          truncated: nextOffset < stat.size,
+          nextOffset: nextOffset < stat.size ? nextOffset : undefined,
+        };
+      } finally {
+        await handle.close();
+      }
     },
 
     async artifactList(params) {
@@ -2844,14 +2971,6 @@ function createRuntime(api) {
         params.rootTaskId || params.root_task_id || reportedTaskId,
       ) || reportedTaskId;
       if (!resultTaskId) throw new Error("team_complete_task could not resolve an active Team task");
-      if (completionEnvelope && await isTaskTerminal(cfg, completionEnvelope)) {
-        const status = await readStatuses(cfg, cfg.memberId);
-        return {
-          status,
-          artifactRefs: Array.isArray(status?.artifactRefs) ? status.artifactRefs : [],
-          completion: { decision: "accepted", reason: "already_terminal", published: false },
-        };
-      }
       params = Object.assign({}, params, {
         taskId: resultTaskId,
         task_id: resultTaskId,
@@ -2883,6 +3002,21 @@ function createRuntime(api) {
         ...discoveredArtifactRefs,
         ...canonicalTeamArtifactRefsFromText(resultMarkdown),
       ]);
+      const resultContentHash = teamResultContentHash(resultMarkdown, artifactRefs);
+      if (completionEnvelope && await isTaskTerminal(cfg, completionEnvelope)) {
+        const status = await readStatuses(cfg, cfg.memberId);
+        const previousContentHash = trim(status?.resultContentHash);
+        // Old Runtime status files do not contain a trustworthy content hash.
+        // Preserve their historical terminal behavior. New statuses may publish
+        // a correction only when the explicit result body or artifact set changed.
+        if (!previousContentHash || previousContentHash === resultContentHash) {
+          return {
+            status,
+            artifactRefs: Array.isArray(status?.artifactRefs) ? status.artifactRefs : [],
+            completion: { decision: "accepted", reason: "already_terminal", published: false },
+          };
+        }
+      }
       const runtimeStatus = "completion_pending";
       let status = await writeLocalStatus(cfg, {
         availability: "busy",
@@ -2926,7 +3060,9 @@ function createRuntime(api) {
                 completionId: params.completionId,
                 summary: params.summary,
                 resultMarkdown,
+                contentHash: resultContentHash,
                 artifactRefs,
+                reviewedArtifactRefs: params.reviewedArtifactRefs || params.reviewed_artifact_refs || [],
                 workId: params.workId || params.work_id,
                 assignmentId: params.assignmentId || params.assignment_id,
                 attemptId: params.attemptId || params.attempt_id,
@@ -3205,6 +3341,11 @@ const completeParameters = {
     summary: { type: "string" },
     resultMarkdown: { type: "string" },
     artifactRefs: { type: "array", items: { type: "string" } },
+    reviewedArtifactRefs: {
+      type: "array",
+      description: "Optional exact artifact paths reviewed by this completion; advisory and non-blocking",
+      items: { type: "string" },
+    },
     completionId: { type: "string" },
     attemptId: { type: "string" },
     rootTaskId: { type: "string" },
@@ -3689,6 +3830,10 @@ export default definePluginEntry({
                     const monitorIntent =
                       trim(envelope.intent).toLowerCase() === "assignment_status_check" ||
                       trim(envelope.metadata?.monitorType || envelope.metadata?.monitor_type).toLowerCase() === "assignment_status_check";
+                    if (await workflowReminderIsStale(cfg, envelope, ctx.log || console)) {
+                      await writeLocalStatus(cfg, { lastContextAt: nowIso() });
+                      return;
+                    }
                     // Do not wake a model for a stale monitor packet after its
                     // assignment has already reached a terminal local status.
                     // In particular, never turn an accepted result back into
@@ -3786,10 +3931,9 @@ export default definePluginEntry({
                   const emitAgentNarrative = async (narrativeText, source, media = {}) => {
                     narrativeText = trim(narrativeText);
                     if (!narrativeText) return false;
-                    assertResponseLocale(envelope.responseLocale || "zh-CN", narrativeText, "Team reply");
+                    const localeAnalysis = assertResponseLocale(envelope.responseLocale || "zh-CN", narrativeText, "Team reply");
                     const contentHash = createHash("sha256").update(narrativeText).digest("hex");
                     if (emittedNarrativeHashes.has(contentHash)) return false;
-                    emittedNarrativeHashes.add(contentHash);
                     const stableId = "agent-narrative:" + safeName(envelope.messageId) + ":" + contentHash.slice(0, 24);
                     const r = new RedisClient(cfg.redisUrl);
                     await r.connect();
@@ -3815,7 +3959,11 @@ export default definePluginEntry({
                         messageKind: "narrative",
                         chatPolicy: "visible",
                         visibleToChat: true,
+                        nonAuthoritative: true,
+                        stateEffect: "none",
                         contentHash,
+                        responseLocale: envelope.responseLocale || "zh-CN",
+                        localeMismatch: localeAnalysis.mismatch || undefined,
                         narrativeSource: source || "runtime_session",
                         text: narrativeText,
                         content: narrativeText,
@@ -3823,6 +3971,7 @@ export default definePluginEntry({
                         mediaUrls: media.mediaUrls,
                         mediaUrl: media.mediaUrl,
                       }));
+                      emittedNarrativeHashes.add(contentHash);
                     } finally {
                       r.close();
                     }
@@ -3875,10 +4024,18 @@ export default definePluginEntry({
                         ctx.log?.info?.("redis-team: suppressed duplicate reply after submitted completion for " + envelope.messageId);
                         return;
                       }
-                      assertResponseLocale(envelope.responseLocale || "zh-CN", payload?.text || "", "Team reply");
                       deliveredViaCallback = true;
                       ctx.log?.info?.("redis-team: delivering reply for " + envelope.messageId);
-                      await emitAgentNarrative(payload?.text || "", "deliver_callback", payload || {});
+                      try {
+                        await emitAgentNarrative(payload?.text || "", "deliver_callback", payload || {});
+                      } catch (err) {
+                        // Chat projection is auxiliary. Keep the assignment turn
+                        // alive and let the session replay retry this stable hash.
+                        ctx.log?.warn?.(
+                          "redis-team: reply projection deferred after error: " +
+                            (err?.message || String(err)),
+                        );
+                      }
                     },
                     onRecordError: (err) => {
                       ctx.log?.error?.(
@@ -3949,7 +4106,14 @@ export default definePluginEntry({
                     ? Math.max(0, assistantNarratives.length - 1)
                     : assistantNarratives.length;
                   for (const narrative of assistantNarratives.slice(0, narrativeLimit)) {
-                    await emitAgentNarrative(narrative, "assistant_session");
+                    try {
+                      await emitAgentNarrative(narrative, "assistant_session");
+                    } catch (err) {
+                      ctx.log?.warn?.(
+                        "redis-team: assistant narrative projection deferred after error: " +
+                          (err?.message || String(err)),
+                      );
+                    }
                   }
 
                   if (!dispatchFailed && !activeResult?.completed && !activeResult?.completionPending && !fallbackCompleted && !fallbackPending) {
@@ -3990,6 +4154,13 @@ export default definePluginEntry({
                   });
                 },
                 async (envelope, error) => {
+                  if (await runtime.isTaskTerminal(cfg, envelope)) {
+                    ctx.log?.warn?.(
+                      "redis-team: ignored message post-processing failure after terminal assignment: " +
+                        error,
+                    );
+                    return;
+                  }
                   await runtime.failActiveTask(error, {
                     cfg,
                     envelope,

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -72,6 +73,13 @@ function toolResult(result) {
   return JSON.parse(result.content[0].text);
 }
 
+function resultContentHash(content, refs) {
+  const normalized = String(content || "").trim().split(/\s+/).filter(Boolean).join(" ");
+  return "sha256:" + createHash("sha256")
+    .update(normalized + "\nrefs=" + [...refs].sort().join("|"))
+    .digest("hex");
+}
+
 try {
   await fs.mkdir(shared, { recursive: true });
   await seedActive("developer", "developer", "dev-01");
@@ -85,8 +93,24 @@ try {
   assert.equal(progress.ok, true);
   assert.equal(progress.status.currentTaskId, "team-75-task-150");
   assert.equal(progress.status.currentAssignmentId, "dev-01");
+  const englishProgress = toolResult(await developerTools.get("team_update_progress").execute("progress-en", {
+    status: "running",
+    progress: 30,
+    eventKind: "worker_progress",
+    summary: "Running static checks before delivery",
+  }));
+  assert.equal(englishProgress.ok, true, "locale mismatch must remain non-blocking");
 
   await fs.writeFile(path.join(shared, "index.html"), "<!doctype html><title>Team 75</title>", "utf8");
+  const truncatedRead = toolResult(await developerTools.get("team_artifact_read").execute("read-truncated", {
+    scope: "team",
+    path: "index.html",
+    maxBytes: 10,
+  }));
+  assert.equal(truncatedRead.ok, true);
+  assert.equal(truncatedRead.artifact.truncated, true);
+  assert.equal(truncatedRead.artifact.nextOffset, 10);
+  assert.equal(Buffer.byteLength(truncatedRead.artifact.content, "utf8"), 10);
   const completion = toolResult(await developerTools.get("team_complete_task").execute("complete-1", {
     status: "succeeded",
     summary: "\u8f7b\u91cf\u770b\u677f\u7f51\u9875\u5f00\u53d1\u5b8c\u6210",
@@ -105,6 +129,8 @@ try {
     availability: "idle",
     progress: 100,
     lastSummary: "Development result accepted",
+    artifactRefs: ["/team/index.html"],
+    resultContentHash: resultContentHash("\u4ea4\u4ed8\u6587\u4ef6\uff1a/team/index.html", ["/team/index.html"]),
   };
   await fs.writeFile(developerStatusPath, JSON.stringify(acceptedStatus), "utf8");
   const lateProgress = toolResult(await developerTools.get("team_update_progress").execute("progress-late", {
@@ -116,6 +142,30 @@ try {
   assert.equal(lateProgress.status.runtimeStatus, "succeeded");
   assert.equal(lateProgress.status.lastSummary, "Development result accepted");
   assert.equal(JSON.parse(await fs.readFile(developerStatusPath, "utf8")).lastSummary, "Development result accepted");
+  const legacyAcceptedStatus = { ...acceptedStatus };
+  delete legacyAcceptedStatus.resultContentHash;
+  await fs.writeFile(developerStatusPath, JSON.stringify(legacyAcceptedStatus), "utf8");
+  const legacyChangedCompletion = toolResult(await developerTools.get("team_complete_task").execute("complete-legacy-changed", {
+    status: "succeeded",
+    summary: "\u65e7\u7248\u72b6\u6001\u4e0b\u7684\u4fee\u6b63",
+    resultMarkdown: "\u65e7\u7248\u72b6\u6001\u4e0b\u4e0d\u5e94\u731c\u6d4b\u662f\u5426\u9700\u8981\u91cd\u5f00\uff1a/team/index.html",
+  }));
+  assert.equal(legacyChangedCompletion.completion.reason, "already_terminal");
+  assert.equal(legacyChangedCompletion.completion.published, false);
+  await fs.writeFile(developerStatusPath, JSON.stringify(acceptedStatus), "utf8");
+  const duplicateCompletion = toolResult(await developerTools.get("team_complete_task").execute("complete-duplicate", {
+    status: "succeeded",
+    summary: "\u8f7b\u91cf\u770b\u677f\u7f51\u9875\u5f00\u53d1\u5b8c\u6210",
+    resultMarkdown: "\u4ea4\u4ed8\u6587\u4ef6\uff1a/team/index.html",
+  }));
+  assert.equal(duplicateCompletion.completion.reason, "already_terminal");
+  assert.equal(duplicateCompletion.completion.published, false);
+  const correctedCompletion = toolResult(await developerTools.get("team_complete_task").execute("complete-corrected", {
+    status: "succeeded",
+    summary: "\u8f7b\u91cf\u770b\u677f\u7f51\u9875\u4fee\u6b63\u5b8c\u6210",
+    resultMarkdown: "\u4fee\u6b63\u540e\u4ea4\u4ed8\u6587\u4ef6\uff1a/team/index.html",
+  }));
+  assert.equal(correctedCompletion.status.runtimeStatus, "completion_pending");
 
   await seedActive("reviewer", "reviewer", "review-01");
   const reviewerTools = createHarness("reviewer", "reviewer");
@@ -128,6 +178,11 @@ try {
   assert.equal(review.ok, true);
   assert.equal(review.artifact.path, "/team/results/team-75-task-150/reviews/review-01/review-report.md");
   await fs.access(path.join(shared, "results", "team-75-task-150", "reviews", "review-01", "review-report.md"));
+
+  assert.match(source, /function analyzeResponseLocale\(/);
+  assert.doesNotMatch(source, /must use \$\{locale \|\| "zh-CN"\}/);
+  assert.match(source, /workflowReminderIsStale/);
+  assert.match(source, /ignored message post-processing failure after terminal assignment/);
 
   console.log("Team75 Redis Team contract test passed");
 } finally {
