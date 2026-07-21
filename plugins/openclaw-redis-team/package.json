@@ -11,6 +11,7 @@
   ],
   "scripts": {
     "build": "node ./scripts/build-check.mjs",
+    "test": "node ./scripts/team75-contract-test.mjs && node ./scripts/build-check.mjs",
     "pack:local": "npm pack --pack-destination ../../openclaw/vendor-plugins"
   },
   "openclaw": {

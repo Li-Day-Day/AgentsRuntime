@@ -12,6 +12,9 @@ This plugin connects an OpenClaw runtime managed by ClawManager to a Redis Strea
   `team_artifact_mkdir` for current-Team scoped artifact operations.
 - Writes small events to Redis and writes durable task/status/result files under the shared Team directory.
 - Attempts to run inbound tasks through OpenClaw embedded agent runtime helper when available.
+- Persists one member-scoped active assignment lease under the private runtime
+  state directory so tool execution can recover the authenticated Redis
+  envelope even when OpenClaw runs tools in a different plugin instance.
 
 ## Required environment
 
@@ -69,6 +72,24 @@ ClawManager returns an `accepted` acknowledgement. Deferred and rejected
 attempts keep the assignment retryable. Runtime errors still emit a structured
 `task_failed` event.
 
+Task/work ids supplied by the model are aliases only. The authenticated Redis
+envelope is authoritative. When no alias is supplied, the plugin first uses the
+private active-assignment lease and then, for backward compatibility, the one
+non-terminal task named by the current member status. It never scans sibling
+Teams or guesses between multiple assignments. Once an assignment is terminal,
+late progress and stale completion acknowledgements cannot return its local
+status to running.
+
+User-visible locale is advisory. A response that does not match
+`responseLocale` is preserved with diagnostic metadata; it never converts an
+accepted assignment into `task_failed`. Assistant-session narrative projection
+is isolated from the business dispatch outcome.
+
+Leader workflow reminders are checked against the optional current root-ledger
+state published by newer ClawManager versions. A newer ledger or terminal root
+suppresses a stale reminder before it wakes the model; missing state remains
+fail-open for backward compatibility.
+
 Every explicit completion atomically writes `results/<taskId>/result.json` and
 `results/<taskId>/result.md`, even when the caller only provides a summary. The
 proposal carries a deterministic `completionId`, a per-attempt `attemptId`,
@@ -77,6 +98,17 @@ canonical `/team/...` artifact references. Leader completions additionally
 declare `workflowFinal`, `finalAnswerReady`, and `remainingActions`. These
 additive fields allow ClawManager to prevent a completed collection phase from
 prematurely closing a multi-stage root task.
+
+Completion events also include best-effort artifact size, modification time,
+and content hashes. These fields are version diagnostics and do not add a new
+completion blocker. Artifact reads larger than `maxBytes` return a truncated
+page with `nextOffset` instead of failing the assignment.
+
+For a terminal local assignment, an identical explicit completion remains
+idempotent. If a newer Runtime can prove that the result body or artifact set
+changed, it republishes the same canonical completion as a correction. The
+ClawManager root ledger decides whether that correction is still admissible;
+an already-terminal root remains immutable.
 
 ## Redis keys
 

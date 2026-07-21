@@ -40,6 +40,11 @@ for (const token of [
   "readTaskEnvelope",
   "runtimeStateDir",
   "privateTaskEnvelopePath",
+  "privateActiveAssignmentPath",
+  "writeActiveAssignmentEnvelope",
+  "readActiveAssignmentEnvelope",
+  "markActiveAssignmentTerminal",
+  "ACTIVE_ASSIGNMENT_LEASE_MS",
   "writeJsonBestEffort",
   "TEAM_SHARED_DIR_MODE = 0o2775",
   "isTaskTerminal",
@@ -79,6 +84,23 @@ for (const token of [
   "assertTeamArtifactWriteScope",
   "assertResponseLocale",
   "sharedWorkspaceForTarget",
+  "artifactRootTaskId",
+  "collectRootTaskArtifactRefs",
+  "kind=plan, kind=review, or kind=final",
+  "canonicalTeamArtifactRefsFromText",
+  "artifactMetadataForRefs",
+  "teamResultContentHash",
+  "resultContentHash",
+  "reviewedArtifactRefs",
+  "analyzeResponseLocale",
+  "workflowReminderIsStale",
+  "rootWorkflowStateKey",
+  'stateEffect: "none"',
+  "truncated:",
+  "nextOffset:",
+  "eventKind: \"agent_narrative\"",
+  "assistant_session",
+  "already_terminal",
   "suppressed duplicate reply after submitted completion",
 ]) {
   if (!dist.includes(token)) throw new Error(`dist/index.js missing Redis Team completion token: ${token}`);
@@ -88,6 +110,14 @@ if (dist.includes("params.taskId === activeEnvelope.taskId")) {
 }
 if (dist.includes('path.join(cfg.sharedDir, ".openclaw-redis-team", "tasks"')) {
   throw new Error("member-scoped Redis Team envelopes must not require a shared NFS .openclaw-redis-team/tasks directory");
+}
+if (dist.includes('|| "unscoped"')) {
+  throw new Error("member Team artifacts must reject missing root task context instead of writing an unscoped path");
+}
+const reviewerGuard = dist.indexOf('kind === "review" && reviewer');
+const genericTeamScopeRejection = dist.indexOf("Only the Team Leader may write team-scoped artifacts");
+if (reviewerGuard < 0 || genericTeamScopeRejection < 0 || reviewerGuard > genericTeamScopeRejection) {
+  throw new Error("Reviewer/QA review publishing must be handled by the team-scope guard");
 }
 const deliverStart = dist.indexOf("deliver: async (payload) => {");
 const deliverEnd = dist.indexOf("onRecordError:", deliverStart);
