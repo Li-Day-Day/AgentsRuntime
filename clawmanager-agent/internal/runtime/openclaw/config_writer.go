@@ -17,6 +17,7 @@ const openClawTrustedProxyRequiredHeader = "x-forwarded-proto"
 const openClawAutoProviderName = "auto"
 const openClawRedisTeamPluginID = "redis-team"
 const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR"
+const openClawBrowserExecutablePath = "/usr/bin/chromium"
 
 func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string) error {
 	if err := gateway.WriteLiteTeamConfigJSON(req, workspacePath); err != nil {
@@ -41,6 +42,7 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("read openclaw config: %w", err)
 	}
+	configureManagedOpenClawBrowser(config)
 
 	if teamEnabledFromRequest(req) {
 		if err := configureOpenClawRedisTeam(config, req, workspacePath); err != nil {
@@ -104,6 +106,25 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		}
 	}
 	return nil
+}
+
+// configureManagedOpenClawBrowser supplies the safe Lite runtime defaults that
+// are present in the image template without replacing an instance's explicit
+// browser choices. New pooled workspaces start from an empty config, so relying
+// on the image template alone leaves Browser unavailable for those instances.
+func configureManagedOpenClawBrowser(config map[string]any) {
+	browser := ensureObject(config, "browser")
+	setDefaultObjectValue(browser, "enabled", true)
+	setDefaultObjectValue(browser, "executablePath", openClawBrowserExecutablePath)
+	setDefaultObjectValue(browser, "headless", true)
+	setDefaultObjectValue(browser, "noSandbox", true)
+}
+
+func setDefaultObjectValue(object map[string]any, key string, value any) {
+	if _, exists := object[key]; exists {
+		return
+	}
+	object[key] = value
 }
 
 func configureOpenClawRedisTeam(config map[string]any, req gateway.CreateGatewayRequest, workspacePath string) error {

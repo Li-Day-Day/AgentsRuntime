@@ -102,11 +102,33 @@ for (const token of [
   "assistant_session",
   "already_terminal",
   "suppressed duplicate reply after submitted completion",
+  "resolveRedisTeamVerificationRole",
+  "Evidence verification policy:",
+  "Code review policy:",
+  "API verification policy:",
+  "attempt Browser startup at most twice",
+  "at most 45 seconds total on Browser setup",
+  "Never install or download browsers",
 ]) {
   if (!dist.includes(token)) throw new Error(`dist/index.js missing Redis Team completion token: ${token}`);
 }
 if (dist.includes("params.taskId === activeEnvelope.taskId")) {
   throw new Error("dist/index.js must match active Redis Team task ids through aliases");
+}
+const verificationRoleResolverStart = dist.indexOf("function resolveRedisTeamVerificationRole");
+const verificationRoleResolverEnd = dist.indexOf("function redisTeamVerificationGuidance", verificationRoleResolverStart);
+if (verificationRoleResolverStart < 0 || verificationRoleResolverEnd < 0) {
+  throw new Error("unable to locate validation role resolver");
+}
+const verificationRoleResolver = dist.slice(verificationRoleResolverStart, verificationRoleResolverEnd);
+for (const forbiddenRolePattern of [
+  'role.includes("review")',
+  'role.includes("qa")',
+  'profileKey.includes("review")',
+]) {
+  if (verificationRoleResolver.includes(forbiddenRolePattern)) {
+    throw new Error(`validation role matching must use exact aliases, found: ${forbiddenRolePattern}`);
+  }
 }
 if (dist.includes('path.join(cfg.sharedDir, ".openclaw-redis-team", "tasks"')) {
   throw new Error("member-scoped Redis Team envelopes must not require a shared NFS .openclaw-redis-team/tasks directory");
