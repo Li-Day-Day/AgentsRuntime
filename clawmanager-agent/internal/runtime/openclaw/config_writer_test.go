@@ -146,6 +146,13 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	if autoProvider["api"] != "openai-completions" {
 		t.Fatalf("models.providers.auto.api = %#v, want openai-completions", autoProvider["api"])
 	}
+	browser := objectAt(t, merged, "browser")
+	if browser["enabled"] != true || browser["headless"] != true || browser["noSandbox"] != true {
+		t.Fatalf("browser defaults = %#v, want enabled headless no-sandbox browser", browser)
+	}
+	if browser["executablePath"] != openClawBrowserExecutablePath {
+		t.Fatalf("browser.executablePath = %#v, want %s", browser["executablePath"], openClawBrowserExecutablePath)
+	}
 	providerModels, ok := autoProvider["models"].([]any)
 	if !ok {
 		t.Fatalf("models.providers.auto.models = %#v, want array", autoProvider["models"])
@@ -162,6 +169,69 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 			t.Fatalf("config mode = %o, want 0600", info.Mode().Perm())
 		}
 	}
+}
+
+func TestWriteOpenClawGatewayConfigCompletesPartialBrowserConfig(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-64")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"browser":{"enabled":false,"profile":"team-review"}}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	req := CreateGatewayRequest{InstanceID: 64, UserID: 45, UID: 200064, GID: 200064}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	merged := readOpenClawConfigForTest(t, configPath)
+	browser := objectAt(t, merged, "browser")
+	if browser["enabled"] != false {
+		t.Fatalf("browser.enabled = %#v, want explicit false preserved", browser["enabled"])
+	}
+	if browser["profile"] != "team-review" {
+		t.Fatalf("browser.profile = %#v, want preserved custom profile", browser["profile"])
+	}
+	if browser["executablePath"] != openClawBrowserExecutablePath || browser["headless"] != true || browser["noSandbox"] != true {
+		t.Fatalf("completed browser config = %#v", browser)
+	}
+}
+
+func TestWriteOpenClawGatewayConfigPreservesExplicitBrowserConfig(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-65")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	existing := []byte(`{"browser":{"enabled":false,"executablePath":"/opt/custom-browser","headless":false,"noSandbox":false}}`)
+	if err := os.WriteFile(configPath, existing, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	req := CreateGatewayRequest{InstanceID: 65, UserID: 45, UID: 200065, GID: 200065}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	browser := objectAt(t, readOpenClawConfigForTest(t, configPath), "browser")
+	if browser["enabled"] != false || browser["executablePath"] != "/opt/custom-browser" || browser["headless"] != false || browser["noSandbox"] != false {
+		t.Fatalf("explicit browser config was overwritten: %#v", browser)
+	}
+}
+
+func readOpenClawConfigForTest(t *testing.T, configPath string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(data, &config); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	return config
 }
 
 func TestWriteOpenClawGatewayConfigUsesRequestEnvironmentLLMOverrides(t *testing.T) {

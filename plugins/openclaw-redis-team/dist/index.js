@@ -1263,6 +1263,43 @@ function startAssignmentHeartbeat({ envelope, emitTaskEvent, log, isTerminal }) 
   return stop;
 }
 
+function resolveRedisTeamVerificationRole(envelope) {
+  const profileKey = trim(
+    envelope?.profileKey ||
+      envelope?.profile_key ||
+      envelope?.memberContext?.profileKey ||
+      envelope?.memberContext?.profile_key ||
+      process.env.CLAWMANAGER_TEAM_PROFILE_KEY,
+  ).toLowerCase();
+  if (profileKey === "agency.evidence-collector") return "evidence";
+  if (profileKey === "agency.code-reviewer") return "code-review";
+  if (profileKey === "agency.api-tester") return "api-test";
+
+  const role = trim(
+    envelope?.effectiveRole ||
+      envelope?.effective_role ||
+      envelope?.role ||
+      process.env.CLAWMANAGER_TEAM_ROLE,
+  ).toLowerCase();
+  if (["reviewer", "qa", "qa-engineer", "evidence-collector"].includes(role)) return "evidence";
+  if (role === "code-reviewer") return "code-review";
+  if (role === "api-tester") return "api-test";
+  return "";
+}
+
+function redisTeamVerificationGuidance(envelope) {
+  switch (resolveRedisTeamVerificationRole(envelope)) {
+    case "evidence":
+      return "Evidence verification policy: use source, artifacts, and tools already available. Browser verification is optional unless explicitly required; attempt Browser startup at most twice and spend at most 45 seconds total on Browser setup. Never install or download browsers, drivers, test frameworks, package dependencies, or system packages for verification. If Browser remains unavailable, record browserVerification=unavailable and continue with static/manual checks. Report only actual findings; do not target a fixed issue count.";
+    case "code-review":
+      return "Code review policy: review source, diffs, architecture boundaries, and existing test evidence first. Keep review proportional and report only concrete findings. Do not create a new test environment or install/download browsers, drivers, frameworks, package dependencies, or system packages. Browser is normally unnecessary; if explicitly useful and ready, attempt startup at most twice and stop Browser setup after 45 seconds before continuing with source review.";
+    case "api-test":
+      return "API verification policy: use existing HTTP tools, available endpoints, artifacts, and static contract review. Browser verification is not required. Never install or download Postman, Newman, browsers, test frameworks, package dependencies, or system packages. If the service or network target is unavailable, record the limit and continue with static contract checks; report only directly observed reproducible failures.";
+    default:
+      return "";
+  }
+}
+
 function appendRedisTeamCompletionGuidance(text, envelope) {
   const body = String(text || "");
   if (isContextOnlyEnvelope(envelope)) return body;
@@ -1288,6 +1325,8 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
     "Optional-work rule: optional work may be omitted, but every omitted optional assignment must be listed in skippedAssignments with assignmentId and a concrete reason.",
     "Never list, search, resolve, or scan the parent of the current Team shared directory, and never inspect sibling Team directories.",
   ];
+  const verificationGuidance = redisTeamVerificationGuidance(envelope);
+  if (verificationGuidance) guidance.push(verificationGuidance);
   if (physicalSharedDir) guidance.push("Resolved current-Team physical shared directory: " + physicalSharedDir);
   if (memberArtifactRoot) guidance.push("Resolved current-member artifact directory: " + memberArtifactRoot);
   return guidance.join("\n");
