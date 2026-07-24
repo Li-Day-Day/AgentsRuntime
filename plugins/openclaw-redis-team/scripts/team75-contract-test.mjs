@@ -8,7 +8,9 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const plugin = (await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`)).default;
+const testSource = source + "\nexport { normalizeEnvelope, appendRedisTeamCompletionGuidance };\n";
+const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
+const plugin = pluginModule.default;
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "redis-team-75-"));
 const state = path.join(root, "state");
@@ -82,8 +84,62 @@ function resultContentHash(content, refs) {
 
 try {
   await fs.mkdir(shared, { recursive: true });
+  await seedActive("leader", "leader", "leader-final-synthesis");
+  const leaderTools = createHarness("leader", "leader");
+  const plan = toolResult(await leaderTools.get("team_artifact_write").execute("plan-write", {
+    scope: "team",
+    kind: "plan",
+    path: "collaboration-plan.md",
+    content: "# Collaboration plan\n\nDeveloper then Reviewer.\n",
+  }));
+  assert.equal(plan.ok, true);
+  assert.equal(plan.artifact.path, "/team/results/team-75-task-150/plan/collaboration-plan.md");
+  const legacyPlanWrite = toolResult(await leaderTools.get("team_artifact_write").execute("plan-write-legacy", {
+    scope: "team",
+    kind: "plan",
+    path: "plan/legacy-plan.md",
+    content: "# Legacy-compatible plan path\n",
+  }));
+  assert.equal(legacyPlanWrite.ok, true);
+  assert.equal(
+    legacyPlanWrite.artifact.path,
+    "/team/results/team-75-task-150/plan/legacy-plan.md",
+    "legacy kind=plan writes must not create a duplicated plan/plan directory",
+  );
+
   await seedActive("developer", "developer", "dev-01");
   const developerTools = createHarness("developer", "developer");
+  const canonicalPlanRead = toolResult(await developerTools.get("team_artifact_read").execute("plan-read-canonical", {
+    path: plan.artifact.path,
+  }));
+  assert.equal(canonicalPlanRead.ok, true);
+  assert.match(canonicalPlanRead.artifact.content, /Developer then Reviewer/);
+  const legacyPlanRead = toolResult(await developerTools.get("team_artifact_read").execute("plan-read-legacy", {
+    scope: "team",
+    kind: "plan",
+    path: "plan/collaboration-plan.md",
+  }));
+  assert.equal(legacyPlanRead.ok, true, "kind=plan must not duplicate a leading plan/ segment");
+  assert.equal(legacyPlanRead.artifact.path, plan.artifact.path);
+  const teamRelativePlanRead = toolResult(await developerTools.get("team_artifact_read").execute("plan-read-relative", {
+    scope: "team",
+    kind: "plan",
+    path: "results/team-75-task-150/plan/collaboration-plan.md",
+  }));
+  assert.equal(teamRelativePlanRead.ok, true, "legacy Team-relative canonical paths must remain readable");
+
+  const normalizedEnvelope = pluginModule.normalizeEnvelope({
+    teamId: "75",
+    memberId: "developer",
+    taskId: "team-75-task-150",
+    artifactRefs: [plan.artifact.path],
+    contextRefs: ["design-notes"],
+  });
+  assert.deepEqual(normalizedEnvelope.artifactRefs, [plan.artifact.path]);
+  const guidedPrompt = pluginModule.appendRedisTeamCompletionGuidance("Implement the page.", normalizedEnvelope);
+  assert.match(guidedPrompt, /read these exact canonical paths/);
+  assert.match(guidedPrompt, /\/team\/results\/team-75-task-150\/plan\/collaboration-plan\.md/);
+
   const progress = toolResult(await developerTools.get("team_update_progress").execute("progress-1", {
     status: "running",
     progress: 25,
@@ -178,6 +234,20 @@ try {
   assert.equal(review.ok, true);
   assert.equal(review.artifact.path, "/team/results/team-75-task-150/reviews/review-01/review-report.md");
   await fs.access(path.join(shared, "results", "team-75-task-150", "reviews", "review-01", "review-report.md"));
+
+  await seedActive("leader", "leader", "review-01");
+  const leaderIdentityTools = createHarness("leader", "leader");
+  const leaderSynthesis = toolResult(await leaderIdentityTools.get("team_update_progress").execute("leader-synthesis", {
+    status: "running",
+    progress: 95,
+    eventKind: "leader_synthesis",
+    summary: "\u6b63\u5728\u6574\u7406\u6700\u7ec8\u4ea4\u4ed8",
+  }));
+  assert.equal(
+    leaderSynthesis.status.currentAssignmentId,
+    "leader-final-synthesis",
+    "Leader synthesis must not inherit the Reviewer's assignment identity",
+  );
 
   assert.match(source, /function analyzeResponseLocale\(/);
   assert.doesNotMatch(source, /must use \$\{locale \|\| "zh-CN"\}/);

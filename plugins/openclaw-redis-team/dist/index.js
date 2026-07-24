@@ -588,7 +588,7 @@ function artifactRootTaskId(params, activeEnvelope) {
     params?.root_task_id,
   );
   if (!isClawManagerRootTaskRef(rootTaskId)) {
-    throw new Error("Team artifact writes require the active ClawManager rootTaskId; refusing an unscoped artifact path");
+    throw new Error("Team artifact operations require the active ClawManager rootTaskId; refusing an unscoped artifact path");
   }
   return rootTaskId;
 }
@@ -660,6 +660,38 @@ function teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite = 
   return path.join(sharedRoot, "artifacts", safeName(rootTaskId), "members", safeName(cfg.memberId), artifactAssignmentId(params, activeEnvelope));
 }
 
+function isCanonicalTeamRelativeArtifactPath(value) {
+  const relative = trim(value).replaceAll("\\", "/").replace(/^\.\//, "");
+  return relative.startsWith("results/") || relative.startsWith("artifacts/");
+}
+
+function normalizeKindRelativeArtifactPath(params, activeEnvelope, relative, defaultScope) {
+  const scope = trim(params?.scope).toLowerCase() || defaultScope;
+  const kind = trim(params?.kind || params?.artifactKind || params?.artifact_kind).toLowerCase();
+  if (scope !== "team" || !kind) return relative;
+
+  // kind=plan already resolves to /team/results/<rootTaskId>/plan. Older
+  // prompts and Agents frequently supplied path="plan/<file>" as well. Strip
+  // only that deterministic duplicate prefix; never scan or guess another
+  // directory.
+  if (kind === "plan" && relative.startsWith("plan/")) {
+    return relative.slice("plan/".length);
+  }
+
+  // A Team-relative canonical path is accepted for forward/backward
+  // compatibility even when a caller also supplied kind. It is validated
+  // against the same kind root on writes below.
+  if (isCanonicalTeamRelativeArtifactPath(relative)) {
+    return relative;
+  }
+
+  // Resolve the root here so a missing/invalid root task is rejected before
+  // any filesystem operation. This is intentionally not used to rewrite
+  // arbitrary user paths.
+  artifactRootTaskId(params, activeEnvelope);
+  return relative;
+}
+
 async function resolveTeamArtifactPath(cfg, params, activeEnvelope, defaultScope, forWrite = false) {
   const rawPath = trim(params?.path).replaceAll("\\", "/");
   const sharedRoot = path.resolve(cfg.sharedDir);
@@ -682,7 +714,22 @@ async function resolveTeamArtifactPath(cfg, params, activeEnvelope, defaultScope
     await assertNoArtifactSymlinkTraversal(sharedRoot, candidate);
     return { candidate, canonical: canonicalArtifactRef(cfg, candidate) };
   }
-  const relative = normalizedArtifactRelativePath(params?.path);
+  let relative = normalizedArtifactRelativePath(params?.path);
+  relative = normalizeKindRelativeArtifactPath(params, activeEnvelope, relative, defaultScope);
+  if (isCanonicalTeamRelativeArtifactPath(relative)) {
+    const candidate = path.resolve(sharedRoot, ...relative.split("/"));
+    const allowedRoot = path.resolve(teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite));
+    const allowedRelative = path.relative(allowedRoot, candidate);
+    if (forWrite && (allowedRelative === ".." || allowedRelative.startsWith(".." + path.sep) || path.isAbsolute(allowedRelative))) {
+      throw new Error("Canonical Team artifact path is outside the active artifact scope");
+    }
+    const sharedRelative = path.relative(sharedRoot, candidate);
+    if (!sharedRelative || sharedRelative === ".." || sharedRelative.startsWith(".." + path.sep) || path.isAbsolute(sharedRelative)) {
+      throw new Error("Team artifact path escaped the current Team workspace");
+    }
+    await assertNoArtifactSymlinkTraversal(sharedRoot, candidate);
+    return { candidate, canonical: canonicalArtifactRef(cfg, candidate) };
+  }
   const root = teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite);
   const candidate = path.resolve(root, ...relative.split("/"));
   const sharedRelative = path.relative(sharedRoot, candidate);
@@ -1313,6 +1360,10 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
     envelope?.sharedWorkspace?.memberArtifactPhysicalRoot ||
       envelope?.workspaceContract?.memberArtifactPhysicalRoot,
   );
+  const contextArtifactRefs = [...new Set([
+    ...(Array.isArray(envelope?.contextRefs) ? envelope.contextRefs : []),
+    ...(Array.isArray(envelope?.artifactRefs) ? envelope.artifactRefs : []),
+  ].map(trim).filter(isCanonicalTeamArtifactRef))];
   const guidance = [
     body,
     "",
@@ -1329,6 +1380,12 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
   if (verificationGuidance) guidance.push(verificationGuidance);
   if (physicalSharedDir) guidance.push("Resolved current-Team physical shared directory: " + physicalSharedDir);
   if (memberArtifactRoot) guidance.push("Resolved current-member artifact directory: " + memberArtifactRoot);
+  if (contextArtifactRefs.length) {
+    guidance.push(
+      "Available Team artifact references: read these exact canonical paths with team_artifact_read; do not rebuild, shorten, or prepend plan/review/member directories:\n" +
+        contextArtifactRefs.map((ref) => "- " + ref).join("\n"),
+    );
+  }
   return guidance.join("\n");
 }
 
@@ -1607,7 +1664,7 @@ function sessionRecordTimestampMs(record) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-async function readAssistantTextsFromDispatch(dispatchResult, sinceMs = 0) {
+async function readAssistantNarrativesFromDispatch(dispatchResult, sinceMs = 0) {
   const collected = [];
   const seen = new Set();
   for (const file of await sessionFilesFromDispatchResult(dispatchResult)) {
@@ -1627,12 +1684,23 @@ async function readAssistantTextsFromDispatch(dispatchResult, sinceMs = 0) {
         const hash = createHash("sha256").update(candidate).digest("hex");
         if (seen.has(hash)) continue;
         seen.add(hash);
-        collected.push(candidate);
+        const sourceTimestampMs = sessionRecordTimestampMs(record);
+        collected.push({
+          text: candidate,
+          contentHash: hash,
+          sourceOccurredAt: sourceTimestampMs > 0 ? new Date(sourceTimestampMs).toISOString() : undefined,
+          sourceSequence: collected.length + 1,
+          sourceRecordId: trim(record?.id || record?.messageId || record?.message_id || record?.data?.id) || undefined,
+        });
       } catch {}
     }
     if (collected.length) return collected.slice(-12);
   }
   return [];
+}
+
+async function readAssistantTextsFromDispatch(dispatchResult, sinceMs = 0) {
+  return (await readAssistantNarrativesFromDispatch(dispatchResult, sinceMs)).map((entry) => entry.text);
 }
 
 function fieldsToObject(fields) {
@@ -1962,6 +2030,9 @@ function normalizeEnvelope(raw) {
     createdAt: raw.createdAt || raw.created_at || nowIso(),
     expiresAt: raw.expiresAt || raw.expires_at,
     contextRefs: Array.isArray(raw.contextRefs) ? raw.contextRefs.filter(Boolean) : [],
+    artifactRefs: Array.isArray(raw.artifactRefs || raw.artifact_refs)
+      ? (raw.artifactRefs || raw.artifact_refs).filter(Boolean)
+      : [],
     artifacts: raw.artifacts || [],
     metadata: raw.metadata || {},
     responseLocale: raw.responseLocale || raw.response_locale || raw.metadata?.responseLocale || raw.metadata?.response_locale || "zh-CN",
@@ -2203,7 +2274,11 @@ function createRuntime(api) {
     // The envelope is the authoritative assignment contract. A Worker may use
     // a descriptive workId in prose, but it must not fork a second Kanban
     // card or bind its completion to a different assignment.
-    const assignmentId = envelopeAssignmentId || reportedWorkId || undefined;
+    const inheritedAssignmentId = envelopeAssignmentId || reportedWorkId || undefined;
+    // A Leader receives Worker result envelopes while coordinating the root
+    // task. Those source envelopes are useful for audit, but they are not the
+    // identity of the Leader's final synthesis lane.
+    const assignmentId = currentIsLeader ? "leader-final-synthesis" : inheritedAssignmentId;
     const workId = assignmentId;
     const revision = Math.max(1, intFrom(meta.revision ?? envelope.revision, 1));
     const completionScope = currentIsLeader ? "root" : assignmentId || "root";
@@ -2244,6 +2319,11 @@ function createRuntime(api) {
         rootTaskTerminal: leaderMediated ? (!assignmentResultOnly && currentIsLeader) : undefined,
         workId,
         assignmentId,
+        canonicalWorkId: workId,
+        sourceWorkId:
+          currentIsLeader && inheritedAssignmentId && inheritedAssignmentId !== assignmentId
+            ? inheritedAssignmentId
+            : undefined,
         reportedWorkId: reportedWorkId && reportedWorkId !== assignmentId ? reportedWorkId : undefined,
         revision,
         sourceMessageId: envelope.messageId,
@@ -2264,7 +2344,9 @@ function createRuntime(api) {
         confirmFinal: boolFrom(meta.confirmFinal, false),
         planVersion: Number(meta.planVersion ?? envelope.planVersion ?? 0),
         ledgerVersion: Number(meta.ledgerVersion ?? envelope.ledgerVersion ?? 0),
-        currentPhaseId: meta.currentPhaseId || envelope.currentPhaseId || envelope.phaseId,
+        currentPhaseId:
+          meta.currentPhaseId ||
+          (currentIsLeader ? "phase-final-synthesis" : envelope.currentPhaseId || envelope.phaseId),
         summary,
         result,
         resultMarkdown,
@@ -2535,6 +2617,22 @@ function createRuntime(api) {
     const revision = Math.max(1, intFrom(params.revision, 1));
     const requiredForRoot = params.required === undefined ? true : boolFrom(params.required, true);
     assertResponseLocale(responseLocale, text, "Team assignment");
+    const inheritedContextRefs = [...new Set([
+      ...(Array.isArray(params.contextRefs) ? params.contextRefs : []),
+      ...(Array.isArray(inferredEnvelope?.contextRefs) ? inferredEnvelope.contextRefs : []),
+      ...(Array.isArray(inferredEnvelope?.artifactRefs) ? inferredEnvelope.artifactRefs : []),
+      ...(Array.isArray(activeEnvelope?.contextRefs) ? activeEnvelope.contextRefs : []),
+      ...(Array.isArray(activeEnvelope?.artifactRefs) ? activeEnvelope.artifactRefs : []),
+      ...activeArtifactRefs,
+    ].map(trim).filter(Boolean))];
+    const validatedContextArtifacts = await validateArtifactRefs(
+      cfg,
+      inheritedContextRefs.filter(isCanonicalTeamArtifactRef),
+    );
+    const contextRefs = [...new Set([
+      ...inheritedContextRefs.filter((ref) => !isCanonicalTeamArtifactRef(ref)),
+      ...validatedContextArtifacts,
+    ])];
     const message = {
       v: WIRE_SCHEMA_VERSION,
       protocolVersion: PROTOCOL_VERSION,
@@ -2568,7 +2666,8 @@ function createRuntime(api) {
         undefined,
       title,
       text,
-      contextRefs: Array.isArray(params.contextRefs) ? params.contextRefs.filter(Boolean) : [],
+      contextRefs,
+      artifactRefs: validatedContextArtifacts,
       ttlSeconds: typeof params.ttlSeconds === "number" ? params.ttlSeconds : 3600,
       priority: trim(params.priority) || "normal",
       metadata: params.metadata || {},
@@ -2909,7 +3008,25 @@ function createRuntime(api) {
       const checkSequence = params.checkSequence ?? params.check_sequence ?? currentEnvelope?.metadata?.checkSequence;
       const envelopeAssignmentId = trim(currentEnvelope?.assignmentId) || trim(currentEnvelope?.workId);
       const reportedWorkId = trim(params.workId || params.work_id || params.assignmentId || params.assignment_id);
-      const canonicalAssignmentId = envelopeAssignmentId || reportedWorkId;
+      const memberIsLeader = isLeaderMember(cfg);
+      const inheritedAssignmentId = envelopeAssignmentId || reportedWorkId;
+      const semanticEventKind =
+        memberIsLeader && eventKind === "worker_plan"
+          ? "leader_plan"
+          : memberIsLeader && eventKind === "worker_progress"
+            ? "leader_progress"
+            : eventKind;
+      const leaderRootEvent =
+        memberIsLeader &&
+        (semanticEventKind === "leader_plan" ||
+          semanticEventKind === "leader_progress" ||
+          semanticEventKind === "leader_synthesis");
+      const canonicalAssignmentId =
+        semanticEventKind === "leader_synthesis" && memberIsLeader
+          ? "leader-final-synthesis"
+          : leaderRootEvent
+            ? undefined
+            : inheritedAssignmentId;
       const canonicalWorkId = canonicalAssignmentId || undefined;
       // artifact_changed is transport-level and can be digested. Carry the
       // current canonical refs on the visible business-progress event too.
@@ -2922,6 +3039,8 @@ function createRuntime(api) {
         params,
         {
           eventKind,
+          semanticEventKind,
+          actorRole: memberIsLeader ? "leader" : trim(cfg.role) || undefined,
           taskId,
           task_id: taskId,
           status: progressStatus,
@@ -2931,10 +3050,22 @@ function createRuntime(api) {
           workId: canonicalWorkId,
           assignmentId: canonicalAssignmentId || undefined,
           canonicalWorkId,
+          sourceWorkId:
+            memberIsLeader && inheritedAssignmentId && inheritedAssignmentId !== canonicalAssignmentId
+              ? inheritedAssignmentId
+              : undefined,
           reportedTaskId: reportedTaskId && !taskMatchesEnvelope(currentEnvelope, reportedTaskId) ? reportedTaskId : undefined,
           reportedWorkId: reportedWorkId && reportedWorkId !== canonicalAssignmentId ? reportedWorkId : undefined,
           sourceMessageId: currentEnvelope?.messageId || params.sourceMessageId || params.source_message_id,
-          phaseId: params.phaseId || params.phase_id || params.phase || currentEnvelope?.phaseId || currentEnvelope?.currentPhaseId,
+          phaseId:
+            params.phaseId ||
+            params.phase_id ||
+            params.phase ||
+            (semanticEventKind === "leader_synthesis" && memberIsLeader
+              ? "phase-final-synthesis"
+              : leaderRootEvent
+                ? undefined
+                : currentEnvelope?.phaseId || currentEnvelope?.currentPhaseId),
           revision: Math.max(1, intFrom(params.revision ?? currentEnvelope?.revision, 1)),
           required: params.required === undefined ? currentEnvelope?.required !== false : boolFrom(params.required, true),
           reviewRequired: boolFrom(params.reviewRequired ?? params.review_required, false),
@@ -2958,7 +3089,7 @@ function createRuntime(api) {
           respondedAt: eventKind === "assignment_check_result" ? nowIso() : undefined,
         },
       );
-      if (currentEnvelope && eventKind === "leader_plan") {
+      if (currentEnvelope && semanticEventKind === "leader_plan") {
         currentEnvelope.planVersion = Number(params.planVersion || currentEnvelope.planVersion || 1);
         currentEnvelope.workflowState = params.workflowState || "executing";
         if (Array.isArray(params.phases) && params.phases.length > 0) {
@@ -3029,12 +3160,24 @@ function createRuntime(api) {
       const completionAssignmentId = trim(
         params.assignmentId || params.assignment_id || completionEnvelope?.assignmentId || completionEnvelope?.workId,
       );
+      const normalizedCompletionAssignmentId = isLeaderMember(cfg)
+        ? "leader-final-synthesis"
+        : completionAssignmentId;
+      if (isLeaderMember(cfg)) {
+        if (completionAssignmentId && completionAssignmentId !== normalizedCompletionAssignmentId) {
+          params.sourceWorkId = params.sourceWorkId || completionAssignmentId;
+        }
+        params.assignmentId = normalizedCompletionAssignmentId;
+        params.workId = normalizedCompletionAssignmentId;
+        params.canonicalWorkId = normalizedCompletionAssignmentId;
+        params.currentPhaseId = params.currentPhaseId || params.current_phase_id || "phase-final-synthesis";
+      }
       // A member confirmation must only describe that member's current
       // assignment. Scanning the whole Team root made a Reviewer claim the
       // Leader's plan and every other member's result as its own delivery.
       const discoveredArtifactRefs = isLeaderMember(cfg)
         ? await collectRootTaskArtifactRefs(cfg, resultTaskId)
-        : await collectMemberAssignmentArtifactRefs(cfg, resultTaskId, cfg.memberId, completionAssignmentId);
+        : await collectMemberAssignmentArtifactRefs(cfg, resultTaskId, cfg.memberId, normalizedCompletionAssignmentId);
       const artifactRefs = await validateArtifactRefs(cfg, [
         ...(Array.isArray(params.artifactRefs) ? params.artifactRefs : []),
         ...activeArtifactRefs,
@@ -3061,7 +3204,7 @@ function createRuntime(api) {
         availability: "busy",
         runtimeStatus,
         currentTaskId: resultTaskId,
-        currentAssignmentId: completionAssignmentId || undefined,
+        currentAssignmentId: normalizedCompletionAssignmentId || undefined,
         progress: params.status === "succeeded" ? 99 : undefined,
         lastSummary: params.summary,
         artifactRefs,
@@ -3102,8 +3245,8 @@ function createRuntime(api) {
                 contentHash: resultContentHash,
                 artifactRefs,
                 reviewedArtifactRefs: params.reviewedArtifactRefs || params.reviewed_artifact_refs || [],
-                workId: params.workId || params.work_id,
-                assignmentId: params.assignmentId || params.assignment_id,
+                workId: normalizedCompletionAssignmentId,
+                assignmentId: normalizedCompletionAssignmentId,
                 attemptId: params.attemptId || params.attempt_id,
                 workflowFinal: params.workflowFinal ?? params.workflow_final ?? params.sealWorkflow ?? params.seal_workflow,
                 finalAnswerReady: params.finalAnswerReady ?? params.final_answer_ready,
@@ -3429,9 +3572,9 @@ const completeParameters = {
 };
 
 const artifactPathProperties = {
-  path: { type: "string", description: "Relative path. Absolute paths and '..' traversal are rejected." },
-  scope: { type: "string", enum: ["member", "team"], description: "member writes to /team/artifacts/<rootTaskId>/members/<memberId>/<assignmentId>. Team scope is only for a Leader plan/final delivery or a Reviewer/QA review report." },
-  kind: { type: "string", enum: ["plan", "review", "final"], description: "Required for scope=team. Produces the canonical results path returned by the tool; never invent a /team link." },
+  path: { type: "string", description: "Artifact locator. Use the exact canonical /team/... path returned by a Team tool or assignment context, a legacy Team-relative results/... or artifacts/... path, or a scope-relative file name. '..' traversal and paths outside the current Team are rejected." },
+  scope: { type: "string", enum: ["member", "team"], description: "member resolves relative paths under the current member/assignment. team resolves relative paths under the declared kind. Canonical /team/... reads may reference any explicitly shared artifact in the current Team." },
+  kind: { type: "string", enum: ["plan", "review", "final"], description: "Required for Team-scoped writes and optional for canonical reads. With kind=plan use path='collaboration-plan.md'; the plan directory is added automatically. Exact canonical /team/... paths must not be shortened or rebuilt." },
   rootTaskId: { type: "string", description: "ClawManager root task ID. Inherited only from a valid active Team assignment; unscoped writes are rejected." },
   assignmentId: { type: "string", description: "Required for member artifacts and review reports; inherited from the active assignment when omitted." },
 };
@@ -3967,11 +4110,11 @@ export default definePluginEntry({
                   let deliveredViaCallback = false;
                   const dispatchStartedAt = Date.now();
                   const emittedNarrativeHashes = new Set();
-                  const emitAgentNarrative = async (narrativeText, source, media = {}) => {
+                  const emitAgentNarrative = async (narrativeText, source, media = {}, sourceMeta = {}) => {
                     narrativeText = trim(narrativeText);
                     if (!narrativeText) return false;
                     const localeAnalysis = assertResponseLocale(envelope.responseLocale || "zh-CN", narrativeText, "Team reply");
-                    const contentHash = createHash("sha256").update(narrativeText).digest("hex");
+                    const contentHash = trim(sourceMeta.contentHash) || createHash("sha256").update(narrativeText).digest("hex");
                     if (emittedNarrativeHashes.has(contentHash)) return false;
                     const stableId = "agent-narrative:" + safeName(envelope.messageId) + ":" + contentHash.slice(0, 24);
                     const r = new RedisClient(cfg.redisUrl);
@@ -4004,6 +4147,10 @@ export default definePluginEntry({
                         responseLocale: envelope.responseLocale || "zh-CN",
                         localeMismatch: localeAnalysis.mismatch || undefined,
                         narrativeSource: source || "runtime_session",
+                        sourceOccurredAt: sourceMeta.sourceOccurredAt,
+                        sourceSequence: sourceMeta.sourceSequence,
+                        sourceRecordId: sourceMeta.sourceRecordId,
+                        lateProjection: sourceMeta.lateProjection === true,
                         text: narrativeText,
                         content: narrativeText,
                         summary: narrativeText.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Team narrative",
@@ -4066,7 +4213,16 @@ export default definePluginEntry({
                       deliveredViaCallback = true;
                       ctx.log?.info?.("redis-team: delivering reply for " + envelope.messageId);
                       try {
-                        await emitAgentNarrative(payload?.text || "", "deliver_callback", payload || {});
+                        await emitAgentNarrative(
+                          payload?.text || "",
+                          "deliver_callback",
+                          payload || {},
+                          {
+                            sourceOccurredAt: payload?.timestamp || payload?.createdAt || payload?.created_at,
+                            sourceRecordId: payload?.messageId || payload?.message_id || payload?.id,
+                            lateProjection: false,
+                          },
+                        );
                       } catch (err) {
                         // Chat projection is auxiliary. Keep the assignment turn
                         // alive and let the session replay retry this stable hash.
@@ -4110,12 +4266,12 @@ export default definePluginEntry({
 
                   let fallbackCompleted = false;
                   let fallbackPending = false;
-                  const assistantNarratives = await readAssistantTextsFromDispatch(
+                  const assistantNarratives = await readAssistantNarrativesFromDispatch(
                     activeResult?.result?.dispatchResult,
                     dispatchStartedAt,
                   );
                   const fallbackText = assistantNarratives.length
-                    ? assistantNarratives[assistantNarratives.length - 1]
+                    ? assistantNarratives[assistantNarratives.length - 1].text
                     : await readLatestAssistantTextFromDispatch(activeResult?.result?.dispatchResult);
                   const terminalAfterDispatch = await runtime.isTaskTerminal(cfg, envelope);
                   if (!dispatchFailed && !activeResult?.completed && !activeResult?.outbound && !deliveredViaCallback) {
@@ -4146,7 +4302,12 @@ export default definePluginEntry({
                     : assistantNarratives.length;
                   for (const narrative of assistantNarratives.slice(0, narrativeLimit)) {
                     try {
-                      await emitAgentNarrative(narrative, "assistant_session");
+                      await emitAgentNarrative(
+                        narrative.text,
+                        "assistant_session",
+                        {},
+                        { ...narrative, lateProjection: true },
+                      );
                     } catch (err) {
                       ctx.log?.warn?.(
                         "redis-team: assistant narrative projection deferred after error: " +
