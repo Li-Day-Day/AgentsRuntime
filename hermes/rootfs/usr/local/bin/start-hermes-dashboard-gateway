@@ -17,6 +17,8 @@ mkdir -p \
     "${XDG_CONFIG_HOME}" \
     "${XDG_DATA_HOME}"
 
+/usr/local/bin/hermes-apply-runtime-config
+
 env_file="${HERMES_HOME}/.env"
 if [ -f "${env_file}" ]; then
     while IFS= read -r line || [ -n "${line:-}" ]; do

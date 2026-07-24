@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/iamlovingit/clawmanager-agent/internal/gateway"
@@ -190,7 +191,7 @@ func TestWriteOpenClawGatewayConfigCompletesPartialBrowserConfig(t *testing.T) {
 	}
 
 	req := CreateGatewayRequest{InstanceID: 64, UserID: 45, UID: 200064, GID: 200064}
-	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace); err != nil {
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
@@ -219,7 +220,7 @@ func TestWriteOpenClawGatewayConfigPreservesExplicitBrowserConfig(t *testing.T) 
 	}
 
 	req := CreateGatewayRequest{InstanceID: 65, UserID: 45, UID: 200065, GID: 200065}
-	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace); err != nil {
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
@@ -277,6 +278,222 @@ func TestWriteOpenClawGatewayConfigUsesRequestEnvironmentLLMOverrides(t *testing
 	model := objectAt(t, defaults, "model")
 	if model["primary"] != "auto/auto" {
 		t.Fatalf("agents.defaults.model.primary = %#v, want first request model", model["primary"])
+	}
+}
+
+func TestWriteOpenClawGatewayConfigMergesRequestChannelsIntoWorkspaceConfig(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-70")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{
+  "channels": {
+    "discord": {"enabled": true},
+    "telegram": {"enabled": false}
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write existing config: %v", err)
+	}
+
+	req := CreateGatewayRequest{
+		InstanceID: 70,
+		UserID:     45,
+		UID:        200070,
+		GID:        200070,
+		Environment: map[string]string{
+			"CLAWMANAGER_OPENCLAW_CHANNELS_JSON": `{"telegram":{"enabled":true},"feishu":{"enabled":true}}`,
+		},
+	}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read merged config: %v", err)
+	}
+	var merged map[string]any
+	if err := json.Unmarshal(data, &merged); err != nil {
+		t.Fatalf("parse merged config: %v", err)
+	}
+	channels := objectAt(t, merged, "channels")
+	if objectAt(t, channels, "telegram")["enabled"] != true {
+		t.Fatalf("channels.telegram.enabled = %#v, want true", objectAt(t, channels, "telegram")["enabled"])
+	}
+	if objectAt(t, channels, "feishu")["enabled"] != true {
+		t.Fatalf("channels.feishu.enabled = %#v, want true", objectAt(t, channels, "feishu")["enabled"])
+	}
+	if objectAt(t, channels, "discord")["enabled"] != true {
+		t.Fatalf("channels.discord.enabled = %#v, want preserved true", objectAt(t, channels, "discord")["enabled"])
+	}
+}
+
+func TestWriteOpenClawGatewayConfigReconcilesManagedChannelPluginEntries(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-72")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{
+  "plugins": {
+    "entries": {
+      "dingtalk-connector": {"enabled": false, "custom": "keep"},
+      "feishu": {"enabled": false},
+      "wecom-openclaw-plugin": {"enabled": true}
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write existing config: %v", err)
+	}
+
+	req := CreateGatewayRequest{
+		InstanceID: 72,
+		UserID:     45,
+		UID:        200072,
+		GID:        200072,
+		Environment: map[string]string{
+			"CLAWMANAGER_OPENCLAW_CHANNELS_JSON": `{"dingtalk":{},"feishu":{}}`,
+		},
+	}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read merged config: %v", err)
+	}
+	var merged map[string]any
+	if err := json.Unmarshal(data, &merged); err != nil {
+		t.Fatalf("parse merged config: %v", err)
+	}
+	entries := objectAt(t, objectAt(t, merged, "plugins"), "entries")
+	if got := objectAt(t, entries, "dingtalk-connector")["enabled"]; got != true {
+		t.Fatalf("plugins.entries.dingtalk-connector.enabled = %#v, want true", got)
+	}
+	if got := objectAt(t, entries, "feishu")["enabled"]; got != true {
+		t.Fatalf("plugins.entries.feishu.enabled = %#v, want true", got)
+	}
+	if got := objectAt(t, entries, "wecom-openclaw-plugin")["enabled"]; got != false {
+		t.Fatalf("plugins.entries.wecom-openclaw-plugin.enabled = %#v, want false", got)
+	}
+	if got := objectAt(t, entries, "dingtalk-connector")["custom"]; got != "keep" {
+		t.Fatalf("plugins.entries.dingtalk-connector.custom = %#v, want preserved value", got)
+	}
+	groupChat := objectAt(t, objectAt(t, merged, "messages"), "groupChat")
+	if got := groupChat["visibleReplies"]; got != "automatic" {
+		t.Fatalf("messages.groupChat.visibleReplies = %#v, want automatic", got)
+	}
+}
+
+func TestWriteOpenClawGatewayConfigPreservesExplicitDingTalkVisibleReplies(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-73")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{
+  "messages": {
+    "groupChat": {
+      "visibleReplies": "message_tool_only"
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write existing config: %v", err)
+	}
+
+	req := CreateGatewayRequest{
+		InstanceID: 73,
+		UserID:     45,
+		Environment: map[string]string{
+			"CLAWMANAGER_OPENCLAW_CHANNELS_JSON": `{"dingtalk-connector":{}}`,
+		},
+	}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read merged config: %v", err)
+	}
+	var merged map[string]any
+	if err := json.Unmarshal(data, &merged); err != nil {
+		t.Fatalf("parse merged config: %v", err)
+	}
+	groupChat := objectAt(t, objectAt(t, merged, "messages"), "groupChat")
+	if got := groupChat["visibleReplies"]; got != "message_tool_only" {
+		t.Fatalf("messages.groupChat.visibleReplies = %#v, want preserved explicit value", got)
+	}
+}
+
+func TestMergeOpenClawChannelsUsesEnvFallbackAndEnvironmentPriority(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		environment map[string]string
+		env         map[string]string
+		wantEnabled bool
+	}{
+		{
+			name: "Env fallback",
+			env: map[string]string{
+				openClawChannelsEnv: `{"telegram":{"enabled":false}}`,
+			},
+			wantEnabled: false,
+		},
+		{
+			name: "Environment priority",
+			environment: map[string]string{
+				openClawChannelsEnv: `{"telegram":{"enabled":true}}`,
+			},
+			env: map[string]string{
+				openClawChannelsEnv: `{"telegram":{"enabled":false}}`,
+			},
+			wantEnabled: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := map[string]any{}
+			req := CreateGatewayRequest{Environment: tc.environment, Env: tc.env}
+			if err := mergeOpenClawChannelsFromRequest(config, req); err != nil {
+				t.Fatalf("mergeOpenClawChannelsFromRequest() error = %v", err)
+			}
+			telegram := objectAt(t, objectAt(t, config, "channels"), "telegram")
+			if got := telegram["enabled"]; got != tc.wantEnabled {
+				t.Fatalf("channels.telegram.enabled = %#v, want %v", got, tc.wantEnabled)
+			}
+		})
+	}
+}
+
+func TestWriteOpenClawGatewayConfigRejectsInvalidRequestChannelsPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "array", payload: `[]`},
+		{name: "invalid json", payload: `{"telegram":`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-71")
+			req := CreateGatewayRequest{
+				InstanceID: 71,
+				UserID:     45,
+				UID:        200071,
+				GID:        200071,
+				Environment: map[string]string{
+					"CLAWMANAGER_OPENCLAW_CHANNELS_JSON": tc.payload,
+				},
+			}
+			err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003)
+			if err == nil {
+				t.Fatal("WriteGatewayConfig() error = nil, want invalid channels payload error")
+			}
+			if !strings.Contains(err.Error(), "CLAWMANAGER_OPENCLAW_CHANNELS_JSON") {
+				t.Fatalf("WriteGatewayConfig() error = %q, want environment name", err)
+			}
+		})
 	}
 }
 

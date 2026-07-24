@@ -18,6 +18,16 @@ const openClawAutoProviderName = "auto"
 const openClawRedisTeamPluginID = "redis-team"
 const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR"
 const openClawBrowserExecutablePath = "/usr/bin/chromium"
+const openClawChannelsEnv = "CLAWMANAGER_OPENCLAW_CHANNELS_JSON"
+
+var openClawEnvManagedChannelPlugins = map[string][]string{
+	"dingtalk":              {"dingtalk-connector"},
+	"dingtalk-connector":    {"dingtalk-connector"},
+	"feishu":                {"feishu"},
+	"lark":                  {"feishu"},
+	"wecom":                 {"wecom-openclaw-plugin"},
+	"wecom-openclaw-plugin": {"wecom-openclaw-plugin"},
+}
 
 func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string, port int) error {
 	if port <= 0 || port > 65535 {
@@ -32,9 +42,16 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	}
 	cfg = resolvedCfg
 
-	configPath := filepath.Join(workspacePath, "home", ".openclaw", "openclaw.json")
+	instancePaths, err := resolveOpenClawInstancePaths(req, workspacePath)
+	if err != nil {
+		return err
+	}
+	configPath := filepath.Join(instancePaths.Persistent, "openclaw.json")
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
 		return fmt.Errorf("create openclaw config dir: %w", err)
+	}
+	if err := seedOpenClawPluginRuntime(req, instancePaths.Persistent); err != nil {
+		return err
 	}
 
 	config := map[string]any{}
@@ -46,8 +63,13 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		return fmt.Errorf("read openclaw config: %w", err)
 	}
 	configureManagedOpenClawBrowser(config)
+	if err := mergeOpenClawChannelsFromRequest(config, req); err != nil {
+		return err
+	}
 
 	mergePlatformDefaults(config, port)
+	agentDefaults := ensureObject(ensureObject(config, "agents"), "defaults")
+	agentDefaults["workspace"] = filepath.ToSlash(instancePaths.OpenClawWorkspace)
 	if teamEnabledFromRequest(req) {
 		if err := configureOpenClawRedisTeam(config, req, workspacePath); err != nil {
 			return err
@@ -129,6 +151,67 @@ func setDefaultObjectValue(object map[string]any, key string, value any) {
 		return
 	}
 	object[key] = value
+}
+
+func mergeOpenClawChannelsFromRequest(config map[string]any, req gateway.CreateGatewayRequest) error {
+	raw, ok := requestEnvValue(req, openClawChannelsEnv)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	var payload any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return fmt.Errorf("parse %s: %w", openClawChannelsEnv, err)
+	}
+	channelsPayload, ok := payload.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s must be a JSON object", openClawChannelsEnv)
+	}
+
+	channels := ensureObject(config, "channels")
+	for name, channel := range channelsPayload {
+		channels[name] = channel
+	}
+	reconcileOpenClawChannelPlugins(config, channelsPayload)
+	applyOpenClawChannelDefaults(config, channelsPayload)
+	return nil
+}
+
+func applyOpenClawChannelDefaults(config map[string]any, channelsPayload map[string]any) {
+	if _, ok := channelsPayload["dingtalk"]; !ok {
+		if _, ok := channelsPayload["dingtalk-connector"]; !ok {
+			return
+		}
+	}
+
+	messages := ensureObject(config, "messages")
+	groupChat := ensureObject(messages, "groupChat")
+	if value, ok := groupChat["visibleReplies"].(string); ok && strings.TrimSpace(value) != "" {
+		return
+	}
+	groupChat["visibleReplies"] = "automatic"
+}
+
+func reconcileOpenClawChannelPlugins(config map[string]any, channelsPayload map[string]any) {
+	plugins := ensureObject(config, "plugins")
+	entries := ensureObject(plugins, "entries")
+	enabledPlugins := map[string]struct{}{}
+	for channelID := range channelsPayload {
+		for _, pluginID := range openClawEnvManagedChannelPlugins[channelID] {
+			enabledPlugins[pluginID] = struct{}{}
+		}
+	}
+	managedPlugins := map[string]struct{}{}
+	for _, pluginIDs := range openClawEnvManagedChannelPlugins {
+		for _, pluginID := range pluginIDs {
+			managedPlugins[pluginID] = struct{}{}
+		}
+	}
+	for pluginID := range managedPlugins {
+		entry := ensureObject(entries, pluginID)
+		_, enabled := enabledPlugins[pluginID]
+		entry["enabled"] = enabled
+	}
 }
 
 func mergePlatformDefaults(config map[string]any, port int) {
@@ -257,6 +340,14 @@ func seedOpenClawRedisTeamPlugin(req gateway.CreateGatewayRequest, workspacePath
 	}
 	extensionsDir := filepath.Join(workspacePath, "home", ".openclaw", "extensions")
 	target := filepath.Join(extensionsDir, openClawRedisTeamPluginID)
+	if _, err := os.Stat(filepath.Join(target, "openclaw.plugin.json")); err == nil {
+		if err := chownTree(target, req.UID, req.GID); err != nil {
+			return fmt.Errorf("chown redis-team plugin: %w", err)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat redis-team plugin target: %w", err)
+	}
 	if err := copyDir(source, target); err != nil {
 		return fmt.Errorf("seed redis-team plugin: %w", err)
 	}
@@ -314,9 +405,19 @@ func copyDir(source, target string) error {
 	for _, entry := range entries {
 		srcPath := filepath.Join(source, entry.Name())
 		dstPath := filepath.Join(target, entry.Name())
-		entryInfo, err := entry.Info()
+		entryInfo, err := os.Lstat(srcPath)
 		if err != nil {
 			return err
+		}
+		if entryInfo.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(srcPath)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(linkTarget, dstPath); err != nil {
+				return err
+			}
+			continue
 		}
 		if entryInfo.IsDir() {
 			if err := copyDir(srcPath, dstPath); err != nil {
@@ -358,9 +459,12 @@ func copyRegularFile(source, target string, mode os.FileMode) error {
 }
 
 func chownTree(root string, uid, gid int) error {
-	return filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
 		}
 		return gateway.ChownWorkspace(path, uid, gid)
 	})

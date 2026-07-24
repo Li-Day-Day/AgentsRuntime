@@ -501,6 +501,7 @@ func OpenClawGatewayEnv(base []string, cfg Config, req CreateGatewayRequest, wor
 	env = setEnv(env, "CLAWMANAGER_USER_ID", strconv.Itoa(req.UserID))
 	env = setEnv(env, "CLAWMANAGER_RUNTIME_TYPE", cfg.RuntimeType)
 	env = setEnv(env, "CLAWMANAGER_WORKSPACE_PATH", workspacePath)
+	env = setEnv(env, "CLAWMANAGER_AGENT_PERSISTENT_DIR", filepath.Join(workspacePath, "home", ".openclaw"))
 	env = setEnv(env, "CLAWMANAGER_GATEWAY_PORT", strconv.Itoa(port))
 	env = setEnv(env, "HOME", filepath.Join(workspacePath, "home"))
 	env = setEnv(env, "HOST", "0.0.0.0")
