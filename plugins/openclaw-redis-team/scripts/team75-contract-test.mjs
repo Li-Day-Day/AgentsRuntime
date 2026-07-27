@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, appendRedisTeamCompletionGuidance };\n";
+const testSource = source + "\nexport { normalizeEnvelope, appendRedisTeamCompletionGuidance, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -94,6 +94,32 @@ try {
   }));
   assert.equal(plan.ok, true);
   assert.equal(plan.artifact.path, "/team/results/team-75-task-150/plan/collaboration-plan.md");
+  const persistedLeaderEnvelope = JSON.parse(await fs.readFile(
+    path.join(state, "teams", "75", "leader", "tasks", "team-75-task-150.json"),
+    "utf8",
+  ));
+  assert.deepEqual(
+    persistedLeaderEnvelope.artifactRefs,
+    [plan.artifact.path],
+    "Leader plan refs must survive the tool turn in the persisted root envelope",
+  );
+  const upstreamRef = "/team/artifacts/team-75-task-150/members/researcher/research-01/result.md";
+  await fs.mkdir(path.join(shared, "artifacts", "team-75-task-150", "members", "researcher", "research-01"), { recursive: true });
+  await fs.writeFile(
+    path.join(shared, upstreamRef.slice("/team/".length)),
+    "# Developer result\n",
+    "utf8",
+  );
+  const mergedLeaderEnvelope = await pluginModule.mergeTaskEnvelopeArtifactContext(
+    { teamId: "75", memberId: "leader", sharedDir: shared },
+    persistedLeaderEnvelope,
+    [upstreamRef],
+  );
+  assert.deepEqual(
+    mergedLeaderEnvelope.artifactRefs,
+    [plan.artifact.path, upstreamRef],
+    "context-only member results must accumulate without replacing the persisted Leader plan",
+  );
   const legacyPlanWrite = toolResult(await leaderTools.get("team_artifact_write").execute("plan-write-legacy", {
     scope: "team",
     kind: "plan",
@@ -139,6 +165,22 @@ try {
   const guidedPrompt = pluginModule.appendRedisTeamCompletionGuidance("Implement the page.", normalizedEnvelope);
   assert.match(guidedPrompt, /read these exact canonical paths/);
   assert.match(guidedPrompt, /\/team\/results\/team-75-task-150\/plan\/collaboration-plan\.md/);
+  assert.deepEqual(
+    pluginModule.canonicalTeamArtifactRefsFromText(
+      { sharedDir: shared },
+      `env: $CLAWMANAGER_TEAM_SHARED_DIR/index.html physical: ${path.join(shared, "index.html")}`,
+    ),
+    ["/team/index.html"],
+    "current-Team env and physical paths must normalize to one canonical artifact ref",
+  );
+  assert.deepEqual(
+    pluginModule.canonicalTeamArtifactRefsFromText(
+      { sharedDir: shared },
+      "/workspaces/teams/user-1/team-999-shared/private.html",
+    ),
+    [],
+    "a sibling Team physical path must never be imported into the current Team context",
+  );
 
   const progress = toolResult(await developerTools.get("team_update_progress").execute("progress-1", {
     status: "running",

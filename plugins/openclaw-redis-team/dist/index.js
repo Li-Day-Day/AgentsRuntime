@@ -827,11 +827,28 @@ async function importExternalArtifactFile(cfg, file) {
   return canonicalArtifactRef(cfg, target);
 }
 
+function canonicalArtifactAlias(cfg, value) {
+  const raw = trim(value).replaceAll("\\", "/");
+  if (!raw) return "";
+  if (raw.startsWith("/team/")) return raw;
+  const envPrefix = raw.match(/^\$\{?CLAWMANAGER_TEAM_SHARED_DIR\}?(?:\/(.*))?$/i);
+  if (envPrefix) {
+    const relative = trim(envPrefix[1]);
+    return relative ? "/team/" + relative.replace(/^\/+/, "") : "";
+  }
+  const sharedRoot = path.resolve(cfg.sharedDir).replaceAll("\\", "/").replace(/\/+$/, "");
+  if (sharedRoot && (raw === sharedRoot || raw.startsWith(sharedRoot + "/"))) {
+    const relative = raw.slice(sharedRoot.length).replace(/^\/+/, "");
+    return relative ? "/team/" + relative : "";
+  }
+  return raw;
+}
+
 async function validateArtifactRefs(cfg, refs) {
   const root = path.resolve(cfg.sharedDir);
   const validated = [];
   for (const raw of Array.isArray(refs) ? refs : []) {
-    const ref = trim(raw);
+    const ref = canonicalArtifactAlias(cfg, raw);
     if (!ref) continue;
     // Accept canonical Team paths and legacy bare names, but do not turn an
     // unreadable external path into a synthetic manifest that looks like a
@@ -844,6 +861,8 @@ async function validateArtifactRefs(cfg, refs) {
       candidate = path.resolve(root, ref);
     } else if (path.dirname(ref) === path.parse(ref).root) {
       candidate = path.resolve(root, path.basename(ref));
+    } else if (path.resolve(ref) === root || path.resolve(ref).startsWith(root + path.sep)) {
+      candidate = path.resolve(ref);
     } else {
       warnOnce("artifact-ref-outside:" + ref, "redis-team: ignored external artifact reference: " + ref);
       continue;
@@ -915,15 +934,16 @@ function teamResultContentHash(resultMarkdown, artifactRefs = []) {
   return "sha256:" + createHash("sha256").update(normalized + "\nrefs=" + refs.join("|")).digest("hex");
 }
 
-function canonicalTeamArtifactRefsFromText(text) {
+function canonicalTeamArtifactRefsFromText(cfg, text) {
   const refs = [];
   const seen = new Set();
-  const pattern = /\/team\/[^\s)\]}>`,"']+/g;
+  const pattern = /(?:\/team\/|\$\{?CLAWMANAGER_TEAM_SHARED_DIR\}?\/|\/workspaces\/teams\/[^\s/]+\/team-[^\s/]+-shared\/)[^\s)\]}>`,"']+/gi;
   for (const match of String(text || "").match(pattern) || []) {
     const ref = match.replace(/[.,;:!?。；：，、！]+$/u, "");
-    if (!ref || ref.endsWith("/") || seen.has(ref)) continue;
-    seen.add(ref);
-    refs.push(ref);
+    const canonicalRef = canonicalArtifactAlias(cfg, ref);
+    if (!canonicalRef || canonicalRef.endsWith("/") || !isCanonicalTeamArtifactRef(canonicalRef) || seen.has(canonicalRef)) continue;
+    seen.add(canonicalRef);
+    refs.push(canonicalRef);
   }
   return refs;
 }
@@ -1185,6 +1205,31 @@ async function readTaskEnvelope(cfg, taskId) {
     if (envelope) return envelope;
   }
   return null;
+}
+
+async function mergeTaskEnvelopeArtifactContext(cfg, envelope, refs = []) {
+  if (!envelope?.taskId) return envelope;
+  const candidates = [
+    ...(Array.isArray(envelope.artifactRefs) ? envelope.artifactRefs : []),
+    ...(Array.isArray(envelope.contextRefs) ? envelope.contextRefs : []),
+    ...refs,
+    ...canonicalTeamArtifactRefsFromText(cfg, envelope.text || envelope.prompt || envelope.rawPrompt || ""),
+  ];
+  const artifactRefs = await validateArtifactRefs(
+    cfg,
+    candidates
+      .map((ref) => canonicalArtifactAlias(cfg, ref))
+      .filter(isCanonicalTeamArtifactRef),
+  );
+  const nonArtifactContextRefs = (Array.isArray(envelope.contextRefs) ? envelope.contextRefs : [])
+    .map(trim)
+    .filter((ref) => ref && !isCanonicalTeamArtifactRef(canonicalArtifactAlias(cfg, ref)));
+  const merged = Object.assign({}, envelope, {
+    artifactRefs: artifactRefs.slice(0, 64),
+    contextRefs: [...new Set([...nonArtifactContextRefs, ...artifactRefs])].slice(0, 96),
+  });
+  await writeTaskEnvelope(cfg, merged);
+  return merged;
 }
 
 function isContextOnlyEnvelope(envelope) {
@@ -2347,6 +2392,9 @@ function createRuntime(api) {
         currentPhaseId:
           meta.currentPhaseId ||
           (currentIsLeader ? "phase-final-synthesis" : envelope.currentPhaseId || envelope.phaseId),
+        phaseId:
+          meta.phaseId ||
+          (currentIsLeader ? "phase-final-synthesis" : envelope.phaseId || envelope.currentPhaseId),
         summary,
         result,
         resultMarkdown,
@@ -2569,6 +2617,9 @@ function createRuntime(api) {
     const generatedTaskId = "task_" + randomUUID();
     const taskId = requestedTaskId || inheritedRootTaskId || inferredEnvelope?.taskId || activeEnvelope?.taskId || generatedTaskId;
     const rootTaskId = inheritedRootTaskId || preferredRootTaskId(taskId);
+    const persistedRootEnvelope = rootTaskId
+      ? await readTaskEnvelope(cfg, rootTaskId)
+      : null;
     const rootMessageId =
       explicitRootMessageId ||
       inferredEnvelope?.rootMessageId ||
@@ -2623,6 +2674,9 @@ function createRuntime(api) {
       ...(Array.isArray(inferredEnvelope?.artifactRefs) ? inferredEnvelope.artifactRefs : []),
       ...(Array.isArray(activeEnvelope?.contextRefs) ? activeEnvelope.contextRefs : []),
       ...(Array.isArray(activeEnvelope?.artifactRefs) ? activeEnvelope.artifactRefs : []),
+      ...(Array.isArray(persistedRootEnvelope?.contextRefs) ? persistedRootEnvelope.contextRefs : []),
+      ...(Array.isArray(persistedRootEnvelope?.artifactRefs) ? persistedRootEnvelope.artifactRefs : []),
+      ...canonicalTeamArtifactRefsFromText(cfg, text),
       ...activeArtifactRefs,
     ].map(trim).filter(Boolean))];
     const validatedContextArtifacts = await validateArtifactRefs(
@@ -2815,7 +2869,6 @@ function createRuntime(api) {
       const prevCompletionPending = activeTaskCompletionPending;
       const prevOutbound = lastOutbound;
       const prevArtifactRefs = activeArtifactRefs;
-      activeEnvelope = envelope;
       activeTaskCompleted = false;
       activeTaskCompletionPending = false;
       lastOutbound = null;
@@ -2826,6 +2879,30 @@ function createRuntime(api) {
       const config = configOverride || readChannelConfig(runtimeApi.config || {});
       const contextOnly = isContextOnlyEnvelope(envelope);
       const previousPersistedEnvelope = contextOnly ? await readJson(privateActiveAssignmentPath(config)) : null;
+      if (contextOnly) {
+        const rootTaskId = preferredRootTaskId(envelope?.rootTaskId, envelope?.taskId);
+        const persistedRootEnvelope = rootTaskId ? await readTaskEnvelope(config, rootTaskId) : null;
+        const contextRefs = [
+          ...(Array.isArray(envelope?.artifactRefs) ? envelope.artifactRefs : []),
+          ...(Array.isArray(envelope?.contextRefs) ? envelope.contextRefs : []),
+          ...(Array.isArray(envelope?.metadata?.artifactRefs) ? envelope.metadata.artifactRefs : []),
+          ...canonicalTeamArtifactRefsFromText(config, envelope?.text || envelope?.prompt || envelope?.rawPrompt || ""),
+        ];
+        if (persistedRootEnvelope && !isContextOnlyEnvelope(persistedRootEnvelope)) {
+          const mergedRootEnvelope = await mergeTaskEnvelopeArtifactContext(config, persistedRootEnvelope, contextRefs);
+          envelope = Object.assign({}, envelope, {
+            artifactRefs: [...new Set([
+              ...(Array.isArray(mergedRootEnvelope.artifactRefs) ? mergedRootEnvelope.artifactRefs : []),
+              ...(Array.isArray(envelope.artifactRefs) ? envelope.artifactRefs : []),
+            ])],
+            contextRefs: [...new Set([
+              ...(Array.isArray(mergedRootEnvelope.contextRefs) ? mergedRootEnvelope.contextRefs : []),
+              ...(Array.isArray(envelope.contextRefs) ? envelope.contextRefs : []),
+            ])],
+          });
+        }
+      }
+      activeEnvelope = envelope;
       try {
         await writeActiveAssignmentEnvelope(config, envelope);
         const result = await fn();
@@ -2882,16 +2959,42 @@ function createRuntime(api) {
       await mkdirBestEffort(path.dirname(resolved.candidate), TEAM_SHARED_DIR_MODE, "Team artifact parent");
       await writeText(resolved.candidate, String(params?.content ?? ""));
       if (currentEnvelope && !activeArtifactRefs.includes(resolved.canonical)) activeArtifactRefs.push(resolved.canonical);
+      const artifactScope = trim(params?.scope).toLowerCase() || "member";
+      const artifactKind = trim(params?.kind || params?.artifactKind || params?.artifact_kind).toLowerCase();
+      if (currentEnvelope && isLeaderMember(cfg) && artifactScope === "team" && artifactKind === "plan") {
+        const rootTaskId = preferredRootTaskId(currentEnvelope.rootTaskId, currentEnvelope.taskId);
+        const persistedRootEnvelope = rootTaskId ? await readTaskEnvelope(cfg, rootTaskId) : currentEnvelope;
+        const mergedRootEnvelope = await mergeTaskEnvelopeArtifactContext(
+          cfg,
+          persistedRootEnvelope || currentEnvelope,
+          [resolved.canonical],
+        );
+        currentEnvelope.artifactRefs = mergedRootEnvelope.artifactRefs;
+        currentEnvelope.contextRefs = mergedRootEnvelope.contextRefs;
+      }
       if (currentEnvelope && cfg.redisUrl && cfg.memberId && hasRequiredRedisTeamKeys(cfg)) {
         const responseLocale = trim(currentEnvelope.responseLocale || "zh-CN");
         const summary = responseLocale.toLowerCase().startsWith("zh")
           ? "已更新团队产物：" + resolved.canonical
           : "Team artifact updated: " + resolved.canonical;
+        const finalArtifact = isLeaderMember(cfg) && artifactScope === "team" && artifactKind === "final";
+        const inheritedWorkId = trim(currentEnvelope.assignmentId || currentEnvelope.workId);
         await withRedis(cfg, null, async (redis) => {
           await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "artifact_changed", currentEnvelope, {
             eventKind: "artifact_changed",
             artifactChanged: true,
+            artifactScope,
+            artifactKind: artifactKind || undefined,
             artifactRefs: [resolved.canonical],
+            workId: finalArtifact ? "leader-final-synthesis" : currentEnvelope.workId || currentEnvelope.assignmentId,
+            assignmentId: finalArtifact ? "leader-final-synthesis" : currentEnvelope.assignmentId || currentEnvelope.workId,
+            canonicalWorkId: finalArtifact ? "leader-final-synthesis" : currentEnvelope.assignmentId || currentEnvelope.workId,
+            sourceWorkId:
+              finalArtifact && inheritedWorkId && inheritedWorkId !== "leader-final-synthesis"
+                ? inheritedWorkId
+                : undefined,
+            phaseId: finalArtifact ? "phase-final-synthesis" : currentEnvelope.phaseId || currentEnvelope.currentPhaseId,
+            currentPhaseId: finalArtifact ? "phase-final-synthesis" : currentEnvelope.currentPhaseId || currentEnvelope.phaseId,
             status: "running",
             runtimeStatus: "running",
             rootTaskTerminal: false,
@@ -3030,10 +3133,11 @@ function createRuntime(api) {
       const canonicalWorkId = canonicalAssignmentId || undefined;
       // artifact_changed is transport-level and can be digested. Carry the
       // current canonical refs on the visible business-progress event too.
-      const artifactRefs = [...new Set([
+      const artifactRefs = await validateArtifactRefs(cfg, [
         ...(Array.isArray(params.artifactRefs) ? params.artifactRefs : []),
         ...activeArtifactRefs,
-      ].filter((value) => typeof value === "string" && isCanonicalTeamArtifactRef(value)))];
+        ...canonicalTeamArtifactRefsFromText(cfg, params.summary || params.detail || ""),
+      ]);
       params = Object.assign(
         {},
         params,
@@ -3090,7 +3194,19 @@ function createRuntime(api) {
         },
       );
       if (currentEnvelope && semanticEventKind === "leader_plan") {
-        currentEnvelope.planVersion = Number(params.planVersion || currentEnvelope.planVersion || 1);
+        const previousPlanVersion = Number(currentEnvelope.planVersion || 0);
+        const nextPlanVersion = Number(params.planVersion || previousPlanVersion || 1);
+        if (nextPlanVersion > previousPlanVersion) {
+          const rootTaskId = preferredRootTaskId(currentEnvelope.rootTaskId, currentEnvelope.taskId);
+          const planPrefix = rootTaskId ? `/team/results/${safeName(rootTaskId)}/plan/` : "";
+          if (planPrefix) {
+            currentEnvelope.artifactRefs = (Array.isArray(currentEnvelope.artifactRefs) ? currentEnvelope.artifactRefs : [])
+              .filter((ref) => !trim(ref).startsWith(planPrefix));
+            currentEnvelope.contextRefs = (Array.isArray(currentEnvelope.contextRefs) ? currentEnvelope.contextRefs : [])
+              .filter((ref) => !trim(ref).startsWith(planPrefix));
+          }
+        }
+        currentEnvelope.planVersion = nextPlanVersion;
         currentEnvelope.workflowState = params.workflowState || "executing";
         if (Array.isArray(params.phases) && params.phases.length > 0) {
           const firstActivePhase = params.phases.find((phase) =>
@@ -3100,7 +3216,7 @@ function createRuntime(api) {
             trim(firstActivePhase?.phaseId || firstActivePhase?.phase_id || firstActivePhase?.id || firstActivePhase?.name) ||
             currentEnvelope.currentPhaseId;
         }
-        await writeTaskEnvelope(cfg, currentEnvelope);
+        await mergeTaskEnvelopeArtifactContext(cfg, currentEnvelope, artifactRefs);
       }
       await ensureDirs(cfg);
       const status = await writeLocalStatus(cfg, {
@@ -3171,6 +3287,7 @@ function createRuntime(api) {
         params.workId = normalizedCompletionAssignmentId;
         params.canonicalWorkId = normalizedCompletionAssignmentId;
         params.currentPhaseId = params.currentPhaseId || params.current_phase_id || "phase-final-synthesis";
+        params.phaseId = params.phaseId || params.phase_id || params.currentPhaseId;
       }
       // A member confirmation must only describe that member's current
       // assignment. Scanning the whole Team root made a Reviewer claim the
@@ -3182,7 +3299,7 @@ function createRuntime(api) {
         ...(Array.isArray(params.artifactRefs) ? params.artifactRefs : []),
         ...activeArtifactRefs,
         ...discoveredArtifactRefs,
-        ...canonicalTeamArtifactRefsFromText(resultMarkdown),
+        ...canonicalTeamArtifactRefsFromText(cfg, resultMarkdown),
       ]);
       const resultContentHash = teamResultContentHash(resultMarkdown, artifactRefs);
       if (completionEnvelope && await isTaskTerminal(cfg, completionEnvelope)) {
@@ -3257,6 +3374,7 @@ function createRuntime(api) {
                 planVersion: params.planVersion ?? params.plan_version ?? completionEnvelope?.planVersion,
                 ledgerVersion: params.ledgerVersion ?? params.ledger_version ?? completionEnvelope?.ledgerVersion,
                 currentPhaseId: params.currentPhaseId || params.current_phase_id || completionEnvelope?.currentPhaseId,
+                phaseId: params.phaseId || params.phase_id || completionEnvelope?.phaseId,
                 completionStatus: params.status,
                 onAccepted: persistAcceptedFinalMirror,
               });
