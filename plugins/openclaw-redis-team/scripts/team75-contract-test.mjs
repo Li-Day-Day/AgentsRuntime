@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, appendRedisTeamCompletionGuidance, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext };\n";
+const testSource = source + "\nexport { normalizeEnvelope, appendRedisTeamCompletionGuidance, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -94,14 +94,52 @@ try {
   }));
   assert.equal(plan.ok, true);
   assert.equal(plan.artifact.path, "/team/results/team-75-task-150/plan/collaboration-plan.md");
+  const context = toolResult(await leaderTools.get("team_artifact_write").execute("context-write", {
+    scope: "team",
+    kind: "context",
+    path: "issue-146.md",
+    content: "# Issue 146 snapshot\n",
+  }));
+  assert.equal(context.ok, true);
+  assert.equal(context.artifact.path, "/team/results/team-75-task-150/context/issue-146.md");
+  assert.equal(
+    pluginModule.canonicalArtifactAlias(
+      { sharedDir: shared },
+      "/team/plan/collaboration-plan.md",
+      "team-75-task-150",
+    ),
+    "/team/results/team-75-task-150/plan/collaboration-plan.md",
+    "legacy plan aliases must resolve inside the current root task only",
+  );
+  const assignedWorkspace = pluginModule.sharedWorkspaceForTarget(
+    { sharedDir: shared, memberId: "leader" },
+    {},
+    "developer",
+    "team-75-task-150",
+    "dev-01",
+  );
+  assert.equal(
+    assignedWorkspace.assignmentArtifactCanonicalRoot,
+    "/team/artifacts/team-75-task-150/members/developer/dev-01",
+  );
+  assert.equal(
+    assignedWorkspace.taskWorkCanonicalRoot,
+    "/team/work/team-75-task-150",
+    "cross-member mutable inputs must be isolated by root task",
+  );
+  assert.equal(
+    assignedWorkspace.taskContextCanonicalRoot,
+    "/team/results/team-75-task-150/context",
+    "durable research context must remain inside the current root task",
+  );
   const persistedLeaderEnvelope = JSON.parse(await fs.readFile(
     path.join(state, "teams", "75", "leader", "tasks", "team-75-task-150.json"),
     "utf8",
   ));
   assert.deepEqual(
     persistedLeaderEnvelope.artifactRefs,
-    [plan.artifact.path],
-    "Leader plan refs must survive the tool turn in the persisted root envelope",
+    [plan.artifact.path, context.artifact.path],
+    "Leader plan and research context refs must survive tool turns in the persisted root envelope",
   );
   const upstreamRef = "/team/artifacts/team-75-task-150/members/researcher/research-01/result.md";
   await fs.mkdir(path.join(shared, "artifacts", "team-75-task-150", "members", "researcher", "research-01"), { recursive: true });
@@ -117,7 +155,7 @@ try {
   );
   assert.deepEqual(
     mergedLeaderEnvelope.artifactRefs,
-    [plan.artifact.path, upstreamRef],
+    [plan.artifact.path, context.artifact.path, upstreamRef],
     "context-only member results must accumulate without replacing the persisted Leader plan",
   );
   const legacyPlanWrite = toolResult(await leaderTools.get("team_artifact_write").execute("plan-write-legacy", {
