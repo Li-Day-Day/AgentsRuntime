@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, appendRedisTeamCompletionGuidance, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget };\n";
+const testSource = source + "\nexport { normalizeEnvelope, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -84,6 +84,71 @@ function resultContentHash(content, refs) {
 
 try {
   await fs.mkdir(shared, { recursive: true });
+  await fs.writeFile(path.join(shared, "team.json"), JSON.stringify({
+    version: 1,
+    teamId: "75",
+    rosterHash: "sha256:team-75-roster-v1",
+    leaderMemberId: "leader",
+    communicationMode: "leader_mediated",
+    members: [
+      { memberId: "leader", displayName: "Leader", role: "leader", effectiveRole: "leader", isLeader: true },
+      { memberId: "developer", displayName: "Developer", role: "developer", effectiveRole: "developer" },
+    ],
+  }), "utf8");
+  await fs.writeFile(
+    path.join(shared, "team-introduction.md"),
+    "# Team 启动介绍\n\nLeader coordinates the Developer.\n",
+    "utf8",
+  );
+  const leaderContextEnvelope = pluginModule.normalizeEnvelope({
+    teamId: "75",
+    from: "clawmanager",
+    to: "leader",
+    taskId: "team-75-task-149",
+    rootTaskId: "team-75-task-149",
+    messageId: "root-149",
+    metadata: {},
+  });
+  const fullLeaderContext = await pluginModule.appendLeaderTeamContext(
+    "Please inspect the team.",
+    { teamId: "75", memberId: "leader", role: "leader", sharedDir: shared },
+    leaderContextEnvelope,
+  );
+  assert.match(fullLeaderContext, /Managed Team operating introduction/);
+  assert.match(fullLeaderContext, /Leader coordinates the Developer/);
+  assert.match(fullLeaderContext, /sha256:team-75-roster-v1/);
+  const compactLeaderContext = await pluginModule.appendLeaderTeamContext(
+    "Please inspect the team again.",
+    { teamId: "75", memberId: "leader", role: "leader", sharedDir: shared },
+    { ...leaderContextEnvelope, taskId: "team-75-task-150", rootTaskId: "team-75-task-150", messageId: "root-150" },
+  );
+  assert.match(compactLeaderContext, /Managed Team roster snapshot/);
+  assert.doesNotMatch(compactLeaderContext, /Managed Team operating introduction/);
+  const workerContext = await pluginModule.appendLeaderTeamContext(
+    "Implement it.",
+    { teamId: "75", memberId: "developer", role: "developer", sharedDir: shared },
+    { ...leaderContextEnvelope, to: "developer", taskId: "team-75-task-151", rootTaskId: "team-75-task-151" },
+  );
+  assert.equal(workerContext, "Implement it.", "worker prompts must not receive Leader roster preloading");
+  const turnFinished = pluginModule.turnFinishedWithoutCompletionEvent(
+    { metadata: { completionRecoveryAttempt: 1 } },
+    { assistantNarratives: [{ text: "Final answer without tool receipt." }] },
+  );
+  assert.equal(turnFinished.eventKind, "turn_finished_without_completion");
+  assert.equal(turnFinished.activeTurnFinished, true);
+  assert.equal(turnFinished.hadAssistantNarrative, true);
+  assert.equal(turnFinished.hadOutboundAssignment, false);
+  assert.equal(turnFinished.completionRecoveryAttempt, 1);
+  assert.equal(
+    await pluginModule.shouldUseAssistantSessionFallback(
+      { teamId: "75", memberId: "leader", role: "leader", sharedDir: shared },
+      leaderContextEnvelope,
+      "A natural-language answer that did not call the completion tool.",
+    ),
+    false,
+    "Leader natural-language prose must never be converted directly into root success",
+  );
+
   await seedActive("leader", "leader", "leader-final-synthesis");
   const leaderTools = createHarness("leader", "leader");
   const plan = toolResult(await leaderTools.get("team_artifact_write").execute("plan-write", {
