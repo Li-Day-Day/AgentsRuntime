@@ -1484,8 +1484,9 @@ function resolveRedisTeamVerificationRole(envelope) {
   const role = trim(
     envelope?.effectiveRole ||
       envelope?.effective_role ||
-      envelope?.role ||
-      process.env.CLAWMANAGER_TEAM_ROLE,
+      process.env.CLAWMANAGER_TEAM_EFFECTIVE_ROLE ||
+      process.env.CLAWMANAGER_TEAM_ROLE ||
+      envelope?.role,
   ).toLowerCase();
   if (["reviewer", "qa", "qa-engineer", "evidence-collector"].includes(role)) return "evidence";
   if (role === "code-reviewer") return "code-review";
@@ -1493,12 +1494,73 @@ function resolveRedisTeamVerificationRole(envelope) {
   return "";
 }
 
+const REVIEW_BROWSER_MAX_CALLS = 4;
+const REVIEW_BROWSER_WINDOW_MS = 20_000;
+
+function directHttpVerificationUrl(value) {
+  const raw = trim(value);
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : "";
+  } catch {
+    return "";
+  }
+}
+
+function verificationTargetUrl(envelope) {
+  const declared = [
+    envelope?.verificationUrl,
+    envelope?.verification_url,
+    envelope?.metadata?.verificationUrl,
+    envelope?.metadata?.verification_url,
+  ];
+  for (const value of declared) {
+    const normalized = directHttpVerificationUrl(value);
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function reviewerBrowserToolDecision(envelope, event, state, now = Date.now()) {
+  if (trim(event?.toolName).toLowerCase() !== "browser" || !["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(envelope))) {
+    return {};
+  }
+  const targetUrl = verificationTargetUrl(envelope);
+  if (!targetUrl) {
+    return {
+      block: true,
+      blockReason: "No directly reachable HTTP(S) verification URL was provided. Continue immediately with static review; do not start a server or retry Browser setup.",
+    };
+  }
+  const guard = state || {};
+  if (!guard.startedAt) guard.startedAt = now;
+  if (now - guard.startedAt >= REVIEW_BROWSER_WINDOW_MS || Number(guard.calls || 0) >= REVIEW_BROWSER_MAX_CALLS) {
+    return {
+      block: true,
+      blockReason: "The single brief Browser verification budget is exhausted. Continue immediately with static review.",
+    };
+  }
+  const action = trim(event?.params?.action).toLowerCase();
+  if (["open", "navigate", "goto"].includes(action)) {
+    const requestedUrl = directHttpVerificationUrl(event?.params?.url || event?.params?.targetUrl);
+    if (!requestedUrl || requestedUrl !== targetUrl) {
+      return {
+        block: true,
+        blockReason: "Browser navigation is limited to the assignment's declared verification URL. Continue with static review instead of trying another target.",
+      };
+    }
+  }
+  guard.calls = Number(guard.calls || 0) + 1;
+  return { state: guard };
+}
+
 function redisTeamVerificationGuidance(envelope) {
   switch (resolveRedisTeamVerificationRole(envelope)) {
     case "evidence":
-      return "Evidence verification policy: use source, artifacts, and tools already available. Browser verification is optional unless explicitly required; attempt Browser startup at most twice and spend at most 45 seconds total on Browser setup. Never install or download browsers, drivers, test frameworks, package dependencies, or system packages for verification. If Browser remains unavailable, record browserVerification=unavailable and continue with static/manual checks. Report only actual findings; do not target a fixed issue count.";
+      return "Evidence verification policy: use source and existing artifacts first. If this assignment provides a directly reachable HTTP(S) verification URL, perform one brief Browser check. Otherwise, or after any Browser/environment error, immediately continue with static review. Never install dependencies, start a temporary server, bypass navigation policy, or retry Browser setup. Environment limitations are not product defects. Say Browser verification passed only when it actually ran; otherwise report static-review scope. When completing a review assignment, set reviewVerdict to pass or fail and identify the exact reviewedAssignmentId and reviewedRevision from the assignment.";
     case "code-review":
-      return "Code review policy: review source, diffs, architecture boundaries, and existing test evidence first. Keep review proportional and report only concrete findings. Do not create a new test environment or install/download browsers, drivers, frameworks, package dependencies, or system packages. Browser is normally unnecessary; if explicitly useful and ready, attempt startup at most twice and stop Browser setup after 45 seconds before continuing with source review.";
+      return "Code review policy: review source, diffs, architecture boundaries, and existing evidence first. Use Browser only for one brief check when this assignment provides a directly reachable HTTP(S) verification URL. On any Browser/environment error, immediately continue with static review. Never install dependencies, start a temporary server, bypass navigation policy, or retry Browser setup. When completing a review assignment, set reviewVerdict to pass or fail and identify the exact reviewedAssignmentId and reviewedRevision from the assignment.";
     case "api-test":
       return "API verification policy: use existing HTTP tools, available endpoints, artifacts, and static contract review. Browser verification is not required. Never install or download Postman, Newman, browsers, test frameworks, package dependencies, or system packages. If the service or network target is unavailable, record the limit and continue with static contract checks; report only directly observed reproducible failures.";
     default:
@@ -1538,7 +1600,7 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
     `Output language rule: use ${locale} for every user-visible plan, assignment, progress summary, resultMarkdown, and final synthesis. Preserve source code, API names, file names, and necessary technical terms in their original form.`,
     "Shared artifact rule: prefer team_artifact_write/read/list/mkdir. These tools enforce current-Team isolation and cooperative permissions. The /team prefix is only the canonical link returned to ClawManager in pooled Lite runtimes.",
     "Assignment output rule: if this is a Worker assignment, its injected assignment artifact root is authoritative. A Team-root output path written in the natural-language assignment is only a requested filename/legacy alias and must not override the assignment root. Do not write cross-member deliverables to pooled Runtime /tmp.",
-    "Verification truth rule: if browser or DOM verification did not run because the sandbox/browser is unavailable, record browserVerification=unavailable and continue with available static/manual checks; do not fail or block an otherwise satisfactory delivery for that environment limitation alone. Never call that a browser pass. Fail only a reproducible product defect, and revalidate after changing an artifact.",
+    "Verification truth rule: an environment or Browser limitation is not a product defect. Continue with available static checks and say Browser verification passed only when it actually ran.",
     "Risk waiver rule: a failed or stale required assignment blocks root success unless the Leader records assignmentId, reason, and accepted risk in team_complete_task. Never waive work that is still running or pending.",
     "Optional-work rule: optional work may be omitted, but every omitted optional assignment must be listed in skippedAssignments with assignmentId and a concrete reason.",
     "Never list, search, resolve, or scan the parent of the current Team shared directory, and never inspect sibling Team directories.",
@@ -2223,6 +2285,34 @@ async function readCurrentRootWorkflowState(redis, cfg, rootTaskId) {
   }
 }
 
+function rootWorkflowStateIsTerminal(state) {
+  if (!state || typeof state !== "object") return false;
+  if (state.terminal === true) return true;
+  return ["succeeded", "failed", "cancelled", "completed"].includes(
+    trim(state.status || state.workflowState || state.workflow_state).toLowerCase(),
+  );
+}
+
+async function rootEnvelopeIsTerminal(cfg, envelope, redis = null) {
+  const rootTaskId = preferredRootTaskId(envelope?.rootTaskId, envelope?.taskId);
+  if (!rootTaskId || !cfg?.redisUrl) return false;
+  if (redis) {
+    return rootWorkflowStateIsTerminal(await readCurrentRootWorkflowState(redis, cfg, rootTaskId));
+  }
+  const client = new RedisClient(cfg.redisUrl);
+  try {
+    await client.connect();
+    return rootWorkflowStateIsTerminal(await readCurrentRootWorkflowState(client, cfg, rootTaskId));
+  } catch {
+    // Old ClawManager images may not publish root state. Compatibility and
+    // transient Redis failures remain fail-open; the App terminal barrier is
+    // the second line of defense.
+    return false;
+  } finally {
+    client.close();
+  }
+}
+
 function statusIsActiveAssignment(status) {
   const availability = trim(status?.availability).toLowerCase();
   const runtimeStatus = trim(status?.runtimeStatus).toLowerCase();
@@ -2420,6 +2510,28 @@ function normalizeEnvelope(raw) {
     revision: Math.max(1, intFrom(raw.revision ?? raw.metadata?.revision, 1)),
     required: raw.required === undefined ? true : boolFrom(raw.required, true),
     reviewRequired: boolFrom(raw.reviewRequired ?? raw.review_required ?? raw.metadata?.reviewRequired, false),
+    reviewedAssignmentId:
+      raw.reviewedAssignmentId ||
+      raw.reviewed_assignment_id ||
+      raw.metadata?.reviewedAssignmentId ||
+      raw.metadata?.reviewed_assignment_id,
+    reviewedRevision: Math.max(
+      0,
+      intFrom(
+        raw.reviewedRevision ??
+          raw.reviewed_revision ??
+          raw.metadata?.reviewedRevision ??
+          raw.metadata?.reviewed_revision,
+        0,
+      ),
+    ) || undefined,
+    verificationUrl:
+      directHttpVerificationUrl(
+        raw.verificationUrl ||
+          raw.verification_url ||
+          raw.metadata?.verificationUrl ||
+          raw.metadata?.verification_url,
+      ) || undefined,
     monitorPolicy: normalizeMonitorPolicy(raw.monitorPolicy || raw.monitor_policy || raw.metadata?.monitorPolicy || raw.metadata?.monitor_policy),
     requiresCompletion: raw.requiresCompletion !== false,
     completionTool: raw.completionTool || "team_complete_task",
@@ -2732,6 +2844,16 @@ function createRuntime(api) {
         artifactRefs,
         artifactMetadata,
         reviewedArtifactRefs: Array.isArray(meta.reviewedArtifactRefs) ? meta.reviewedArtifactRefs : undefined,
+        reviewedAssignmentId:
+          trim(meta.reviewedAssignmentId || meta.reviewed_assignment_id || envelope.reviewedAssignmentId) || undefined,
+        reviewedRevision:
+          Math.max(
+            0,
+            intFrom(meta.reviewedRevision ?? meta.reviewed_revision ?? envelope.reviewedRevision, 0),
+          ) || undefined,
+        reviewVerdict: ["pass", "fail"].includes(trim(meta.reviewVerdict || meta.review_verdict).toLowerCase())
+          ? trim(meta.reviewVerdict || meta.review_verdict).toLowerCase()
+          : undefined,
       });
       const streamId = await xaddJson(redis, eventsKey(cfg), proposal);
       const ack = await waitForCompletionAcknowledgement(
@@ -2997,6 +3119,10 @@ function createRuntime(api) {
       "phase-1";
     const revision = Math.max(1, intFrom(params.revision, 1));
     const requiredForRoot = params.required === undefined ? true : boolFrom(params.required, true);
+    const verificationUrl =
+      directHttpVerificationUrl(params.verificationUrl || params.verification_url) ||
+      verificationTargetUrl(inferredEnvelope) ||
+      verificationTargetUrl(activeEnvelope);
     assertResponseLocale(responseLocale, text, "Team assignment");
     const inheritedContextRefs = [...new Set([
       ...(Array.isArray(params.contextRefs) ? params.contextRefs : []),
@@ -3032,6 +3158,11 @@ function createRuntime(api) {
     if (trim(sharedWorkspace.taskContextPhysicalRoot)) {
       await mkdirBestEffort(sharedWorkspace.taskContextPhysicalRoot, TEAM_SHARED_DIR_MODE, "task-scoped context directory");
     }
+    const reviewedAssignmentId = trim(params.reviewedAssignmentId || params.reviewed_assignment_id);
+    const dependsOn = [...new Set([
+      ...(Array.isArray(params.dependsOn) ? params.dependsOn : []),
+      reviewedAssignmentId,
+    ].map(trim).filter(Boolean))];
     const message = {
       v: WIRE_SCHEMA_VERSION,
       protocolVersion: PROTOCOL_VERSION,
@@ -3053,7 +3184,10 @@ function createRuntime(api) {
       revision,
       required: requiredForRoot,
       reviewRequired: boolFrom(params.reviewRequired ?? params.review_required, false),
-      dependsOn: Array.isArray(params.dependsOn) ? params.dependsOn.filter(Boolean) : [],
+      reviewedAssignmentId: reviewedAssignmentId || undefined,
+      reviewedRevision: Math.max(0, intFrom(params.reviewedRevision ?? params.reviewed_revision, 0)) || undefined,
+      verificationUrl: verificationUrl || undefined,
+      dependsOn,
 	  planVersion: Number(params.planVersion ?? params.plan_version ?? inferredEnvelope?.planVersion ?? activeEnvelope?.planVersion ?? 1),
 	  ledgerVersion: Number(params.ledgerVersion ?? params.ledger_version ?? inferredEnvelope?.ledgerVersion ?? activeEnvelope?.ledgerVersion ?? 0),
 	  workflowState: "executing",
@@ -3080,6 +3214,13 @@ function createRuntime(api) {
     const redis = new RedisClient(cfg.redisUrl);
     await redis.connect();
     try {
+      if (await rootEnvelopeIsTerminal(cfg, message, redis)) {
+        return Object.assign({}, message, {
+          sent: false,
+          ignored: true,
+          reason: "already_terminal",
+        });
+      }
       if (target.route === "unknown") {
         const failureEvent = inferredEnvelope
           ? taskEvent(cfg, "message_failed", inferredEnvelope, {
@@ -3126,6 +3267,9 @@ function createRuntime(api) {
         revision: message.revision,
         required: message.required,
         reviewRequired: message.reviewRequired,
+        reviewedAssignmentId: message.reviewedAssignmentId,
+        reviewedRevision: message.reviewedRevision,
+        verificationUrl: message.verificationUrl,
         dependsOn: message.dependsOn,
         planVersion: message.planVersion,
         ledgerVersion: message.ledgerVersion,
@@ -3200,6 +3344,14 @@ function createRuntime(api) {
   }
 
   return {
+    beforeBrowserToolCall(event, state, now) {
+      return reviewerBrowserToolDecision(activeEnvelope, event, state, now);
+    },
+
+    async isRootTaskTerminal(cfg, envelope) {
+      return rootEnvelopeIsTerminal(cfg, envelope);
+    },
+
     isActiveTaskCompleted(taskId) {
       return activeTaskMatches(taskId) && activeTaskCompleted;
     },
@@ -3744,6 +3896,9 @@ function createRuntime(api) {
                 contentHash: resultContentHash,
                 artifactRefs,
                 reviewedArtifactRefs: params.reviewedArtifactRefs || params.reviewed_artifact_refs || [],
+                reviewedAssignmentId: params.reviewedAssignmentId || params.reviewed_assignment_id,
+                reviewedRevision: params.reviewedRevision ?? params.reviewed_revision,
+                reviewVerdict: params.reviewVerdict || params.review_verdict,
                 workId: normalizedCompletionAssignmentId,
                 assignmentId: normalizedCompletionAssignmentId,
                 attemptId: params.attemptId || params.attempt_id,
@@ -3970,6 +4125,9 @@ const teamSendParameters = {
     revision: { type: "number", minimum: 1, description: "Assignment/artifact revision" },
     required: { type: "boolean", description: "Whether this assignment blocks root completion" },
     reviewRequired: { type: "boolean", description: "Whether the latest revision requires review before root completion" },
+    reviewedAssignmentId: { type: "string", description: "For a Reviewer assignment, the existing business assignment being reviewed" },
+    reviewedRevision: { type: "number", minimum: 1, description: "For a Reviewer assignment, the exact target revision" },
+    verificationUrl: { type: "string", description: "Optional directly reachable HTTP(S) URL for one brief Browser check" },
     planVersion: { type: "number", minimum: 0 },
     ledgerVersion: { type: "number", minimum: 0 },
     dependsOn: { type: "array", items: { type: "string" } },
@@ -4043,6 +4201,9 @@ const completeParameters = {
       description: "Optional exact artifact paths reviewed by this completion; advisory and non-blocking",
       items: { type: "string" },
     },
+    reviewedAssignmentId: { type: "string", description: "Reviewer-only target assignment validated by this result" },
+    reviewedRevision: { type: "number", minimum: 1, description: "Reviewer-only exact target revision validated by this result" },
+    reviewVerdict: { type: "string", enum: ["pass", "fail"], description: "Reviewer-only structured verdict; PASS is required to close a review gate" },
     completionId: { type: "string" },
     attemptId: { type: "string" },
     rootTaskId: { type: "string" },
@@ -4161,6 +4322,47 @@ export default definePluginEntry({
   register(api) {
     const runtime = createRuntime(api);
     const consumerHandles = new Map();
+    const reviewerBrowserGuards = new Map();
+
+    api.on(
+      "before_tool_call",
+      async (event, ctx) => {
+        if (trim(event?.toolName).toLowerCase() !== "browser") return;
+        const guardKey = trim(event?.runId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId || "active-review");
+        const current = reviewerBrowserGuards.get(guardKey) || { calls: 0, startedAt: 0 };
+        const decision = runtime.beforeBrowserToolCall(event, current, Date.now());
+        if (decision?.state) reviewerBrowserGuards.set(guardKey, decision.state);
+        if (reviewerBrowserGuards.size > 256) {
+          const cutoff = Date.now() - 5 * 60_000;
+          for (const [key, value] of reviewerBrowserGuards) {
+            if (Number(value?.startedAt || 0) < cutoff) reviewerBrowserGuards.delete(key);
+          }
+        }
+        if (decision?.block) {
+          return { block: true, blockReason: decision.blockReason };
+        }
+      },
+      { priority: 100, timeoutMs: 1000 },
+    );
+    api.on(
+      "after_tool_call",
+      async (event, ctx) => {
+        if (trim(event?.toolName).toLowerCase() !== "browser") return;
+        const guardKey = trim(event?.runId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId || "active-review");
+        const current = reviewerBrowserGuards.get(guardKey);
+        if (!current) return;
+        if (
+          trim(event?.error || event?.result?.error) ||
+          event?.isError === true ||
+          event?.result?.isError === true ||
+          Number(event?.durationMs || event?.result?.durationMs || 0) >= REVIEW_BROWSER_WINDOW_MS
+        ) {
+          current.calls = REVIEW_BROWSER_MAX_CALLS;
+          reviewerBrowserGuards.set(guardKey, current);
+        }
+      },
+      { priority: 100, timeoutMs: 1000 },
+    );
 
     function createConsumerEntry() {
       let resolveStopped = () => {};
@@ -4604,6 +4806,19 @@ export default definePluginEntry({
                       connected: true,
                       lastConnectedAt: Date.now(),
                       statusState: "online",
+                    });
+                    return;
+                  }
+
+                  if (await runtime.isRootTaskTerminal(cfg, envelope)) {
+                    ctx.log?.info?.(
+                      "redis-team: ignored late assignment for terminal root before Agent dispatch " +
+                        envelope.messageId,
+                    );
+                    await writeLocalStatus(cfg, {
+                      availability: "idle",
+                      runtimeStatus: "succeeded",
+                      lastContextAt: nowIso(),
                     });
                     return;
                   }

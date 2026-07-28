@@ -118,14 +118,19 @@ for (const token of [
   "Evidence verification policy:",
   "Code review policy:",
   "API verification policy:",
-  "attempt Browser startup at most twice",
-  "at most 45 seconds total on Browser setup",
-  "Never install or download browsers",
+  "reviewerBrowserToolDecision",
+  "No directly reachable HTTP(S) verification URL was provided",
+  "single brief Browser verification budget is exhausted",
+  "ignored late assignment for terminal root before Agent dispatch",
+  "reviewVerdict",
 ]) {
   if (!dist.includes(token)) throw new Error(`dist/index.js missing Redis Team completion token: ${token}`);
 }
 if (dist.includes("params.taskId === activeEnvelope.taskId")) {
   throw new Error("dist/index.js must match active Redis Team task ids through aliases");
+}
+if (dist.includes("browserVerification=unavailable")) {
+  throw new Error("Reviewer guidance must not expose browserVerification=unavailable as a user-facing verdict");
 }
 const verificationRoleResolverStart = dist.indexOf("function resolveRedisTeamVerificationRole");
 const verificationRoleResolverEnd = dist.indexOf("function redisTeamVerificationGuidance", verificationRoleResolverStart);

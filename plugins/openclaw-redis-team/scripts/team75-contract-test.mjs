@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget };\n";
+const testSource = source + "\nexport { normalizeEnvelope, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, rootWorkflowStateIsTerminal };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -40,6 +40,7 @@ function createHarness(memberId, role) {
     registerTool(tool) {
       registered.set(tool.name, tool);
     },
+    on() {},
     registerChannel() {},
   });
   return registered;
@@ -117,6 +118,52 @@ try {
   assert.match(fullLeaderContext, /Managed Team operating introduction/);
   assert.match(fullLeaderContext, /Leader coordinates the Developer/);
   assert.match(fullLeaderContext, /sha256:team-75-roster-v1/);
+  const staticOnlyBrowser = pluginModule.reviewerBrowserToolDecision(
+    { role: "reviewer", taskId: "team-75-task-149", text: "Review the local HTML artifact." },
+    { toolName: "browser", params: { action: "start" } },
+    {},
+    1000,
+  );
+  assert.equal(staticOnlyBrowser.block, true);
+  assert.match(staticOnlyBrowser.blockReason, /static review/);
+  assert.equal(
+    pluginModule.verificationTargetUrl({
+      role: "reviewer",
+      text: "Read https://example.com as source material, but no verification target was declared.",
+    }),
+    "",
+    "ordinary URLs in assignment prose must not trigger Browser verification",
+  );
+  const browserState = {};
+  const browserEnvelope = pluginModule.normalizeEnvelope({
+    role: "reviewer",
+    taskId: "team-75-task-149",
+    reviewedAssignmentId: "dev-01",
+    reviewedRevision: 2,
+    verificationUrl: "https://example.com/review",
+  });
+  assert.equal(browserEnvelope.reviewedAssignmentId, "dev-01");
+  assert.equal(browserEnvelope.reviewedRevision, 2);
+  assert.equal(browserEnvelope.verificationUrl, "https://example.com/review");
+  for (let index = 0; index < 4; index += 1) {
+    const decision = pluginModule.reviewerBrowserToolDecision(
+      browserEnvelope,
+      { toolName: "browser", params: { action: index === 1 ? "open" : "snapshot", url: index === 1 ? "https://example.com/review" : undefined } },
+      browserState,
+      1000 + index,
+    );
+    assert.notEqual(decision.block, true);
+  }
+  const exhaustedBrowser = pluginModule.reviewerBrowserToolDecision(
+    browserEnvelope,
+    { toolName: "browser", params: { action: "snapshot" } },
+    browserState,
+    1005,
+  );
+  assert.equal(exhaustedBrowser.block, true);
+  assert.equal(pluginModule.rootWorkflowStateIsTerminal({ terminal: true }), true);
+  assert.equal(pluginModule.rootWorkflowStateIsTerminal({ status: "succeeded" }), true);
+  assert.equal(pluginModule.rootWorkflowStateIsTerminal({ status: "running" }), false);
   const compactLeaderContext = await pluginModule.appendLeaderTeamContext(
     "Please inspect the team again.",
     { teamId: "75", memberId: "leader", role: "leader", sharedDir: shared },
