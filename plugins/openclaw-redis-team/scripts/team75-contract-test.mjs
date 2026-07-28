@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, rootWorkflowStateIsTerminal };\n";
+const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, browserToolCallFailed, rootWorkflowStateIsTerminal };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -16,6 +16,9 @@ const root = await fs.mkdtemp(path.join(os.tmpdir(), "redis-team-75-"));
 const state = path.join(root, "state");
 const shared = path.join(root, "shared");
 process.env.XDG_STATE_HOME = state;
+process.env.CLAWMANAGER_TEAM_TOKEN = "team-75-preview-secret";
+process.env.CLAWMANAGER_TEAM_ID = "75";
+process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://clawmanager-team-preview.invalid";
 
 function createHarness(memberId, role) {
   const registered = new Map();
@@ -118,14 +121,13 @@ try {
   assert.match(fullLeaderContext, /Managed Team operating introduction/);
   assert.match(fullLeaderContext, /Leader coordinates the Developer/);
   assert.match(fullLeaderContext, /sha256:team-75-roster-v1/);
-  const staticOnlyBrowser = pluginModule.reviewerBrowserToolDecision(
+  const reviewerBrowserWithoutDeclaredTarget = pluginModule.reviewerBrowserToolDecision(
     { role: "reviewer", taskId: "team-75-task-149", text: "Review the local HTML artifact." },
     { toolName: "browser", params: { action: "start" } },
     {},
     1000,
   );
-  assert.equal(staticOnlyBrowser.block, true);
-  assert.match(staticOnlyBrowser.blockReason, /static review/);
+  assert.notEqual(reviewerBrowserWithoutDeclaredTarget.block, true);
   assert.equal(
     pluginModule.verificationTargetUrl({
       role: "reviewer",
@@ -161,6 +163,32 @@ try {
     1005,
   );
   assert.equal(exhaustedBrowser.block, true);
+  assert.equal(pluginModule.browserToolCallFailed({
+    result: {
+      content: [{ type: "text", text: JSON.stringify({ status: "error", tool: "browser", error: "navigation blocked" }) }],
+    },
+  }), true);
+  assert.equal(pluginModule.browserToolCallFailed({
+    result: { content: [{ type: "text", text: JSON.stringify({ status: "ok", title: "Rendered" }) }] },
+  }), false);
+  assert.deepEqual(
+    pluginModule.normalizePhaseDispositions([
+      { phaseId: "phase-2", decision: "skipped", reason: "Phase 1 fully satisfied the goal." },
+      { phaseId: "phase-2", decision: "cancelled", reason: "duplicate must be ignored" },
+      { phaseId: "phase-3", decision: "completed", reason: "invalid disposition" },
+      { phaseId: "phase-4", decision: "superseded", reason: "" },
+    ]),
+    [{ phaseId: "phase-2", decision: "skipped", reason: "Phase 1 fully satisfied the goal." }],
+  );
+  for (let index = 0; index < 8; index += 1) {
+    const developerBrowser = pluginModule.reviewerBrowserToolDecision(
+      { role: "developer", taskId: "team-75-task-149" },
+      { toolName: "browser", params: { action: "snapshot" } },
+      {},
+      2000 + index,
+    );
+    assert.notEqual(developerBrowser.block, true, "Developer Browser must not inherit the Reviewer budget");
+  }
   assert.equal(pluginModule.rootWorkflowStateIsTerminal({ terminal: true }), true);
   assert.equal(pluginModule.rootWorkflowStateIsTerminal({ status: "succeeded" }), true);
   assert.equal(pluginModule.rootWorkflowStateIsTerminal({ status: "running" }), false);
@@ -350,6 +378,16 @@ try {
   assert.equal(englishProgress.ok, true, "locale mismatch must remain non-blocking");
 
   await fs.writeFile(path.join(shared, "index.html"), "<!doctype html><title>Team 75</title>", "utf8");
+  const preview = toolResult(await developerTools.get("team_artifact_preview").execute("preview-index", {
+    scope: "team",
+    path: "index.html",
+  }));
+  assert.equal(preview.ok, true);
+  assert.equal(preview.artifact.path, "/team/index.html");
+  assert.match(
+    preview.artifact.previewUrl,
+    /^http:\/\/clawmanager-team-preview\.invalid\/v1\/75\/_\/[A-Za-z0-9_-]+\/index\.html$/,
+  );
   const truncatedRead = toolResult(await developerTools.get("team_artifact_read").execute("read-truncated", {
     scope: "team",
     path: "index.html",

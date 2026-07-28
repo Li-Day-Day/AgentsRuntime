@@ -69,6 +69,8 @@ for (const token of [
   "artifact_changed",
   "waivers",
   "skippedAssignments",
+  "phaseDispositions",
+  "explicit-disposition-v1",
   "completion_pending",
   "waiting_completion",
   "resultMarkdown",
@@ -78,6 +80,7 @@ for (const token of [
   "assignment-",
   "team_artifact_write",
   "team_artifact_read",
+  "team_artifact_preview",
   "team_artifact_list",
   "team_artifact_mkdir",
   "assertNoArtifactSymlinkTraversal",
@@ -119,7 +122,8 @@ for (const token of [
   "Code review policy:",
   "API verification policy:",
   "reviewerBrowserToolDecision",
-  "No directly reachable HTTP(S) verification URL was provided",
+  "browserToolCallFailed",
+  "Team artifact Browser preview",
   "single brief Browser verification budget is exhausted",
   "ignored late assignment for terminal root before Agent dispatch",
   "reviewVerdict",
@@ -168,7 +172,7 @@ if (deliverBody.includes("completeActiveTask") || deliverBody.includes('"task_co
 if (!deliverBody.includes("runtime.isActiveTaskCompleted")) {
   throw new Error("normal Redis Team replies must be suppressed after explicit completion");
 }
-for (const tool of ["team_artifact_write", "team_artifact_read", "team_artifact_list", "team_artifact_mkdir"]) {
+for (const tool of ["team_artifact_write", "team_artifact_read", "team_artifact_preview", "team_artifact_list", "team_artifact_mkdir"]) {
   if (!manifest.contracts?.tools?.includes(tool)) {
     throw new Error(`openclaw.plugin.json missing tool contract: ${tool}`);
   }

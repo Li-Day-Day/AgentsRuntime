@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -19,6 +19,8 @@ const PROTOCOL_VERSION = 3;
 const COMPLETION_SOURCE = "team_complete_task";
 const TEAM_SHARED_DIR_MODE = 0o2775;
 const RUNTIME_PRIVATE_DIR_MODE = 0o700;
+const TEAM_PREVIEW_HOST = "clawmanager-team-preview.invalid";
+const PHASE_DISPOSITION_POLICY = "explicit-disposition-v1";
 const ACTIVE_ASSIGNMENT_LEASE_MS = 6 * 60 * 60 * 1000;
 const SYSTEM_REPLY_TARGETS = new Set([
   "clawmanager",
@@ -162,6 +164,22 @@ function completionStateKey(cfg, completionId) {
 }
 function rootWorkflowStateKey(cfg, rootTaskId) {
   return keyPrefix(cfg) + ":root:" + redisKeyPart(rootTaskId) + ":state";
+}
+
+function normalizePhaseDispositions(value) {
+  if (!Array.isArray(value)) return [];
+  const result = [];
+  const seen = new Set();
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") continue;
+    const phaseId = trim(entry.phaseId || entry.phase_id || entry.id);
+    const decision = trim(entry.decision || entry.status).toLowerCase();
+    const reason = trim(entry.reason);
+    if (!phaseId || !reason || !["cancelled", "skipped", "superseded"].includes(decision) || seen.has(phaseId)) continue;
+    seen.add(phaseId);
+    result.push({ phaseId, decision, reason });
+  }
+  return result;
 }
 function assignmentActivityKey(cfg, rootTaskId, assignmentId) {
   return [
@@ -786,6 +804,60 @@ function canonicalArtifactRef(cfg, file) {
     throw new Error("artifact path escaped Redis Team shared directory: " + file);
   }
   return "/team/" + relative.split(path.sep).join("/");
+}
+
+function previewUrlForTeamArtifact(cfg, file) {
+  const originValue = trim(process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN) || `http://${TEAM_PREVIEW_HOST}`;
+  const token = trim(process.env.CLAWMANAGER_TEAM_TOKEN);
+  const teamId = trim(cfg?.teamId || process.env.CLAWMANAGER_TEAM_ID);
+  if (!originValue || !token || !teamId) {
+    throw new Error("Team artifact Browser preview is unavailable in this Runtime");
+  }
+  let origin;
+  try {
+    origin = new URL(originValue);
+  } catch {
+    throw new Error("Team artifact Browser preview origin is invalid");
+  }
+  if (origin.protocol !== "http:" || origin.hostname.toLowerCase() !== TEAM_PREVIEW_HOST) {
+    throw new Error("Team artifact Browser preview origin is not managed by ClawManager");
+  }
+
+  const root = path.resolve(cfg.sharedDir);
+  const relative = path.relative(root, path.resolve(file));
+  if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
+    throw new Error("artifact path escaped Redis Team shared directory: " + file);
+  }
+  const relativeParts = relative.split(path.sep).filter(Boolean);
+  if (!relativeParts.length) throw new Error("Team artifact preview requires a file");
+
+  const signedPrefix = relativeParts.slice(0, -1).join("/");
+  const encodedPrefix = signedPrefix
+    ? Buffer.from(signedPrefix, "utf8").toString("base64url")
+    : "_";
+  const payload = `team-preview-v1\n${teamId}\n${signedPrefix}`;
+  const signature = createHmac("sha256", token).update(payload).digest("base64url");
+  origin.pathname = [
+    "v1",
+    encodeURIComponent(teamId),
+    encodedPrefix,
+    signature,
+    encodeURIComponent(relativeParts.at(-1)),
+  ].join("/");
+  origin.search = "";
+  origin.hash = "";
+  return { url: origin.toString() };
+}
+
+function optionalPreviewFields(cfg, file) {
+  try {
+    const preview = previewUrlForTeamArtifact(cfg, file);
+    return {
+      previewUrl: preview.url,
+    };
+  } catch {
+    return {};
+  }
 }
 
 function isCanonicalTeamArtifactRef(value) {
@@ -1526,13 +1598,6 @@ function reviewerBrowserToolDecision(envelope, event, state, now = Date.now()) {
   if (trim(event?.toolName).toLowerCase() !== "browser" || !["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(envelope))) {
     return {};
   }
-  const targetUrl = verificationTargetUrl(envelope);
-  if (!targetUrl) {
-    return {
-      block: true,
-      blockReason: "No directly reachable HTTP(S) verification URL was provided. Continue immediately with static review; do not start a server or retry Browser setup.",
-    };
-  }
   const guard = state || {};
   if (!guard.startedAt) guard.startedAt = now;
   if (now - guard.startedAt >= REVIEW_BROWSER_WINDOW_MS || Number(guard.calls || 0) >= REVIEW_BROWSER_MAX_CALLS) {
@@ -1541,26 +1606,45 @@ function reviewerBrowserToolDecision(envelope, event, state, now = Date.now()) {
       blockReason: "The single brief Browser verification budget is exhausted. Continue immediately with static review.",
     };
   }
-  const action = trim(event?.params?.action).toLowerCase();
-  if (["open", "navigate", "goto"].includes(action)) {
-    const requestedUrl = directHttpVerificationUrl(event?.params?.url || event?.params?.targetUrl);
-    if (!requestedUrl || requestedUrl !== targetUrl) {
-      return {
-        block: true,
-        blockReason: "Browser navigation is limited to the assignment's declared verification URL. Continue with static review instead of trying another target.",
-      };
-    }
-  }
   guard.calls = Number(guard.calls || 0) + 1;
   return { state: guard };
+}
+
+function browserToolCallFailed(event) {
+  if (
+    trim(event?.error) ||
+    event?.isError === true ||
+    trim(event?.result?.error) ||
+    event?.result?.isError === true
+  ) {
+    return true;
+  }
+  const inspect = (value, depth = 0) => {
+    if (depth > 4 || value == null) return false;
+    if (typeof value === "string") {
+      const raw = value.trim();
+      if (!raw || (!raw.startsWith("{") && !raw.startsWith("["))) return false;
+      try {
+        return inspect(JSON.parse(raw), depth + 1);
+      } catch {
+        return false;
+      }
+    }
+    if (Array.isArray(value)) return value.some((item) => inspect(item, depth + 1));
+    if (typeof value !== "object") return false;
+    const status = trim(value.status).toLowerCase();
+    if (value.isError === true || ["error", "failed", "blocked"].includes(status) || trim(value.error)) return true;
+    return Object.values(value).some((item) => inspect(item, depth + 1));
+  };
+  return inspect(event?.result) || inspect(event?.output);
 }
 
 function redisTeamVerificationGuidance(envelope) {
   switch (resolveRedisTeamVerificationRole(envelope)) {
     case "evidence":
-      return "Evidence verification policy: use source and existing artifacts first. If this assignment provides a directly reachable HTTP(S) verification URL, perform one brief Browser check. Otherwise, or after any Browser/environment error, immediately continue with static review. Never install dependencies, start a temporary server, bypass navigation policy, or retry Browser setup. Environment limitations are not product defects. Say Browser verification passed only when it actually ran; otherwise report static-review scope. When completing a review assignment, set reviewVerdict to pass or fail and identify the exact reviewedAssignmentId and reviewedRevision from the assignment.";
+      return "Evidence verification policy: use source and existing artifacts first. Browser is available, including for Team files through team_artifact_preview, but use it only when interaction or visual evidence materially affects the verdict. For non-code or non-interactive review, proceed directly with static review. After any Browser/environment error or when the brief Browser budget is exhausted, immediately continue with static review; do not install dependencies, start a temporary server, bypass navigation policy, or retry setup. Say Browser verification passed only when it actually ran; otherwise report static-review scope. When completing a review assignment, set reviewVerdict to pass or fail and identify the exact reviewedAssignmentId and reviewedRevision from the assignment.";
     case "code-review":
-      return "Code review policy: review source, diffs, architecture boundaries, and existing evidence first. Use Browser only for one brief check when this assignment provides a directly reachable HTTP(S) verification URL. On any Browser/environment error, immediately continue with static review. Never install dependencies, start a temporary server, bypass navigation policy, or retry Browser setup. When completing a review assignment, set reviewVerdict to pass or fail and identify the exact reviewedAssignmentId and reviewedRevision from the assignment.";
+      return "Code review policy: review source, diffs, architecture boundaries, and existing evidence first. Browser is available, including for Team files through team_artifact_preview, but keep verification brief and use it only when interaction or rendering affects the verdict. On any Browser/environment error or when the brief Browser budget is exhausted, immediately continue with static review. Never install dependencies, start a temporary server, bypass navigation policy, or retry setup. When completing a review assignment, set reviewVerdict to pass or fail and identify the exact reviewedAssignmentId and reviewedRevision from the assignment.";
     case "api-test":
       return "API verification policy: use existing HTTP tools, available endpoints, artifacts, and static contract review. Browser verification is not required. Never install or download Postman, Newman, browsers, test frameworks, package dependencies, or system packages. If the service or network target is unavailable, record the limit and continue with static contract checks; report only directly observed reproducible failures.";
     default:
@@ -1598,11 +1682,12 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
     "Redis Team delivery rule: finish this assignment by calling team_complete_task with status=\"succeeded\", a concise summary, and resultMarkdown containing the answer. A normal chat answer may stay private in OpenClaw and not reach ClawManager. Do not send the same completed deliverable with team_send as well: reserve team_send for a real handoff, question, or intermediate milestone.",
     "Progress visibility rule: when you create an execution plan or reach a meaningful milestone, call team_update_progress with status=\"running\", a concise summary, and eventKind set to leader_plan, worker_plan, worker_progress, or leader_synthesis as appropriate. Use assignment_check_result only when replying to a ClawManager Monitor envelope carrying a monitor checkId. Do not expose hidden reasoning or tool logs; only publish user-visible plans, phase summaries, blockers, verification notes, and recovery status.",
     `Output language rule: use ${locale} for every user-visible plan, assignment, progress summary, resultMarkdown, and final synthesis. Preserve source code, API names, file names, and necessary technical terms in their original form.`,
-    "Shared artifact rule: prefer team_artifact_write/read/list/mkdir. These tools enforce current-Team isolation and cooperative permissions. The /team prefix is only the canonical link returned to ClawManager in pooled Lite runtimes.",
+    "Shared artifact rule: prefer team_artifact_write/read/list/mkdir. These tools enforce current-Team isolation and cooperative permissions. The /team prefix is only the canonical link returned to ClawManager in pooled Lite runtimes. To inspect a Team HTML or other Team file in Browser, call team_artifact_preview and navigate to its returned signed HTTP URL; never use file:// or start a temporary file server.",
     "Assignment output rule: if this is a Worker assignment, its injected assignment artifact root is authoritative. A Team-root output path written in the natural-language assignment is only a requested filename/legacy alias and must not override the assignment root. Do not write cross-member deliverables to pooled Runtime /tmp.",
     "Verification truth rule: an environment or Browser limitation is not a product defect. Continue with available static checks and say Browser verification passed only when it actually ran.",
     "Risk waiver rule: a failed or stale required assignment blocks root success unless the Leader records assignmentId, reason, and accepted risk in team_complete_task. Never waive work that is still running or pending.",
     "Optional-work rule: optional work may be omitted, but every omitted optional assignment must be listed in skippedAssignments with assignmentId and a concrete reason.",
+    "Phase finality rule: a required phase declared in leader_plan never disappears implicitly. If a planned phase is intentionally not started, the Leader must list it in team_complete_task phaseDispositions with phaseId, decision (cancelled, skipped, or superseded), and a concrete reason. Never use a disposition for running or unfinished assigned work.",
     "Never list, search, resolve, or scan the parent of the current Team shared directory, and never inspect sibling Team directories.",
   ];
   const verificationGuidance = redisTeamVerificationGuidance(envelope);
@@ -2827,6 +2912,8 @@ function createRuntime(api) {
         remainingActions,
         waivers: Array.isArray(meta.waivers) ? meta.waivers : [],
         skippedAssignments: Array.isArray(meta.skippedAssignments) ? meta.skippedAssignments : [],
+        phaseDispositionPolicy: currentIsLeader ? PHASE_DISPOSITION_POLICY : undefined,
+        phaseDispositions: currentIsLeader ? normalizePhaseDispositions(meta.phaseDispositions) : [],
         confirmFinal: boolFrom(meta.confirmFinal, false),
         planVersion: Number(meta.planVersion ?? envelope.planVersion ?? 0),
         ledgerVersion: Number(meta.ledgerVersion ?? envelope.ledgerVersion ?? 0),
@@ -3511,7 +3598,11 @@ function createRuntime(api) {
           }));
         });
       }
-      return { path: resolved.canonical, bytes: Buffer.byteLength(String(params?.content ?? ""), "utf8") };
+      return {
+        path: resolved.canonical,
+        bytes: Buffer.byteLength(String(params?.content ?? ""), "utf8"),
+        ...optionalPreviewFields(cfg, resolved.candidate),
+      };
     },
 
     async artifactRead(params) {
@@ -3536,6 +3627,7 @@ function createRuntime(api) {
           offset,
           truncated: nextOffset < stat.size,
           nextOffset: nextOffset < stat.size ? nextOffset : undefined,
+          ...optionalPreviewFields(cfg, resolved.candidate),
         };
       } finally {
         await handle.close();
@@ -3559,9 +3651,25 @@ function createRuntime(api) {
           type: entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "other",
           path: canonicalArtifactRef(cfg, candidate),
           bytes: entry.isFile() ? stat.size : undefined,
+          ...(entry.isFile() ? optionalPreviewFields(cfg, candidate) : {}),
         });
       }
       return { path: resolved.canonical, entries: result };
+    },
+
+    async artifactPreview(params) {
+      const cfg = readChannelConfig(runtimeApi.config || {});
+      if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
+      const currentEnvelope = activeEnvelope || await resolveActiveAssignmentEnvelope(cfg, params || {});
+      const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "team");
+      const stat = await fs.stat(resolved.candidate);
+      if (!stat.isFile()) throw new Error("Team artifact is not a file: " + resolved.canonical);
+      const preview = previewUrlForTeamArtifact(cfg, resolved.candidate);
+      return {
+        path: resolved.canonical,
+        bytes: stat.size,
+        previewUrl: preview.url,
+      };
     },
 
     async artifactMkdir(params) {
@@ -3693,6 +3801,10 @@ function createRuntime(api) {
           planVersion: Number(params.planVersion ?? params.plan_version ?? currentEnvelope?.planVersion ?? 0),
           ledgerVersion: Number(params.ledgerVersion ?? params.ledger_version ?? currentEnvelope?.ledgerVersion ?? 0),
           workflowState: params.workflowState || params.workflow_state || currentEnvelope?.workflowState,
+          phaseDispositionPolicy:
+            semanticEventKind === "leader_plan"
+              ? PHASE_DISPOSITION_POLICY
+              : params.phaseDispositionPolicy || params.phase_disposition_policy,
           phases: Array.isArray(params.phases) ? params.phases : undefined,
           remainingActions: Array.isArray(params.remainingActions || params.remaining_actions) ? (params.remainingActions || params.remaining_actions) : undefined,
           rootTaskTerminal: false,
@@ -3907,6 +4019,7 @@ function createRuntime(api) {
                 remainingActions: params.remainingActions || params.remaining_actions || [],
                 waivers: params.waivers || params.assignmentWaivers || params.assignment_waivers || [],
                 skippedAssignments: params.skippedAssignments || params.skipped_assignments || [],
+                phaseDispositions: normalizePhaseDispositions(params.phaseDispositions || params.phase_dispositions),
                 confirmFinal: params.confirmFinal ?? params.confirm_final,
                 planVersion: currentWorkflow
                   ? Number(terminalEnvelope?.planVersion || 0)
@@ -4240,6 +4353,20 @@ const completeParameters = {
         },
       },
     },
+    phaseDispositions: {
+      type: "array",
+      description: "Leader-only explicit disposition for every required planned phase intentionally not started",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["phaseId", "decision", "reason"],
+        properties: {
+          phaseId: { type: "string" },
+          decision: { type: "string", enum: ["cancelled", "skipped", "superseded"] },
+          reason: { type: "string" },
+        },
+      },
+    },
     confirmFinal: { type: "boolean", description: "Confirm finality after a narrative/structure contradiction warning" },
     planVersion: { type: "number", minimum: 0 },
     ledgerVersion: { type: "number", minimum: 0 },
@@ -4273,6 +4400,13 @@ const artifactReadParameters = {
     ...artifactPathProperties,
     maxBytes: { type: "number", minimum: 1, maximum: 1048576 },
   },
+};
+
+const artifactPreviewParameters = {
+  type: "object",
+  additionalProperties: false,
+  required: ["path"],
+  properties: artifactPathProperties,
 };
 
 const artifactListParameters = {
@@ -4351,12 +4485,7 @@ export default definePluginEntry({
         const guardKey = trim(event?.runId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId || "active-review");
         const current = reviewerBrowserGuards.get(guardKey);
         if (!current) return;
-        if (
-          trim(event?.error || event?.result?.error) ||
-          event?.isError === true ||
-          event?.result?.isError === true ||
-          Number(event?.durationMs || event?.result?.durationMs || 0) >= REVIEW_BROWSER_WINDOW_MS
-        ) {
+        if (browserToolCallFailed(event) || Number(event?.durationMs || event?.result?.durationMs || 0) >= REVIEW_BROWSER_WINDOW_MS) {
           current.calls = REVIEW_BROWSER_MAX_CALLS;
           reviewerBrowserGuards.set(guardKey, current);
         }
@@ -4466,6 +4595,15 @@ export default definePluginEntry({
       parameters: artifactReadParameters,
       async execute(_id, params) {
         return { content: [{ type: "text", text: JSON.stringify({ ok: true, artifact: await runtime.artifactRead(params || {}) }, null, 2) }] };
+      },
+    });
+    api.registerTool({
+      name: "team_artifact_preview",
+      label: "Team Artifact Preview",
+      description: "Create a signed, read-only ClawManager URL for opening a current-Team file in Browser. The URL remains valid for the life of the Team token. Use this instead of file:// or a temporary server.",
+      parameters: artifactPreviewParameters,
+      async execute(_id, params) {
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, artifact: await runtime.artifactPreview(params || {}) }, null, 2) }] };
       },
     });
     api.registerTool({

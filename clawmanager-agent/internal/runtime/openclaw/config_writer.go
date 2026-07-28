@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +19,7 @@ const openClawAutoProviderName = "auto"
 const openClawRedisTeamPluginID = "redis-team"
 const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR"
 const openClawBrowserExecutablePath = "/usr/bin/chromium"
+const openClawBrowserProxyEnv = "CLAWMANAGER_BROWSER_PROXY_URL"
 
 func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string) error {
 	if err := gateway.WriteLiteTeamConfigJSON(req, workspacePath); err != nil {
@@ -42,7 +44,7 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("read openclaw config: %w", err)
 	}
-	configureManagedOpenClawBrowser(config)
+	configureManagedOpenClawBrowser(config, req)
 
 	if teamEnabledFromRequest(req) {
 		if err := configureOpenClawRedisTeam(config, req, workspacePath); err != nil {
@@ -112,12 +114,72 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 // are present in the image template without replacing an instance's explicit
 // browser choices. New pooled workspaces start from an empty config, so relying
 // on the image template alone leaves Browser unavailable for those instances.
-func configureManagedOpenClawBrowser(config map[string]any) {
+func configureManagedOpenClawBrowser(config map[string]any, req gateway.CreateGatewayRequest) {
 	browser := ensureObject(config, "browser")
 	setDefaultObjectValue(browser, "enabled", true)
 	setDefaultObjectValue(browser, "executablePath", openClawBrowserExecutablePath)
 	setDefaultObjectValue(browser, "headless", true)
 	setDefaultObjectValue(browser, "noSandbox", true)
+
+	proxyURL, managed := managedOpenClawBrowserProxy(req)
+	if !managed {
+		return
+	}
+
+	// Team workers must all have a functioning Browser. Chromium is forced
+	// through ClawManager's DNS-pinning egress proxy, so OpenClaw may permit
+	// the proxy's internal service address without exposing arbitrary pod or
+	// cluster addresses to the page being reviewed.
+	browser["enabled"] = true
+	browser["executablePath"] = openClawBrowserExecutablePath
+	browser["headless"] = true
+	browser["noSandbox"] = true
+	browser["extraArgs"] = managedOpenClawBrowserArgs(browser["extraArgs"], proxyURL)
+	ssrfPolicy := ensureObject(browser, "ssrfPolicy")
+	ssrfPolicy["dangerouslyAllowPrivateNetwork"] = true
+}
+
+func managedOpenClawBrowserProxy(req gateway.CreateGatewayRequest) (string, bool) {
+	if !teamEnabledFromRequest(req) {
+		return "", false
+	}
+	raw, explicitlyManaged := requestEnvValue(req, openClawBrowserProxyEnv)
+	if !explicitlyManaged {
+		raw, _ = requestEnvValue(req, "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+	}
+	raw = strings.TrimSpace(raw)
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || strings.TrimSpace(parsed.Host) == "" {
+		return "", false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host != "clawmanager-egress-proxy" && !strings.HasPrefix(host, "clawmanager-egress-proxy.") {
+		return "", false
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/"), true
+}
+
+func managedOpenClawBrowserArgs(existing any, proxyURL string) []string {
+	current := appendUniqueStringArray(existing)
+	filtered := make([]string, 0, len(current)+4)
+	for _, argument := range current {
+		normalized := strings.ToLower(strings.TrimSpace(argument))
+		if normalized == "--no-proxy-server" ||
+			strings.HasPrefix(normalized, "--proxy-") {
+			continue
+		}
+		filtered = append(filtered, argument)
+	}
+	return append(filtered,
+		"--proxy-server="+proxyURL,
+		"--proxy-bypass-list=<-loopback>",
+		"--disable-quic",
+		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+	)
 }
 
 func setDefaultObjectValue(object map[string]any, key string, value any) {

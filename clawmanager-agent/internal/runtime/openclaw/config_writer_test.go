@@ -221,6 +221,143 @@ func TestWriteOpenClawGatewayConfigPreservesExplicitBrowserConfig(t *testing.T) 
 	}
 }
 
+func TestWriteOpenClawGatewayConfigForcesTeamBrowserThroughManagedProxy(t *testing.T) {
+	existing := []byte(`{
+	  "browser": {
+	    "enabled": false,
+	    "extraArgs": [
+	      "--window-size=1280,720",
+	      "--no-proxy-server",
+	      "--proxy-server=http://untrusted.example:8080",
+	      "--proxy-bypass-list=*",
+	      "--proxy-pac-url=http://untrusted.example/proxy.pac"
+	    ],
+	    "ssrfPolicy": {"allowedHostnames": ["example.com"]}
+	  }
+	}`)
+	var config map[string]any
+	if err := json.Unmarshal(existing, &config); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+
+	proxyURL := "http://clawmanager-egress-proxy.clawmanager-system.svc.cluster.local:3128"
+	req := CreateGatewayRequest{
+		InstanceID: 66,
+		UserID:     45,
+		UID:        200066,
+		GID:        200066,
+		Environment: map[string]string{
+			"CLAWMANAGER_TEAM_ENABLED":      "true",
+			"CLAWMANAGER_BROWSER_PROXY_URL": proxyURL,
+		},
+	}
+	configureManagedOpenClawBrowser(config, req)
+
+	browser := objectAt(t, config, "browser")
+	if browser["enabled"] != true {
+		t.Fatalf("browser.enabled = %#v, want true for Team worker", browser["enabled"])
+	}
+	args, ok := browser["extraArgs"].([]string)
+	if !ok {
+		t.Fatalf("browser.extraArgs = %#v, want string array", browser["extraArgs"])
+	}
+	gotArgs := map[string]bool{}
+	for _, argument := range args {
+		gotArgs[argument] = true
+	}
+	for _, required := range []string{
+		"--window-size=1280,720",
+		"--proxy-server=" + proxyURL,
+		"--proxy-bypass-list=<-loopback>",
+		"--disable-quic",
+		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+	} {
+		if !gotArgs[required] {
+			t.Fatalf("browser.extraArgs missing %q: %#v", required, args)
+		}
+	}
+	for _, forbidden := range []string{
+		"--no-proxy-server",
+		"--proxy-server=http://untrusted.example:8080",
+		"--proxy-bypass-list=*",
+		"--proxy-pac-url=http://untrusted.example/proxy.pac",
+	} {
+		if gotArgs[forbidden] {
+			t.Fatalf("browser.extraArgs retained conflicting argument %q: %#v", forbidden, args)
+		}
+	}
+	ssrfPolicy := objectAt(t, browser, "ssrfPolicy")
+	if ssrfPolicy["dangerouslyAllowPrivateNetwork"] != true {
+		t.Fatalf("browser.ssrfPolicy = %#v, want managed proxy allowance", ssrfPolicy)
+	}
+	allowedHostnames, ok := ssrfPolicy["allowedHostnames"].([]any)
+	if !ok || !stringSet(allowedHostnames)["example.com"] {
+		t.Fatalf("browser.ssrfPolicy.allowedHostnames was not preserved: %#v", ssrfPolicy)
+	}
+}
+
+func TestWriteOpenClawGatewayConfigDoesNotRelaxSSRFWithoutManagedTeamProxy(t *testing.T) {
+	req := CreateGatewayRequest{
+		InstanceID: 67,
+		UserID:     45,
+		UID:        200067,
+		GID:        200067,
+		Environment: map[string]string{
+			"CLAWMANAGER_TEAM_ENABLED": "true",
+		},
+	}
+	config := map[string]any{}
+	configureManagedOpenClawBrowser(config, req)
+	browser := objectAt(t, config, "browser")
+	if _, exists := browser["ssrfPolicy"]; exists {
+		t.Fatalf("browser.ssrfPolicy was relaxed without a managed proxy: %#v", browser)
+	}
+}
+
+func TestManagedTeamBrowserUsesExistingClawManagerHTTPSProxyForUpgrades(t *testing.T) {
+	proxyURL := "http://clawmanager-egress-proxy.clawmanager-system.svc.cluster.local:3128"
+	req := CreateGatewayRequest{
+		Environment: map[string]string{
+			"CLAWMANAGER_TEAM_ENABLED": "true",
+			"HTTPS_PROXY":              proxyURL,
+		},
+	}
+	config := map[string]any{}
+	configureManagedOpenClawBrowser(config, req)
+	browser := objectAt(t, config, "browser")
+	if _, exists := browser["ssrfPolicy"]; !exists {
+		t.Fatalf("existing Team instance did not adopt managed Browser proxy: %#v", browser)
+	}
+	args, ok := browser["extraArgs"].([]string)
+	if !ok {
+		t.Fatalf("browser.extraArgs = %#v, want string array", browser["extraArgs"])
+	}
+	found := false
+	for _, argument := range args {
+		if argument == "--proxy-server="+proxyURL {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("browser.extraArgs missing managed proxy: %#v", args)
+	}
+}
+
+func TestManagedTeamBrowserRejectsUntrustedGenericProxyFallback(t *testing.T) {
+	req := CreateGatewayRequest{
+		Environment: map[string]string{
+			"CLAWMANAGER_TEAM_ENABLED": "true",
+			"HTTPS_PROXY":              "http://untrusted.example:3128",
+		},
+	}
+	config := map[string]any{}
+	configureManagedOpenClawBrowser(config, req)
+	browser := objectAt(t, config, "browser")
+	if _, exists := browser["ssrfPolicy"]; exists {
+		t.Fatalf("untrusted proxy fallback relaxed Browser SSRF: %#v", browser)
+	}
+}
+
 func readOpenClawConfigForTest(t *testing.T, configPath string) map[string]any {
 	t.Helper()
 	data, err := os.ReadFile(configPath)
