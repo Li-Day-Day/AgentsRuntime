@@ -58,12 +58,20 @@
           "auto/model-id": {}
         },
         "workspace": "/config/.openclaw/workspace",
+        "memorySearch": {
+          "enabled": true,
+          "provider": "none"
+        },
         "compaction": {
           "mode": "default",
-          "reserveTokens": 8192,
-          "keepRecentTokens": 50000,
-          "maxHistoryShare": 0.85,
-          "notifyUser": true
+          "reserveTokens": 32768,
+          "reserveTokensFloor": 20000,
+          "keepRecentTokens": 30000,
+          "maxHistoryShare": 0.65,
+          "notifyUser": true,
+          "memoryFlush": {
+            "enabled": true
+          }
         },
         "maxConcurrent": 4,
         "subagents": {
@@ -76,8 +84,8 @@
         "enabled": true,
         "entries": {
           "session-memory": {
-              "enabled": true,
-              "messages": 50
+            "enabled": true,
+            "messages": 50
           }
         }
       }
@@ -169,6 +177,15 @@
         },
         "redis-team": {
           "enabled": false
+        },
+        "memory-core": {
+          "config": {
+            "dreaming": {
+              "enabled": true,
+              "frequency": "0 3 * * *",
+              "timezone": "Asia/Shanghai"
+            }
+          }
         }
       }
     },

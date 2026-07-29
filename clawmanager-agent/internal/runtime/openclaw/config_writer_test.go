@@ -230,6 +230,127 @@ func TestWriteOpenClawGatewayConfigPreservesExplicitBrowserConfig(t *testing.T) 
 	}
 }
 
+func TestWriteOpenClawGatewayConfigPreservesExplicitLiteDefaults(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-66")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	existing := []byte(`{
+  "models": {"mode": "replace"},
+  "agents": {
+    "defaults": {
+      "memorySearch": {"enabled": false, "provider": "local"},
+      "compaction": {
+        "mode": "safeguard",
+        "reserveTokens": 1024,
+        "reserveTokensFloor": 512,
+        "keepRecentTokens": 4096,
+        "maxHistoryShare": 0.5,
+        "notifyUser": false,
+        "memoryFlush": {"enabled": false}
+      },
+      "maxConcurrent": 2,
+      "subagents": {"maxConcurrent": 3}
+    }
+  },
+  "tools": {"profile": "minimal"},
+  "commands": {
+    "native": "off",
+    "nativeSkills": "off",
+    "restart": false,
+    "ownerDisplay": "friendly"
+  },
+  "messages": {"groupChat": {"visibleReplies": "message_tool_only"}},
+  "gateway": {
+    "mode": "remote",
+    "tailscale": {"mode": "on", "resetOnExit": true},
+    "nodes": {"denyCommands": ["custom.block"]}
+  },
+  "plugins": {
+    "entries": {
+      "bonjour": {"enabled": true},
+      "memory-core": {
+        "config": {
+          "dreaming": {
+            "enabled": false,
+            "frequency": "custom",
+            "timezone": "UTC"
+          }
+        }
+      }
+    }
+  }
+}`)
+	if err := os.WriteFile(configPath, existing, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	req := CreateGatewayRequest{InstanceID: 66, UserID: 45, UID: 200066, GID: 200066}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	merged := readOpenClawConfigForTest(t, configPath)
+	if got := objectAt(t, merged, "models")["mode"]; got != "replace" {
+		t.Fatalf("models.mode = %#v, want explicit replace preserved", got)
+	}
+	agentDefaults := objectAt(t, objectAt(t, merged, "agents"), "defaults")
+	memorySearch := objectAt(t, agentDefaults, "memorySearch")
+	if memorySearch["enabled"] != false || memorySearch["provider"] != "local" {
+		t.Fatalf("explicit memorySearch was overwritten: %#v", memorySearch)
+	}
+	compaction := objectAt(t, agentDefaults, "compaction")
+	if compaction["mode"] != "safeguard" ||
+		compaction["reserveTokens"] != float64(1024) ||
+		compaction["reserveTokensFloor"] != float64(512) ||
+		compaction["keepRecentTokens"] != float64(4096) ||
+		compaction["maxHistoryShare"] != 0.5 ||
+		compaction["notifyUser"] != false ||
+		objectAt(t, compaction, "memoryFlush")["enabled"] != false {
+		t.Fatalf("explicit compaction was overwritten: %#v", compaction)
+	}
+	if agentDefaults["maxConcurrent"] != float64(2) || objectAt(t, agentDefaults, "subagents")["maxConcurrent"] != float64(3) {
+		t.Fatalf("explicit agent concurrency was overwritten: %#v", agentDefaults)
+	}
+	if objectAt(t, merged, "tools")["profile"] != "minimal" {
+		t.Fatalf("explicit tools.profile was overwritten: %#v", objectAt(t, merged, "tools"))
+	}
+	commands := objectAt(t, merged, "commands")
+	if commands["native"] != "off" ||
+		commands["nativeSkills"] != "off" ||
+		commands["restart"] != false ||
+		commands["ownerDisplay"] != "friendly" {
+		t.Fatalf("explicit commands were overwritten: %#v", commands)
+	}
+	if objectAt(t, objectAt(t, merged, "messages"), "groupChat")["visibleReplies"] != "message_tool_only" {
+		t.Fatalf("explicit visibleReplies was overwritten")
+	}
+	gateway := objectAt(t, merged, "gateway")
+	if gateway["mode"] != "remote" {
+		t.Fatalf("gateway.mode = %#v, want explicit remote preserved", gateway["mode"])
+	}
+	tailscale := objectAt(t, gateway, "tailscale")
+	if tailscale["mode"] != "on" || tailscale["resetOnExit"] != true {
+		t.Fatalf("explicit gateway.tailscale was overwritten: %#v", tailscale)
+	}
+	deniedCommands, ok := objectAt(t, gateway, "nodes")["denyCommands"].([]any)
+	if !ok {
+		t.Fatalf("gateway.nodes.denyCommands = %#v, want array", objectAt(t, gateway, "nodes")["denyCommands"])
+	}
+	deniedSet := stringSet(deniedCommands)
+	if len(deniedSet) != len(openClawDefaultDeniedNodeCommands)+1 || !deniedSet["custom.block"] {
+		t.Fatalf("gateway.nodes.denyCommands = %#v, want custom command plus managed deny list", deniedCommands)
+	}
+	if objectAt(t, objectAt(t, objectAt(t, merged, "plugins"), "entries"), "bonjour")["enabled"] != true {
+		t.Fatalf("explicit bonjour enabled state was overwritten")
+	}
+	dreaming := objectAt(t, objectAt(t, objectAt(t, objectAt(t, objectAt(t, merged, "plugins"), "entries"), "memory-core"), "config"), "dreaming")
+	if dreaming["enabled"] != false || dreaming["frequency"] != "custom" || dreaming["timezone"] != "UTC" {
+		t.Fatalf("explicit memory-core dreaming config was overwritten: %#v", dreaming)
+	}
+}
+
 func readOpenClawConfigForTest(t *testing.T, configPath string) map[string]any {
 	t.Helper()
 	data, err := os.ReadFile(configPath)

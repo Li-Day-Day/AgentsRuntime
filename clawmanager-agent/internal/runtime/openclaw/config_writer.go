@@ -20,6 +20,28 @@ const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DI
 const openClawBrowserExecutablePath = "/usr/bin/chromium"
 const openClawChannelsEnv = "CLAWMANAGER_OPENCLAW_CHANNELS_JSON"
 
+var openClawDefaultDeniedNodeCommands = []string{
+	"camera.snap",
+	"camera.clip",
+	"screen.record",
+	"contacts.add",
+	"calendar.add",
+	"reminders.add",
+	"sms.send",
+}
+
+var openClawDefaultDisabledPlugins = []string{
+	"bonjour",
+	"acpx",
+	"browser",
+	"phone-control",
+	"talk-voice",
+	"device-pair",
+	"dingtalk-connector",
+	"wecom-openclaw-plugin",
+	"redis-team",
+}
+
 var openClawEnvManagedChannelPlugins = map[string][]string{
 	"dingtalk":              {"dingtalk-connector"},
 	"dingtalk-connector":    {"dingtalk-connector"},
@@ -63,6 +85,7 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		return fmt.Errorf("read openclaw config: %w", err)
 	}
 	configureManagedOpenClawBrowser(config)
+	mergeOpenClawLiteDefaults(config)
 	if err := mergeOpenClawChannelsFromRequest(config, req); err != nil {
 		return err
 	}
@@ -151,6 +174,69 @@ func setDefaultObjectValue(object map[string]any, key string, value any) {
 		return
 	}
 	object[key] = value
+}
+
+// mergeOpenClawLiteDefaults supplies the instance defaults that Pro receives
+// from /defaults/.openclaw/openclaw.json. Lite workspaces start with an empty
+// config, so these defaults must be added when the instance is created.
+//
+// Values are only filled when absent so recreating an existing Lite instance
+// does not discard explicit user choices. Environment-managed model, channel,
+// Team, gateway port, and authentication settings are applied afterwards.
+func mergeOpenClawLiteDefaults(config map[string]any) {
+	models := ensureObject(config, "models")
+	setDefaultObjectValue(models, "mode", "merge")
+
+	agentDefaults := ensureObject(ensureObject(config, "agents"), "defaults")
+	memorySearch := ensureObject(agentDefaults, "memorySearch")
+	setDefaultObjectValue(memorySearch, "enabled", true)
+	setDefaultObjectValue(memorySearch, "provider", "none")
+
+	compaction := ensureObject(agentDefaults, "compaction")
+	setDefaultObjectValue(compaction, "mode", "default")
+	setDefaultObjectValue(compaction, "reserveTokens", 32768)
+	setDefaultObjectValue(compaction, "reserveTokensFloor", 20000)
+	setDefaultObjectValue(compaction, "keepRecentTokens", 30000)
+	setDefaultObjectValue(compaction, "maxHistoryShare", 0.65)
+	setDefaultObjectValue(compaction, "notifyUser", true)
+	memoryFlush := ensureObject(compaction, "memoryFlush")
+	setDefaultObjectValue(memoryFlush, "enabled", true)
+
+	setDefaultObjectValue(agentDefaults, "maxConcurrent", 4)
+	subagents := ensureObject(agentDefaults, "subagents")
+	setDefaultObjectValue(subagents, "maxConcurrent", 8)
+
+	tools := ensureObject(config, "tools")
+	setDefaultObjectValue(tools, "profile", "full")
+
+	commands := ensureObject(config, "commands")
+	setDefaultObjectValue(commands, "native", "auto")
+	setDefaultObjectValue(commands, "nativeSkills", "auto")
+	setDefaultObjectValue(commands, "restart", true)
+	setDefaultObjectValue(commands, "ownerDisplay", "raw")
+
+	messages := ensureObject(config, "messages")
+	groupChat := ensureObject(messages, "groupChat")
+	setDefaultObjectValue(groupChat, "visibleReplies", "automatic")
+
+	gatewayConfig := ensureObject(config, "gateway")
+	setDefaultObjectValue(gatewayConfig, "mode", "local")
+	tailscale := ensureObject(gatewayConfig, "tailscale")
+	setDefaultObjectValue(tailscale, "mode", "off")
+	setDefaultObjectValue(tailscale, "resetOnExit", false)
+	nodes := ensureObject(gatewayConfig, "nodes")
+	nodes["denyCommands"] = appendUniqueStringArray(nodes["denyCommands"], openClawDefaultDeniedNodeCommands...)
+
+	entries := ensureObject(ensureObject(config, "plugins"), "entries")
+	for _, pluginID := range openClawDefaultDisabledPlugins {
+		entry := ensureObject(entries, pluginID)
+		setDefaultObjectValue(entry, "enabled", false)
+	}
+	memoryCore := ensureObject(entries, "memory-core")
+	dreaming := ensureObject(ensureObject(memoryCore, "config"), "dreaming")
+	setDefaultObjectValue(dreaming, "enabled", true)
+	setDefaultObjectValue(dreaming, "frequency", "0 3 * * *")
+	setDefaultObjectValue(dreaming, "timezone", "Asia/Shanghai")
 }
 
 func mergeOpenClawChannelsFromRequest(config map[string]any, req gateway.CreateGatewayRequest) error {
