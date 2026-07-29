@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, browserToolCallFailed, rootWorkflowStateIsTerminal };\n";
+const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, browserToolCallFailed, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -18,7 +18,8 @@ const shared = path.join(root, "shared");
 process.env.XDG_STATE_HOME = state;
 process.env.CLAWMANAGER_TEAM_TOKEN = "team-75-preview-secret";
 process.env.CLAWMANAGER_TEAM_ID = "75";
-process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://clawmanager-team-preview.invalid";
+process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://clawmanager-egress-proxy.clawmanager-hxc-peer-system.svc.cluster.local:3128";
+process.env.CLAWMANAGER_BROWSER_PROXY_URL = "http://clawmanager-egress-proxy.clawmanager-hxc-peer-system.svc.cluster.local:3128";
 
 function createHarness(memberId, role) {
   const registered = new Map();
@@ -386,8 +387,30 @@ try {
   assert.equal(preview.artifact.path, "/team/index.html");
   assert.match(
     preview.artifact.previewUrl,
-    /^http:\/\/clawmanager-team-preview\.invalid\/v1\/75\/_\/[A-Za-z0-9_-]+\/index\.html$/,
+    /^http:\/\/clawmanager-egress-proxy\.clawmanager-hxc-peer-system\.svc\.cluster\.local:3128\/v1\/75\/_\/[A-Za-z0-9_-]+\/index\.html$/,
   );
+  assert.equal(new URL(preview.artifact.previewUrl).search, "", "preview links must not carry an expiry");
+  process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://clawmanager-team-preview.invalid";
+  const legacyPreviewUrl = pluginModule.previewUrlForTeamArtifact(
+    { teamId: "75", sharedDir: shared },
+    path.join(shared, "index.html"),
+  );
+  assert.equal(
+    new URL(legacyPreviewUrl.url).hostname,
+    "clawmanager-egress-proxy.clawmanager-hxc-peer-system.svc.cluster.local",
+    "a new Runtime must repair the legacy .invalid origin with the managed proxy address",
+  );
+  assert.equal(new URL(legacyPreviewUrl.url).port, "3128");
+  process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://attacker.example";
+  assert.throws(
+    () => pluginModule.previewUrlForTeamArtifact(
+      { teamId: "75", sharedDir: shared },
+      path.join(shared, "index.html"),
+    ),
+    /not managed by ClawManager/,
+    "an arbitrary preview origin must never receive a Team-signed artifact path",
+  );
+  process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://clawmanager-egress-proxy.clawmanager-hxc-peer-system.svc.cluster.local:3128";
   const truncatedRead = toolResult(await developerTools.get("team_artifact_read").execute("read-truncated", {
     scope: "team",
     path: "index.html",

@@ -19,7 +19,8 @@ const PROTOCOL_VERSION = 3;
 const COMPLETION_SOURCE = "team_complete_task";
 const TEAM_SHARED_DIR_MODE = 0o2775;
 const RUNTIME_PRIVATE_DIR_MODE = 0o700;
-const TEAM_PREVIEW_HOST = "clawmanager-team-preview.invalid";
+const LEGACY_TEAM_PREVIEW_HOST = "clawmanager-team-preview.invalid";
+const EGRESS_PROXY_SERVICE_NAME = "clawmanager-egress-proxy";
 const PHASE_DISPOSITION_POLICY = "explicit-disposition-v1";
 const ACTIVE_ASSIGNMENT_LEASE_MS = 6 * 60 * 60 * 1000;
 const SYSTEM_REPLY_TARGETS = new Set([
@@ -806,22 +807,71 @@ function canonicalArtifactRef(cfg, file) {
   return "/team/" + relative.split(path.sep).join("/");
 }
 
+function isManagedClusterServiceHost(hostname, serviceName) {
+  const normalized = trim(hostname).toLowerCase().replace(/\.$/, "");
+  if (normalized === serviceName) return true;
+  const labels = normalized.split(".");
+  return labels[0] === serviceName && labels.length >= 3 && labels[1] !== "" && labels[2] === "svc";
+}
+
+function managedTeamPreviewOrigin() {
+  const configured = trim(process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN);
+  if (configured) {
+    let origin;
+    try {
+      origin = new URL(configured);
+    } catch {
+      throw new Error("Team artifact Browser preview origin is invalid");
+    }
+    if (
+      origin.protocol === "http:" &&
+      isManagedClusterServiceHost(origin.hostname, EGRESS_PROXY_SERVICE_NAME)
+    ) {
+      origin.pathname = "/";
+      origin.search = "";
+      origin.hash = "";
+      origin.username = "";
+      origin.password = "";
+      return origin;
+    }
+    if (origin.hostname.toLowerCase() !== LEGACY_TEAM_PREVIEW_HOST) {
+      throw new Error("Team artifact Browser preview origin is not managed by ClawManager");
+    }
+  }
+
+  const proxyValue =
+    trim(process.env.CLAWMANAGER_BROWSER_PROXY_URL) ||
+    trim(process.env.HTTPS_PROXY) ||
+    trim(process.env.HTTP_PROXY) ||
+    trim(process.env.https_proxy) ||
+    trim(process.env.http_proxy);
+  let proxy;
+  try {
+    proxy = new URL(proxyValue);
+  } catch {
+    throw new Error("Team artifact Browser preview service is unavailable in this Runtime");
+  }
+  if (
+    proxy.protocol !== "http:" ||
+    !isManagedClusterServiceHost(proxy.hostname, EGRESS_PROXY_SERVICE_NAME)
+  ) {
+    throw new Error("Team artifact Browser preview proxy is not managed by ClawManager");
+  }
+  proxy.pathname = "/";
+  proxy.search = "";
+  proxy.hash = "";
+  proxy.username = "";
+  proxy.password = "";
+  return proxy;
+}
+
 function previewUrlForTeamArtifact(cfg, file) {
-  const originValue = trim(process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN) || `http://${TEAM_PREVIEW_HOST}`;
   const token = trim(process.env.CLAWMANAGER_TEAM_TOKEN);
   const teamId = trim(cfg?.teamId || process.env.CLAWMANAGER_TEAM_ID);
-  if (!originValue || !token || !teamId) {
+  if (!token || !teamId) {
     throw new Error("Team artifact Browser preview is unavailable in this Runtime");
   }
-  let origin;
-  try {
-    origin = new URL(originValue);
-  } catch {
-    throw new Error("Team artifact Browser preview origin is invalid");
-  }
-  if (origin.protocol !== "http:" || origin.hostname.toLowerCase() !== TEAM_PREVIEW_HOST) {
-    throw new Error("Team artifact Browser preview origin is not managed by ClawManager");
-  }
+  const origin = managedTeamPreviewOrigin();
 
   const root = path.resolve(cfg.sharedDir);
   const relative = path.relative(root, path.resolve(file));
