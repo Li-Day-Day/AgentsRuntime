@@ -15,7 +15,14 @@ const DEFAULT_ASSIGNMENT_HEARTBEAT_SECONDS = 30;
 const STATUS_INTERVAL_MS = 15000;
 const READ_BLOCK_MS = 15000;
 const WIRE_SCHEMA_VERSION = 1;
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
+const RUNTIME_CAPABILITIES = Object.freeze([
+  "completion_ack_v1",
+  "automatic_turn_completion_v1",
+  "assignment_heartbeat_v1",
+  "team_artifact_preview_v1",
+  "review_contract_v1",
+]);
 const COMPLETION_SOURCE = "team_complete_task";
 const TEAM_SHARED_DIR_MODE = 0o2775;
 const RUNTIME_PRIVATE_DIR_MODE = 0o700;
@@ -31,6 +38,10 @@ const SYSTEM_REPLY_TARGETS = new Set([
   "requester",
   "caller",
   "system",
+]);
+const CONTROL_PLANE_REPLY_TARGETS = new Set([
+  "clawmanager-monitor",
+  "clawmanager-recovery",
 ]);
 
 function trim(value) {
@@ -216,14 +227,16 @@ function isActiveCompletionTarget(value, cfg = {}) {
 function normalizeRedisTeamTarget(value, cfg = {}) {
   const raw = trim(value) || "broadcast";
   const lower = raw.toLowerCase();
+  const control = CONTROL_PLANE_REPLY_TARGETS.has(lower);
   const system = SYSTEM_REPLY_TARGETS.has(lower);
-  const group = !system && isTeamBroadcastTarget(raw, cfg);
+  const group = !control && !system && isTeamBroadcastTarget(raw, cfg);
   return {
     to: system || group ? "broadcast" : raw,
     originalTo: raw,
+    control,
     system,
     group,
-    completion: system || group,
+    completion: !control && (system || group),
   };
 }
 function isSafeMemberTarget(value) {
@@ -232,6 +245,7 @@ function isSafeMemberTarget(value) {
 }
 async function resolveRedisTeamTarget(cfg, value) {
   const target = normalizeRedisTeamTarget(value, cfg);
+  if (target.control) return Object.assign(target, { route: "control" });
   if (target.completion) return Object.assign(target, { route: "completion" });
   if (!isSafeMemberTarget(target.to)) {
     return Object.assign(target, { route: "unknown", error: "unknown Redis Team target: " + target.originalTo });
@@ -1302,7 +1316,9 @@ function isRosterLeaderTarget(roster, target) {
 
 function isSystemSender(value, cfg = {}) {
   const raw = trim(value) || "clawmanager";
-  return isActiveCompletionTarget(raw, cfg) || raw.toLowerCase() === "clawmanager";
+  return isActiveCompletionTarget(raw, cfg) ||
+    CONTROL_PLANE_REPLY_TARGETS.has(raw.toLowerCase()) ||
+    raw.toLowerCase() === "clawmanager";
 }
 
 function statusMatchesTarget(status, target) {
@@ -1350,6 +1366,8 @@ async function writeLocalStatus(cfg, patch = {}) {
       runtimeStatus: "running",
       availability: "idle",
       monitorObservationVersion: 1,
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: [...RUNTIME_CAPABILITIES],
       lastSeenAt: nowIso(),
     },
     previous,
@@ -1357,6 +1375,8 @@ async function writeLocalStatus(cfg, patch = {}) {
       teamId: cfg.teamId,
       memberId: cfg.memberId,
       role: cfg.role,
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: [...RUNTIME_CAPABILITIES],
       lastSeenAt: nowIso(),
     },
     patch,
@@ -1729,7 +1749,7 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
   const guidance = [
     body,
     "",
-    "Redis Team delivery rule: finish this assignment by calling team_complete_task with status=\"succeeded\", a concise summary, and resultMarkdown containing the answer. A normal chat answer may stay private in OpenClaw and not reach ClawManager. Do not send the same completed deliverable with team_send as well: reserve team_send for a real handoff, question, or intermediate milestone.",
+    "Redis Team delivery rule: team_complete_task remains the preferred explicit receipt when you need failure, waiver, skip, or phase-disposition fields. For ordinary successful work, provide one complete final answer; the Runtime will submit that final turn to ClawManager if no completion tool call was made. Do not spend another turn merely repeating the answer or asking someone to close a task. Do not send the same completed deliverable with team_send as well: reserve team_send for a real handoff, question, or intermediate milestone.",
     "Progress visibility rule: when you create an execution plan or reach a meaningful milestone, call team_update_progress with status=\"running\", a concise summary, and eventKind set to leader_plan, worker_plan, worker_progress, or leader_synthesis as appropriate. Use assignment_check_result only when replying to a ClawManager Monitor envelope carrying a monitor checkId. Do not expose hidden reasoning or tool logs; only publish user-visible plans, phase summaries, blockers, verification notes, and recovery status.",
     `Output language rule: use ${locale} for every user-visible plan, assignment, progress summary, resultMarkdown, and final synthesis. Preserve source code, API names, file names, and necessary technical terms in their original form.`,
     "Shared artifact rule: prefer team_artifact_write/read/list/mkdir. These tools enforce current-Team isolation and cooperative permissions. The /team prefix is only the canonical link returned to ClawManager in pooled Lite runtimes. To inspect a Team HTML or other Team file in Browser, call team_artifact_preview and navigate to its returned signed HTTP URL; never use file:// or start a temporary file server.",
@@ -1945,9 +1965,6 @@ async function shouldUseAssistantSessionFallback(cfg, envelope, text) {
   const roster = await readTeamRoster(cfg);
   const currentMember = currentRosterMember(cfg, roster);
   const currentIsLeader = isLeaderRosterMember(currentMember) || isRosterLeaderTarget(roster, cfg.memberId);
-  if (isLeaderMediatedRoster(roster) && currentIsLeader) {
-    return false;
-  }
   if (isSystemSender(envelope.from, cfg)) return true;
   if (roster.members.length && isKnownRosterTarget(roster, envelope.from)) {
     if (isLeaderMediatedRoster(roster) && !currentIsLeader && isRosterLeaderTarget(roster, envelope.from)) {
@@ -2539,6 +2556,7 @@ function eventFor(cfg, event, extra = {}) {
     {
       v: WIRE_SCHEMA_VERSION,
       protocolVersion: PROTOCOL_VERSION,
+      runtimeCapabilities: [...RUNTIME_CAPABILITIES],
       eventId: "evt_" + randomUUID(),
       event,
       type: event,
@@ -2936,6 +2954,7 @@ function createRuntime(api) {
         attemptId,
         completionSource: COMPLETION_SOURCE,
         explicitCompletion: true,
+        automaticTurnResult: meta.automaticTurnResult === true || undefined,
         assignmentResultOnly: assignmentResultOnly || undefined,
         rootTaskTerminal: leaderMediated ? (!assignmentResultOnly && currentIsLeader) : undefined,
         workId,
@@ -3387,6 +3406,45 @@ function createRuntime(api) {
         await xaddJson(redis, eventsKey(cfg), failureEvent);
         lastOutbound = { message, target, failed: true, error: target.error };
         return Object.assign({}, message, { failed: true, error: target.error });
+      }
+      if (target.route === "control") {
+        const monitorReply =
+          trim(inferredEnvelope?.intent).toLowerCase() === "assignment_status_check" ||
+          trim(inferredEnvelope?.metadata?.monitorType || inferredEnvelope?.metadata?.monitor_type).toLowerCase() === "assignment_status_check";
+        await xaddJson(redis, eventsKey(cfg), eventFor(cfg, "task_progress", {
+          messageId: message.messageId,
+          message_id: message.messageId,
+          taskId: message.taskId,
+          task_id: message.taskId,
+          rootTaskId: message.rootTaskId,
+          root_task_id: message.rootTaskId,
+          rootMessageId: message.rootMessageId,
+          root_message_id: message.rootMessageId,
+          workId: message.workId,
+          assignmentId: message.assignmentId,
+          canonicalWorkId: message.assignmentId,
+          phaseId: message.phaseId,
+          sourceMessageId: inferredEnvelope?.messageId || activeEnvelope?.messageId,
+          source_message_id: inferredEnvelope?.messageId || activeEnvelope?.messageId,
+          to: target.originalTo,
+          eventKind: monitorReply ? "assignment_check_result" : "control_plane_reply",
+          intent: monitorReply ? "assignment_status_check" : "control_plane_reply",
+          requiresCompletion: false,
+          nonAuthoritative: true,
+          rootTaskTerminal: false,
+          status: "running",
+          runtimeStatus: "running",
+          availability: "busy",
+          text: message.text,
+          summary: message.title,
+          visibleToChat: false,
+          chatPolicy: "hidden",
+        }));
+        lastOutbound = { message, target, control: true };
+        return Object.assign({}, message, {
+          sent: true,
+          controlPlaneReply: true,
+        });
       }
 
       await xaddJson(redis, inboxKey(cfg, message.to), message);
@@ -5206,7 +5264,7 @@ export default definePluginEntry({
                     ? assistantNarratives[assistantNarratives.length - 1].text
                     : await readLatestAssistantTextFromDispatch(activeResult?.result?.dispatchResult);
                   const terminalAfterDispatch = await runtime.isTaskTerminal(cfg, envelope);
-                  if (!dispatchFailed && !activeResult?.completed && !activeResult?.outbound && !deliveredViaCallback) {
+                  if (!dispatchFailed && !activeResult?.completed && !activeResult?.outbound) {
                     if (!terminalAfterDispatch && await shouldUseAssistantSessionFallback(cfg, envelope, fallbackText)) {
                       const usableFallbackText = usableFallbackAssistantText(fallbackText);
                       const fallbackResult = await runtime.completeActiveTask(usableFallbackText, {
@@ -5215,6 +5273,8 @@ export default definePluginEntry({
                         taskId: envelope.taskId,
                         summary: usableFallbackText.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Redis Team task completed",
                         resultMarkdown: usableFallbackText,
+                        artifactRefs: activeResult?.artifactRefs || [],
+                        automaticTurnResult: true,
                       });
                       fallbackCompleted = fallbackResult?.decision === "accepted";
                       fallbackPending = fallbackResult?.decision === "submitted";

@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, browserToolCallFailed, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
+const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, browserToolCallFailed, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -215,14 +215,20 @@ try {
   assert.equal(turnFinished.hadAssistantNarrative, true);
   assert.equal(turnFinished.hadOutboundAssignment, false);
   assert.equal(turnFinished.completionRecoveryAttempt, 1);
+  const controlTarget = await pluginModule.resolveRedisTeamTarget(
+    { teamId: "75", memberId: "leader", sharedDir: shared },
+    "clawmanager-monitor",
+  );
+  assert.equal(controlTarget.route, "control");
+  assert.equal(controlTarget.completion, false);
   assert.equal(
     await pluginModule.shouldUseAssistantSessionFallback(
       { teamId: "75", memberId: "leader", role: "leader", sharedDir: shared },
       leaderContextEnvelope,
       "A natural-language answer that did not call the completion tool.",
     ),
-    false,
-    "Leader natural-language prose must never be converted directly into root success",
+    true,
+    "a complete Leader turn must be submitted through the same completion proposal path",
   );
 
   await seedActive("leader", "leader", "leader-final-synthesis");
