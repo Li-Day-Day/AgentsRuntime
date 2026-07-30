@@ -19,9 +19,12 @@ const PROTOCOL_VERSION = 4;
 const RUNTIME_CAPABILITIES = Object.freeze([
   "completion_ack_v1",
   "automatic_turn_completion_v1",
+  "automatic_turn_completion_v2",
   "assignment_heartbeat_v1",
+  "durable_turn_facts_v1",
   "team_artifact_preview_v1",
   "review_contract_v1",
+  "validation_contract_v2",
 ]);
 const COMPLETION_SOURCE = "team_complete_task";
 const TEAM_SHARED_DIR_MODE = 0o2775;
@@ -173,6 +176,15 @@ function completionAckKey(cfg, completionId, attemptId) {
 }
 function completionStateKey(cfg, completionId) {
   return keyPrefix(cfg) + ":completion-state:" + redisKeyPart(completionId);
+}
+function turnFactsKey(cfg, envelope) {
+  const messageId = trim(envelope?.messageId || envelope?.message_id);
+  if (!messageId) return "";
+  return keyPrefix(cfg) + ":turn-facts:" + redisKeyPart(cfg.memberId) + ":" + redisKeyPart(messageId);
+}
+function turnArtifactFactsKey(cfg, envelope) {
+  const key = turnFactsKey(cfg, envelope);
+  return key ? key + ":artifacts" : "";
 }
 function rootWorkflowStateKey(cfg, rootTaskId) {
   return keyPrefix(cfg) + ":root:" + redisKeyPart(rootTaskId) + ":state";
@@ -598,15 +610,27 @@ function normalizedArtifactRelativePath(value) {
   return normalized.replace(/^\.\//, "");
 }
 
-function assertTeamArtifactWriteScope(cfg, params) {
+function isAssignedValidationWriter(cfg, activeEnvelope) {
+  return (
+    isReviewMember(cfg) ||
+    boolFrom(activeEnvelope?.validationAssignment, false) ||
+    !!trim(
+      activeEnvelope?.validationTargetAssignmentId ||
+        activeEnvelope?.validatedAssignmentId ||
+        activeEnvelope?.reviewedAssignmentId,
+    )
+  );
+}
+
+function assertTeamArtifactWriteScope(cfg, params, activeEnvelope) {
   const scope = trim(params?.scope).toLowerCase() || "member";
   const kind = trim(params?.kind || params?.artifactKind || params?.artifact_kind).toLowerCase();
-  const role = trim(cfg?.role).toLowerCase();
-  const memberId = trim(cfg?.memberId).toLowerCase();
-  const leader = role === "leader" || role.includes("leader") || memberId === "leader" || memberId.includes("leader");
-  const reviewer = role.includes("review") || role.includes("qa") || memberId.includes("review") || memberId === "qa";
-  if (scope === "team" && !leader && !(kind === "review" && reviewer)) {
-    throw new Error("Only the Team Leader may write team-scoped artifacts; members must use scope=member");
+  if (
+    scope === "team" &&
+    !isLeaderMember(cfg) &&
+    !(kind === "review" && isAssignedValidationWriter(cfg, activeEnvelope))
+  ) {
+    throw new Error("Only the Team Leader or assigned validator may write this team-scoped artifact; members must otherwise use scope=member");
   }
 }
 
@@ -679,7 +703,7 @@ function teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite = 
     // Reads and lists with a declared kind must resolve to precisely the same
     // canonical directory as writes. Previously only writes honored kind,
     // so kind=final,path=result.md was incorrectly read from /team/result.md.
-    if (forWrite) assertTeamArtifactWriteScope(cfg, params);
+    if (forWrite) assertTeamArtifactWriteScope(cfg, params, activeEnvelope);
     if (kind === "plan") {
       if (forWrite && !isLeaderMember(cfg)) throw new Error("Only the Team Leader may publish a Team plan");
       return path.join(sharedRoot, "results", safeName(rootTaskId), "plan");
@@ -693,7 +717,9 @@ function teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite = 
       return path.join(sharedRoot, "results", safeName(rootTaskId), "context");
     }
     if (kind === "review") {
-      if (forWrite && !isLeaderMember(cfg) && !isReviewMember(cfg)) throw new Error("Only a Reviewer/QA member or Team Leader may publish a review report");
+      if (forWrite && !isLeaderMember(cfg) && !isAssignedValidationWriter(cfg, activeEnvelope)) {
+        throw new Error("Only the assigned validator or Team Leader may publish a validation report");
+      }
       return path.join(sharedRoot, "results", safeName(rootTaskId), "reviews", artifactAssignmentId(params, activeEnvelope));
     }
     if (forWrite) {
@@ -725,6 +751,12 @@ function normalizeKindRelativeArtifactPath(params, activeEnvelope, relative, def
   }
   if (kind === "context" && relative.startsWith("context/")) {
     return relative.slice("context/".length);
+  }
+  if (kind === "review") {
+    const assignmentPrefix = safeName(artifactAssignmentId(params, activeEnvelope)) + "/";
+    if (relative.startsWith(assignmentPrefix)) {
+      return relative.slice(assignmentPrefix.length);
+    }
   }
 
   // A Team-relative canonical path is accepted for forward/backward
@@ -1314,6 +1346,23 @@ function isRosterLeaderTarget(roster, target) {
   return isLeaderRosterMember(member) || trim(target).toLowerCase() === "leader";
 }
 
+function looksLikeFinalWorkerDelivery(outbound) {
+  const message = outbound?.message || {};
+  const text = trim(message.text);
+  const usableText = usableFallbackAssistantText(text);
+  if (!usableText || /[?？]\s*$/.test(usableText)) return false;
+  const declaredKind = trim(message.intent || message.kind || message.title).toLowerCase();
+  if (["result", "delivery", "complete", "completion", "final"].some((marker) => declaredKind.includes(marker))) {
+    return true;
+  }
+  if (/\/team\/(?:artifacts|results)\//i.test(usableText)) return true;
+  const lower = usableText.toLowerCase();
+  return (
+    /\b(?:complete|completed|delivered|delivery|final|result|pass|passed|fail|failed)\b/.test(lower) ||
+    /(?:完成|已交付|交付完成|结果|报告|验收通过|审核通过|验证通过)/u.test(usableText)
+  );
+}
+
 function isSystemSender(value, cfg = {}) {
   const raw = trim(value) || "clawmanager";
   return isActiveCompletionTarget(raw, cfg) ||
@@ -1622,6 +1671,17 @@ function resolveRedisTeamVerificationRole(envelope) {
   if (profileKey === "agency.evidence-collector") return "evidence";
   if (profileKey === "agency.code-reviewer") return "code-review";
   if (profileKey === "agency.api-tester") return "api-test";
+  if (
+    boolFrom(envelope?.validationAssignment ?? envelope?.validation_assignment, false) ||
+    trim(
+      envelope?.validationTargetAssignmentId ||
+        envelope?.validation_target_assignment_id ||
+        envelope?.validatedAssignmentId ||
+        envelope?.validated_assignment_id,
+    )
+  ) {
+    return "code-review";
+  }
 
   const role = trim(
     envelope?.effectiveRole ||
@@ -1797,6 +1857,10 @@ function turnFinishedWithoutCompletionEvent(envelope, {
     completionRequired: true,
     eventKind: "turn_finished_without_completion",
     activeTurnFinished: true,
+    nonAuthoritative: true,
+    visibleToChat: false,
+    visible_to_chat: false,
+    chatPolicy: "hidden",
     hadAssistantNarrative: deliveredViaCallback || assistantNarratives.length > 0 || !!trim(fallbackText),
     hadOutboundAssignment: !!hadOutboundAssignment,
     completionRecoveryAttempt: Math.max(
@@ -1964,7 +2028,10 @@ async function shouldUseAssistantSessionFallback(cfg, envelope, text) {
   if (!fallbackText) return false;
   const roster = await readTeamRoster(cfg);
   const currentMember = currentRosterMember(cfg, roster);
-  const currentIsLeader = isLeaderRosterMember(currentMember) || isRosterLeaderTarget(roster, cfg.memberId);
+  const currentIsLeader =
+    isLeaderRosterMember(currentMember) ||
+    isRosterLeaderTarget(roster, cfg.memberId) ||
+    isLeaderMember(cfg);
   if (isSystemSender(envelope.from, cfg)) return true;
   if (roster.members.length && isKnownRosterTarget(roster, envelope.from)) {
     if (isLeaderMediatedRoster(roster) && !currentIsLeader && isRosterLeaderTarget(roster, envelope.from)) {
@@ -2350,6 +2417,92 @@ async function xaddJson(redis, stream, event) {
   return redis.command("XADD", stream, "*", ...eventStreamFields(event));
 }
 
+async function resetTurnFacts(redis, cfg, envelope) {
+  const factsKey = turnFactsKey(cfg, envelope);
+  const artifactsKey = turnArtifactFactsKey(cfg, envelope);
+  if (!factsKey || !artifactsKey) return;
+  try {
+    await redis.command("DEL", factsKey, artifactsKey);
+  } catch (err) {
+    warnOnce("turn-facts-reset", "redis-team: durable turn facts are unavailable; using in-process facts: " + (err?.message || err));
+  }
+}
+
+async function recordTurnFacts(redis, cfg, envelope, facts = {}) {
+  const factsKey = turnFactsKey(cfg, envelope);
+  const artifactsKey = turnArtifactFactsKey(cfg, envelope);
+  if (!factsKey || !artifactsKey) return;
+  try {
+    if (facts.outbound) {
+      await redis.command("HSET", factsKey, "outbound", JSON.stringify(facts.outbound));
+    }
+    if (facts.completionProposed) {
+      await redis.command("HSET", factsKey, "completionProposed", "1");
+    }
+    const refs = Array.isArray(facts.artifactRefs) ? facts.artifactRefs.map(trim).filter(Boolean) : [];
+    if (refs.length) {
+      await redis.command("SADD", artifactsKey, ...refs);
+    }
+    // These keys are dispatch-local recovery facts, not task leases or expiring
+    // artifact URLs. Their retention never changes whether a long task may run.
+    await redis.command("EXPIRE", factsKey, 604800);
+    await redis.command("EXPIRE", artifactsKey, 604800);
+  } catch (err) {
+    warnOnce("turn-facts-record", "redis-team: durable turn facts are unavailable; using in-process facts: " + (err?.message || err));
+  }
+}
+
+async function readTurnFacts(cfg, envelope) {
+  const factsKey = turnFactsKey(cfg, envelope);
+  const artifactsKey = turnArtifactFactsKey(cfg, envelope);
+  if (!cfg?.redisUrl || !factsKey || !artifactsKey) {
+    return { outbound: null, completionProposed: false, artifactRefs: [] };
+  }
+  const redis = new RedisClient(cfg.redisUrl);
+  try {
+    await redis.connect();
+    const [rawFacts, rawArtifacts] = await Promise.all([
+      redis.command("HGETALL", factsKey),
+      redis.command("SMEMBERS", artifactsKey),
+    ]);
+    const facts = {};
+    for (let index = 0; Array.isArray(rawFacts) && index + 1 < rawFacts.length; index += 2) {
+      facts[String(rawFacts[index])] = rawFacts[index + 1];
+    }
+    let outbound = null;
+    if (facts.outbound) {
+      try {
+        outbound = JSON.parse(String(facts.outbound));
+      } catch {
+        outbound = null;
+      }
+    }
+    return {
+      outbound,
+      completionProposed: String(facts.completionProposed || "") === "1",
+      artifactRefs: Array.isArray(rawArtifacts) ? rawArtifacts.map(String).map(trim).filter(Boolean) : [],
+    };
+  } catch (err) {
+    warnOnce("turn-facts-read", "redis-team: durable turn facts are unavailable; using in-process facts: " + (err?.message || err));
+    return { outbound: null, completionProposed: false, artifactRefs: [] };
+  } finally {
+    redis.close();
+  }
+}
+
+function mergeActiveTurnFacts(activeResult, durableFacts) {
+  const result = activeResult && typeof activeResult === "object" ? activeResult : {};
+  const facts = durableFacts && typeof durableFacts === "object" ? durableFacts : {};
+  return Object.assign({}, result, {
+    outbound: result.outbound || facts.outbound || null,
+    completionPending: !!result.completionPending || !!facts.completionProposed,
+    artifactRefs: [...new Set([
+      ...(Array.isArray(result.artifactRefs) ? result.artifactRefs : []),
+      ...(Array.isArray(facts.artifactRefs) ? facts.artifactRefs : []),
+    ].map(trim).filter(Boolean))],
+  });
+}
+
 async function xaddTerminalOnce(redis, cfg, completionId, event) {
   const script = [
     "local existing = redis.call('GET', KEYS[1])",
@@ -2423,6 +2576,33 @@ async function workflowReminderIsStale(cfg, envelope, log = console) {
     redis.close();
   }
   return false;
+}
+
+async function activeMemberRouting(cfg, outbound) {
+  const roster = await readTeamRoster(cfg);
+  const currentMember = currentRosterMember(cfg, roster);
+  const currentIsLeader =
+    isLeaderRosterMember(currentMember) ||
+    isRosterLeaderTarget(roster, cfg.memberId) ||
+    isLeaderMember(cfg);
+  const target = trim(outbound?.message?.to || outbound?.target?.to || outbound?.target?.originalTo);
+  const route = trim(outbound?.target?.route).toLowerCase();
+  const targetIsLeader = isRosterLeaderTarget(roster, target);
+  const workerToLeader =
+    !outbound?.failed &&
+    !!target &&
+    !currentIsLeader &&
+    targetIsLeader &&
+    (route === "" || route === "member");
+  return {
+    currentIsLeader,
+    leaderCoordination:
+      !!target &&
+      currentIsLeader &&
+      !targetIsLeader,
+    workerToLeader,
+    workerDelivery: workerToLeader && looksLikeFinalWorkerDelivery(outbound),
+  };
 }
 
 async function readCurrentRootWorkflowState(redis, cfg, rootTaskId) {
@@ -2592,6 +2772,10 @@ function taskEvent(cfg, event, envelope, extra = {}) {
         revision: envelope.revision || 1,
         required: envelope.required !== false,
         reviewRequired: boolFrom(envelope.reviewRequired, false),
+        validationRequired: boolFrom(envelope.validationRequired, false),
+        validationAssignment: boolFrom(envelope.validationAssignment, false),
+        validationTargetAssignmentId: envelope.validationTargetAssignmentId,
+        validationTargetRevision: envelope.validationTargetRevision,
         planVersion: Number(envelope.planVersion || 0),
         ledgerVersion: Number(envelope.ledgerVersion || 0),
         workflowState: envelope.workflowState,
@@ -2663,6 +2847,33 @@ function normalizeEnvelope(raw) {
     revision: Math.max(1, intFrom(raw.revision ?? raw.metadata?.revision, 1)),
     required: raw.required === undefined ? true : boolFrom(raw.required, true),
     reviewRequired: boolFrom(raw.reviewRequired ?? raw.review_required ?? raw.metadata?.reviewRequired, false),
+    validationRequired: boolFrom(
+      raw.validationRequired ?? raw.validation_required ?? raw.metadata?.validationRequired,
+      false,
+    ),
+    validationAssignment: boolFrom(
+      raw.validationAssignment ?? raw.validation_assignment ?? raw.metadata?.validationAssignment,
+      false,
+    ),
+    validationTargetAssignmentId:
+      raw.validationTargetAssignmentId ||
+      raw.validation_target_assignment_id ||
+      raw.validatedAssignmentId ||
+      raw.validated_assignment_id ||
+      raw.metadata?.validationTargetAssignmentId ||
+      raw.metadata?.validation_target_assignment_id,
+    validationTargetRevision: Math.max(
+      0,
+      intFrom(
+        raw.validationTargetRevision ??
+          raw.validation_target_revision ??
+          raw.validatedRevision ??
+          raw.validated_revision ??
+          raw.metadata?.validationTargetRevision ??
+          raw.metadata?.validation_target_revision,
+        0,
+      ),
+    ),
     reviewedAssignmentId:
       raw.reviewedAssignmentId ||
       raw.reviewed_assignment_id ||
@@ -2900,10 +3111,17 @@ function createRuntime(api) {
     const artifactRefs = Array.isArray(meta.artifactRefs) ? meta.artifactRefs : [];
     const resultContentHash = trim(meta.contentHash) || teamResultContentHash(resultMarkdown, artifactRefs);
     const artifactMetadata = await artifactMetadataForRefs(cfg, artifactRefs);
+    const reviewedArtifactRefs = Array.isArray(meta.reviewedArtifactRefs)
+      ? [...new Set(meta.reviewedArtifactRefs.map(trim).filter(Boolean))]
+      : [];
+    const reviewedArtifactMetadata = await artifactMetadataForRefs(cfg, reviewedArtifactRefs);
     const roster = await readTeamRoster(cfg);
     const leaderMediated = isLeaderMediatedRoster(roster);
     const currentMember = currentRosterMember(cfg, roster);
-    const currentIsLeader = isLeaderRosterMember(currentMember) || isRosterLeaderTarget(roster, cfg.memberId);
+    const currentIsLeader =
+      isLeaderRosterMember(currentMember) ||
+      isRosterLeaderTarget(roster, cfg.memberId) ||
+      isLeaderMember(cfg);
     const assignmentResultOnly = leaderMediated && !currentIsLeader;
     const completionStatus = ["failed", "cancelled"].includes(trim(meta.completionStatus).toLowerCase())
       ? "failed"
@@ -2999,7 +3217,8 @@ function createRuntime(api) {
         contentHash: resultContentHash,
         artifactRefs,
         artifactMetadata,
-        reviewedArtifactRefs: Array.isArray(meta.reviewedArtifactRefs) ? meta.reviewedArtifactRefs : undefined,
+        reviewedArtifactRefs: reviewedArtifactRefs.length ? reviewedArtifactRefs : undefined,
+        reviewedArtifactMetadata: reviewedArtifactMetadata.length ? reviewedArtifactMetadata : undefined,
         reviewedAssignmentId:
           trim(meta.reviewedAssignmentId || meta.reviewed_assignment_id || envelope.reviewedAssignmentId) || undefined,
         reviewedRevision:
@@ -3010,8 +3229,37 @@ function createRuntime(api) {
         reviewVerdict: ["pass", "fail"].includes(trim(meta.reviewVerdict || meta.review_verdict).toLowerCase())
           ? trim(meta.reviewVerdict || meta.review_verdict).toLowerCase()
           : undefined,
+        validationTargetAssignmentId:
+          trim(
+            meta.validationTargetAssignmentId ||
+              meta.validation_target_assignment_id ||
+              meta.validatedAssignmentId ||
+              meta.validated_assignment_id ||
+              envelope.validationTargetAssignmentId,
+          ) || undefined,
+        validationTargetRevision:
+          Math.max(
+            0,
+            intFrom(
+              meta.validationTargetRevision ??
+                meta.validation_target_revision ??
+                meta.validatedRevision ??
+                meta.validated_revision ??
+                envelope.validationTargetRevision,
+              0,
+            ),
+          ) || undefined,
+        validationVerdict: ["pass", "fail"].includes(
+          trim(meta.validationVerdict || meta.validation_verdict || meta.reviewVerdict || meta.review_verdict).toLowerCase(),
+        )
+          ? trim(meta.validationVerdict || meta.validation_verdict || meta.reviewVerdict || meta.review_verdict).toLowerCase()
+          : undefined,
       });
       const streamId = await xaddJson(redis, eventsKey(cfg), proposal);
+      await recordTurnFacts(redis, cfg, envelope, {
+        completionProposed: true,
+        artifactRefs,
+      });
       const ack = await waitForCompletionAcknowledgement(
         redis,
         cfg,
@@ -3205,10 +3453,13 @@ function createRuntime(api) {
       String(status?.availability || "").toLowerCase() === "busy" ||
       String(status?.runtimeStatus || "").toLowerCase() === "running";
     const inferredTaskId = requestedTaskId || (statusIsActive ? (status?.currentTaskId || status?.runtimeTaskId) : "") || "";
+    const persistedActiveEnvelope = await readJson(privateActiveAssignmentPath(cfg));
     const inferredEnvelope =
       activeTaskMatches(inferredTaskId)
         ? activeEnvelope
-        : await readTaskEnvelope(cfg, inferredTaskId);
+        : persistedActiveEnvelope && taskMatchesEnvelope(persistedActiveEnvelope, inferredTaskId)
+          ? persistedActiveEnvelope
+          : await readTaskEnvelope(cfg, inferredTaskId);
     const textRootTaskId = extractLabeledValue(text, ["rootTaskId", "root_task_id"]);
     const textRootMessageId = extractLabeledValue(text, ["rootMessageId", "root_message_id"]);
     const explicitRootTaskId = preferredRootTaskId(params.rootTaskId, params.root_task_id);
@@ -3314,7 +3565,30 @@ function createRuntime(api) {
     if (trim(sharedWorkspace.taskContextPhysicalRoot)) {
       await mkdirBestEffort(sharedWorkspace.taskContextPhysicalRoot, TEAM_SHARED_DIR_MODE, "task-scoped context directory");
     }
-    const reviewedAssignmentId = trim(params.reviewedAssignmentId || params.reviewed_assignment_id);
+    const reviewedAssignmentId = trim(
+      params.validationTargetAssignmentId ||
+        params.validation_target_assignment_id ||
+        params.validatedAssignmentId ||
+        params.validated_assignment_id ||
+        params.reviewedAssignmentId ||
+        params.reviewed_assignment_id,
+    );
+    const validationTargetRevision = Math.max(
+      0,
+      intFrom(
+        params.validationTargetRevision ??
+          params.validation_target_revision ??
+          params.validatedRevision ??
+          params.validated_revision ??
+          params.reviewedRevision ??
+          params.reviewed_revision,
+        0,
+      ),
+    );
+    const validationAssignment = boolFrom(
+      params.validationAssignment ?? params.validation_assignment,
+      !!reviewedAssignmentId,
+    );
     const dependsOn = [...new Set([
       ...(Array.isArray(params.dependsOn) ? params.dependsOn : []),
       reviewedAssignmentId,
@@ -3340,8 +3614,12 @@ function createRuntime(api) {
       revision,
       required: requiredForRoot,
       reviewRequired: boolFrom(params.reviewRequired ?? params.review_required, false),
+      validationRequired: boolFrom(params.validationRequired ?? params.validation_required, false),
+      validationAssignment,
+      validationTargetAssignmentId: reviewedAssignmentId || undefined,
+      validationTargetRevision: validationTargetRevision || undefined,
       reviewedAssignmentId: reviewedAssignmentId || undefined,
-      reviewedRevision: Math.max(0, intFrom(params.reviewedRevision ?? params.reviewed_revision, 0)) || undefined,
+      reviewedRevision: validationTargetRevision || undefined,
       verificationUrl: verificationUrl || undefined,
       dependsOn,
 	  planVersion: Number(params.planVersion ?? params.plan_version ?? inferredEnvelope?.planVersion ?? activeEnvelope?.planVersion ?? 1),
@@ -3462,6 +3740,10 @@ function createRuntime(api) {
         revision: message.revision,
         required: message.required,
         reviewRequired: message.reviewRequired,
+        validationRequired: message.validationRequired,
+        validationAssignment: message.validationAssignment,
+        validationTargetAssignmentId: message.validationTargetAssignmentId,
+        validationTargetRevision: message.validationTargetRevision,
         reviewedAssignmentId: message.reviewedAssignmentId,
         reviewedRevision: message.reviewedRevision,
         verificationUrl: message.verificationUrl,
@@ -3483,6 +3765,9 @@ function createRuntime(api) {
         inReplyTo: inferredEnvelope?.messageId || activeEnvelope?.messageId,
       })));
       lastOutbound = { message, target };
+      await recordTurnFacts(redis, cfg, inferredEnvelope || activeEnvelope, {
+        outbound: lastOutbound,
+      });
     } finally {
       redis.close();
     }
@@ -3600,6 +3885,9 @@ function createRuntime(api) {
       }
       activeEnvelope = envelope;
       try {
+        if (config.redisUrl && hasRequiredRedisTeamKeys(config)) {
+          await withRedis(config, null, (redis) => resetTurnFacts(redis, config, envelope));
+        }
         await writeActiveAssignmentEnvelope(config, envelope);
         const result = await fn();
         return { result, completed: activeTaskCompleted, completionPending: activeTaskCompletionPending, outbound: lastOutbound, artifactRefs: activeArtifactRefs };
@@ -3649,8 +3937,8 @@ function createRuntime(api) {
     async artifactWrite(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
-      assertTeamArtifactWriteScope(cfg, params);
       const currentEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
+      assertTeamArtifactWriteScope(cfg, params, currentEnvelope);
       const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "member", true);
       await mkdirBestEffort(path.dirname(resolved.candidate), TEAM_SHARED_DIR_MODE, "Team artifact parent");
       await writeText(resolved.candidate, String(params?.content ?? ""));
@@ -3680,6 +3968,7 @@ function createRuntime(api) {
           : "Team artifact updated: " + resolved.canonical;
         const finalArtifact = isLeaderMember(cfg) && artifactScope === "team" && artifactKind === "final";
         const inheritedWorkId = trim(currentEnvelope.assignmentId || currentEnvelope.workId);
+        const changedArtifactMetadata = await artifactMetadataForRefs(cfg, [resolved.canonical]);
         await withRedis(cfg, null, async (redis) => {
           await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "artifact_changed", currentEnvelope, {
             eventKind: "artifact_changed",
@@ -3687,6 +3976,7 @@ function createRuntime(api) {
             artifactScope,
             artifactKind: artifactKind || undefined,
             artifactRefs: [resolved.canonical],
+            artifactMetadata: changedArtifactMetadata,
             workId: finalArtifact ? "leader-final-synthesis" : currentEnvelope.workId || currentEnvelope.assignmentId,
             assignmentId: finalArtifact ? "leader-final-synthesis" : currentEnvelope.assignmentId || currentEnvelope.workId,
             canonicalWorkId: finalArtifact ? "leader-final-synthesis" : currentEnvelope.assignmentId || currentEnvelope.workId,
@@ -3704,6 +3994,9 @@ function createRuntime(api) {
             responseLocale,
             summary,
           }));
+          await recordTurnFacts(redis, cfg, currentEnvelope, {
+            artifactRefs: [resolved.canonical],
+          });
         });
       }
       return {
@@ -3783,8 +4076,8 @@ function createRuntime(api) {
     async artifactMkdir(params) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
-      assertTeamArtifactWriteScope(cfg, params);
       const currentEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
+      assertTeamArtifactWriteScope(cfg, params, currentEnvelope);
       const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "member", true);
       if (!(await mkdirBestEffort(resolved.candidate, TEAM_SHARED_DIR_MODE, "Team artifact directory"))) {
         throw new Error("Unable to create Team artifact directory: " + resolved.canonical);
@@ -4115,10 +4408,40 @@ function createRuntime(api) {
                 resultMarkdown,
                 contentHash: resultContentHash,
                 artifactRefs,
-                reviewedArtifactRefs: params.reviewedArtifactRefs || params.reviewed_artifact_refs || [],
+                reviewedArtifactRefs:
+                  params.reviewedArtifactRefs ||
+                  params.reviewed_artifact_refs ||
+                  (
+                    params.validationTargetAssignmentId ||
+                    params.validation_target_assignment_id ||
+                    params.validatedAssignmentId ||
+                    params.validated_assignment_id ||
+                    params.reviewedAssignmentId ||
+                    params.reviewed_assignment_id
+                      ? [
+                          ...(Array.isArray(terminalEnvelope.artifactRefs) ? terminalEnvelope.artifactRefs : []),
+                          ...(Array.isArray(terminalEnvelope.contextRefs) ? terminalEnvelope.contextRefs : []),
+                        ]
+                      : []
+                  ),
                 reviewedAssignmentId: params.reviewedAssignmentId || params.reviewed_assignment_id,
                 reviewedRevision: params.reviewedRevision ?? params.reviewed_revision,
                 reviewVerdict: params.reviewVerdict || params.review_verdict,
+                validationTargetAssignmentId:
+                  params.validationTargetAssignmentId ||
+                  params.validation_target_assignment_id ||
+                  params.validatedAssignmentId ||
+                  params.validated_assignment_id,
+                validationTargetRevision:
+                  params.validationTargetRevision ??
+                  params.validation_target_revision ??
+                  params.validatedRevision ??
+                  params.validated_revision,
+                validationVerdict:
+                  params.validationVerdict ||
+                  params.validation_verdict ||
+                  params.reviewVerdict ||
+                  params.review_verdict,
                 workId: normalizedCompletionAssignmentId,
                 assignmentId: normalizedCompletionAssignmentId,
                 attemptId: params.attemptId || params.attempt_id,
@@ -4346,8 +4669,12 @@ const teamSendParameters = {
     revision: { type: "number", minimum: 1, description: "Assignment/artifact revision" },
     required: { type: "boolean", description: "Whether this assignment blocks root completion" },
     reviewRequired: { type: "boolean", description: "Whether the latest revision requires review before root completion" },
-    reviewedAssignmentId: { type: "string", description: "For a Reviewer assignment, the existing business assignment being reviewed" },
-    reviewedRevision: { type: "number", minimum: 1, description: "For a Reviewer assignment, the exact target revision" },
+    validationRequired: { type: "boolean", description: "Whether the target assignment requires a separate validation result before root completion" },
+    validationAssignment: { type: "boolean", description: "Marks this as a validation assignment; any member role may validate" },
+    validationTargetAssignmentId: { type: "string", description: "Existing business assignment this validator must check" },
+    validationTargetRevision: { type: "number", minimum: 1, description: "Exact target revision this validator must check" },
+    reviewedAssignmentId: { type: "string", description: "Legacy alias for validationTargetAssignmentId" },
+    reviewedRevision: { type: "number", minimum: 1, description: "Legacy alias for validationTargetRevision" },
     verificationUrl: { type: "string", description: "Optional directly reachable HTTP(S) URL for one brief Browser check" },
     planVersion: { type: "number", minimum: 0 },
     ledgerVersion: { type: "number", minimum: 0 },
@@ -4422,9 +4749,12 @@ const completeParameters = {
       description: "Optional exact artifact paths reviewed by this completion; advisory and non-blocking",
       items: { type: "string" },
     },
-    reviewedAssignmentId: { type: "string", description: "Reviewer-only target assignment validated by this result" },
-    reviewedRevision: { type: "number", minimum: 1, description: "Reviewer-only exact target revision validated by this result" },
-    reviewVerdict: { type: "string", enum: ["pass", "fail"], description: "Reviewer-only structured verdict; PASS is required to close a review gate" },
+    validationTargetAssignmentId: { type: "string", description: "Contract target assignment validated by this result; valid for any member role" },
+    validationTargetRevision: { type: "number", minimum: 1, description: "Exact contract target revision validated by this result" },
+    validationVerdict: { type: "string", enum: ["pass", "fail"], description: "Structured validator verdict; PASS is required to close the validation gate" },
+    reviewedAssignmentId: { type: "string", description: "Legacy alias for validationTargetAssignmentId" },
+    reviewedRevision: { type: "number", minimum: 1, description: "Legacy alias for validationTargetRevision" },
+    reviewVerdict: { type: "string", enum: ["pass", "fail"], description: "Legacy alias for validationVerdict" },
     completionId: { type: "string" },
     attemptId: { type: "string" },
     rootTaskId: { type: "string" },
@@ -5254,6 +5584,10 @@ export default definePluginEntry({
                     );
                   }
 
+                  activeResult = mergeActiveTurnFacts(
+                    activeResult,
+                    await readTurnFacts(cfg, envelope),
+                  );
                   let fallbackCompleted = false;
                   let fallbackPending = false;
                   const assistantNarratives = await readAssistantNarrativesFromDispatch(
@@ -5263,17 +5597,37 @@ export default definePluginEntry({
                   const fallbackText = assistantNarratives.length
                     ? assistantNarratives[assistantNarratives.length - 1].text
                     : await readLatestAssistantTextFromDispatch(activeResult?.result?.dispatchResult);
+                  const routing = await activeMemberRouting(cfg, activeResult?.outbound);
+                  const workerOutboundText = routing.workerDelivery
+                    ? trim(activeResult?.outbound?.message?.text)
+                    : "";
+                  // For a Worker delivery, team_send contains the durable
+                  // assignment result while the final assistant sentence is
+                  // often only "sent above". Prefer the actual delivery body.
+                  const turnResultText = routing.workerDelivery
+                    ? workerOutboundText || fallbackText
+                    : fallbackText;
                   const terminalAfterDispatch = await runtime.isTaskTerminal(cfg, envelope);
-                  if (!dispatchFailed && !activeResult?.completed && !activeResult?.outbound) {
-                    if (!terminalAfterDispatch && await shouldUseAssistantSessionFallback(cfg, envelope, fallbackText)) {
-                      const usableFallbackText = usableFallbackAssistantText(fallbackText);
+                  if (!dispatchFailed && !activeResult?.completed && !activeResult?.completionPending && !routing.leaderCoordination) {
+                    if (!terminalAfterDispatch && await shouldUseAssistantSessionFallback(cfg, envelope, turnResultText)) {
+                      const usableFallbackText = usableFallbackAssistantText(turnResultText);
+                      const rootTaskId = preferredRootTaskId(envelope.rootTaskId, envelope.taskId);
+                      const assignmentId = trim(envelope.assignmentId || envelope.workId);
+                      const discoveredArtifactRefs = routing.currentIsLeader
+                        ? await collectRootTaskArtifactRefs(cfg, rootTaskId)
+                        : await collectMemberAssignmentArtifactRefs(cfg, rootTaskId, cfg.memberId, assignmentId);
+                      const fallbackArtifactRefs = await validateArtifactRefs(cfg, [
+                        ...(activeResult?.artifactRefs || []),
+                        ...discoveredArtifactRefs,
+                        ...canonicalTeamArtifactRefsFromText(cfg, usableFallbackText, rootTaskId),
+                      ]);
                       const fallbackResult = await runtime.completeActiveTask(usableFallbackText, {
                         cfg,
                         envelope,
                         taskId: envelope.taskId,
                         summary: usableFallbackText.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Redis Team task completed",
                         resultMarkdown: usableFallbackText,
-                        artifactRefs: activeResult?.artifactRefs || [],
+                        artifactRefs: fallbackArtifactRefs,
                         automaticTurnResult: true,
                       });
                       fallbackCompleted = fallbackResult?.decision === "accepted";
@@ -5308,7 +5662,7 @@ export default definePluginEntry({
                     }
                   }
 
-                  if (!dispatchFailed && !activeResult?.completed && !activeResult?.completionPending && !fallbackCompleted && !fallbackPending) {
+                  if (!dispatchFailed && !activeResult?.completed && !activeResult?.completionPending && !fallbackCompleted && !fallbackPending && !activeResult?.outbound) {
                     if (terminalAfterDispatch || await runtime.isTaskTerminal(cfg, envelope)) {
                       ctx.log?.info?.(
                         "redis-team: task " + envelope.taskId + " already terminal after dispatch",

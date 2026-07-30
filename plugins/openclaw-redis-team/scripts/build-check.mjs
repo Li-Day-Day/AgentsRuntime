@@ -160,10 +160,17 @@ if (dist.includes('path.join(cfg.sharedDir, ".openclaw-redis-team", "tasks"')) {
 if (dist.includes('|| "unscoped"')) {
   throw new Error("member Team artifacts must reject missing root task context instead of writing an unscoped path");
 }
-const reviewerGuard = dist.indexOf('kind === "review" && reviewer');
-const genericTeamScopeRejection = dist.indexOf("Only the Team Leader may write team-scoped artifacts");
-if (reviewerGuard < 0 || genericTeamScopeRejection < 0 || reviewerGuard > genericTeamScopeRejection) {
-  throw new Error("Reviewer/QA review publishing must be handled by the team-scope guard");
+const validationWriterHelper = dist.indexOf("function isAssignedValidationWriter");
+const validationWriterGuard = dist.indexOf('kind === "review" && isAssignedValidationWriter(cfg, activeEnvelope)');
+const genericTeamScopeRejection = dist.indexOf("Only the Team Leader or assigned validator may write this team-scoped artifact");
+if (
+  validationWriterHelper < 0 ||
+  validationWriterGuard < 0 ||
+  genericTeamScopeRejection < 0 ||
+  validationWriterHelper > validationWriterGuard ||
+  validationWriterGuard > genericTeamScopeRejection
+) {
+  throw new Error("Assigned validation publishing must be handled by the team-scope guard");
 }
 const deliverStart = dist.indexOf("deliver: async (payload) => {");
 const deliverEnd = dist.indexOf("onRecordError:", deliverStart);

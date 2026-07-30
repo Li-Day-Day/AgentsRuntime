@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, browserToolCallFailed, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
+const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, browserToolCallFailed, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -50,7 +50,7 @@ function createHarness(memberId, role) {
   return registered;
 }
 
-async function seedActive(memberId, role, assignmentId) {
+async function seedActive(memberId, role, assignmentId, extra = {}) {
   const dir = path.join(state, "teams", "75", memberId);
   await fs.mkdir(dir, { recursive: true });
   const envelope = {
@@ -72,6 +72,7 @@ async function seedActive(memberId, role, assignmentId) {
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
       terminal: false,
     },
+    ...extra,
   };
   await fs.writeFile(path.join(dir, "active-assignment.json"), JSON.stringify(envelope), "utf8");
 }
@@ -190,6 +191,36 @@ try {
     );
     assert.notEqual(developerBrowser.block, true, "Developer Browser must not inherit the Reviewer budget");
   }
+  const genericValidatorState = {};
+  for (let index = 0; index < 4; index += 1) {
+    const genericValidatorBrowser = pluginModule.reviewerBrowserToolDecision(
+      {
+        role: "domain-specialist",
+        validationAssignment: true,
+        validationTargetAssignmentId: "dev-01",
+        taskId: "team-75-task-149",
+      },
+      { toolName: "browser", params: { action: "snapshot" } },
+      genericValidatorState,
+      3000 + index,
+    );
+    assert.notEqual(genericValidatorBrowser.block, true);
+  }
+  assert.equal(
+    pluginModule.reviewerBrowserToolDecision(
+      {
+        role: "domain-specialist",
+        validationAssignment: true,
+        validationTargetAssignmentId: "dev-01",
+        taskId: "team-75-task-149",
+      },
+      { toolName: "browser", params: { action: "snapshot" } },
+      genericValidatorState,
+      3005,
+    ).block,
+    true,
+    "any assigned validator gets the brief Browser budget without reducing ordinary Worker Browser access",
+  );
   assert.equal(pluginModule.rootWorkflowStateIsTerminal({ terminal: true }), true);
   assert.equal(pluginModule.rootWorkflowStateIsTerminal({ status: "succeeded" }), true);
   assert.equal(pluginModule.rootWorkflowStateIsTerminal({ status: "running" }), false);
@@ -215,6 +246,52 @@ try {
   assert.equal(turnFinished.hadAssistantNarrative, true);
   assert.equal(turnFinished.hadOutboundAssignment, false);
   assert.equal(turnFinished.completionRecoveryAttempt, 1);
+  assert.equal(turnFinished.visibleToChat, false);
+  assert.equal(turnFinished.chatPolicy, "hidden");
+  assert.deepEqual(
+    pluginModule.mergeActiveTurnFacts(
+      { outbound: null, completionPending: false, artifactRefs: ["/team/a.md"] },
+      { outbound: { message: { to: "developer" } }, completionProposed: true, artifactRefs: ["/team/a.md", "/team/b.md"] },
+    ),
+    {
+      outbound: { message: { to: "developer" } },
+      completionPending: true,
+      artifactRefs: ["/team/a.md", "/team/b.md"],
+    },
+    "dispatch completion must recover facts emitted by a separate plugin instance",
+  );
+  const leaderDispatchRouting = await pluginModule.activeMemberRouting(
+    { teamId: "75", memberId: "leader", role: "leader", sharedDir: shared },
+    { message: { to: "developer", text: "Implement the page." } },
+  );
+  assert.equal(leaderDispatchRouting.leaderCoordination, true);
+  assert.equal(leaderDispatchRouting.workerDelivery, false);
+  const workerDeliveryRouting = await pluginModule.activeMemberRouting(
+    { teamId: "75", memberId: "developer", role: "developer", sharedDir: shared },
+    { message: { to: "leader", text: "Delivery complete." } },
+  );
+  assert.equal(workerDeliveryRouting.leaderCoordination, false);
+  assert.equal(workerDeliveryRouting.workerDelivery, true);
+  const workerQuestionRouting = await pluginModule.activeMemberRouting(
+    { teamId: "75", memberId: "developer", role: "developer", sharedDir: shared },
+    { message: { to: "leader", text: "Should I change the current color palette?" } },
+  );
+  assert.equal(workerQuestionRouting.workerToLeader, true);
+  assert.equal(workerQuestionRouting.workerDelivery, false, "a Worker question must not close its assignment");
+  const workerArtifactDeliveryRouting = await pluginModule.activeMemberRouting(
+    { teamId: "75", memberId: "developer", role: "developer", sharedDir: shared },
+    { message: { to: "leader", text: "产物：/team/artifacts/team-75-task-150/members/developer/dev-01/kanban.html" } },
+  );
+  assert.equal(workerArtifactDeliveryRouting.workerDelivery, true);
+  const failedLeaderDispatchRouting = await pluginModule.activeMemberRouting(
+    { teamId: "75", memberId: "leader", role: "leader", sharedDir: shared },
+    { failed: true, message: { to: "missing-worker", text: "Implement the page." } },
+  );
+  assert.equal(
+    failedLeaderDispatchRouting.leaderCoordination,
+    true,
+    "a failed or unknown Leader dispatch must never be mistaken for root completion",
+  );
   const controlTarget = await pluginModule.resolveRedisTeamTarget(
     { teamId: "75", memberId: "leader", sharedDir: shared },
     "clawmanager-monitor",
@@ -493,6 +570,34 @@ try {
   assert.equal(review.ok, true);
   assert.equal(review.artifact.path, "/team/results/team-75-task-150/reviews/review-01/review-report.md");
   await fs.access(path.join(shared, "results", "team-75-task-150", "reviews", "review-01", "review-report.md"));
+  const legacyPrefixedReview = toolResult(await reviewerTools.get("team_artifact_write").execute("review-prefixed", {
+    scope: "team",
+    kind: "review",
+    path: "review-01/legacy-review-report.md",
+    content: "# Legacy review report\n\nPASS\n",
+  }));
+  assert.equal(
+    legacyPrefixedReview.artifact.path,
+    "/team/results/team-75-task-150/reviews/review-01/legacy-review-report.md",
+    "kind=review must strip exactly one duplicated active assignment prefix",
+  );
+  await seedActive("auditor", "domain-specialist", "audit-01", {
+    validationAssignment: true,
+    validationTargetAssignmentId: "dev-01",
+    validationTargetRevision: 1,
+  });
+  const auditorTools = createHarness("auditor", "domain-specialist");
+  const genericValidationReport = toolResult(await auditorTools.get("team_artifact_write").execute("audit-report", {
+    scope: "team",
+    kind: "review",
+    path: "validation-report.md",
+    content: "# Validation report\n\nPASS\n",
+  }));
+  assert.equal(
+    genericValidationReport.artifact.path,
+    "/team/results/team-75-task-150/reviews/audit-01/validation-report.md",
+    "an explicitly assigned validator must not depend on a Reviewer role name",
+  );
 
   await seedActive("leader", "leader", "review-01");
   const leaderIdentityTools = createHarness("leader", "leader");
@@ -512,6 +617,8 @@ try {
   assert.doesNotMatch(source, /must use \$\{locale \|\| "zh-CN"\}/);
   assert.match(source, /workflowReminderIsStale/);
   assert.match(source, /ignored message post-processing failure after terminal assignment/);
+  assert.match(source, /automatic_turn_completion_v2/);
+  assert.match(source, /validation_contract_v2/);
 
   console.log("Team75 Redis Team contract test passed");
 } finally {
