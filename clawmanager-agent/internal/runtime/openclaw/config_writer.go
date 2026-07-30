@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/iamlovingit/clawmanager-agent/internal/gateway"
+	"github.com/iamlovingit/clawmanager-agent/internal/scheduledtasks"
 )
 
 const openClawTrustedProxyUserHeader = "x-forwarded-prefix"
@@ -104,6 +106,33 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 		if err := gateway.PrepareLiteTeamSharedWorkspace(cfg.WorkspaceRoot, req, workspacePath); err != nil {
 			return err
 		}
+	}
+	openclawHome := filepath.Join(workspacePath, "home", ".openclaw")
+	result := scheduledtasks.ApplyOpenClawFromEnv(openclawHome, func(key string) string {
+		if req.Environment != nil {
+			if value, ok := req.Environment[key]; ok {
+				return value
+			}
+		}
+		if req.Env != nil {
+			if value, ok := req.Env[key]; ok {
+				return value
+			}
+		}
+		return os.Getenv(key)
+	}, req.UID, req.GID)
+	if result.Error != "" {
+		log.Printf("apply openclaw scheduled tasks failed (continuing): source_env=%s error=%s", result.SourceEnv, result.Error)
+	}
+	// Apply writes jobs.json as the agent user (often root). Gateway runs as
+	// instance UID, so chown the whole cron tree — not only the directory inode.
+	cronDir := filepath.Join(openclawHome, "cron")
+	if _, err := os.Stat(cronDir); err == nil {
+		if err := chownTree(cronDir, req.UID, req.GID); err != nil {
+			return fmt.Errorf("chown openclaw cron tree: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat openclaw cron dir: %w", err)
 	}
 	return nil
 }
