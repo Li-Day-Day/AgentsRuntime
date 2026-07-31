@@ -35,7 +35,59 @@ func PrepareLiteTeamSharedWorkspace(workspaceRoot string, req CreateGatewayReque
 	if err := repairLiteTeamSharedTree(sharedDir, sharedGID); err != nil {
 		return err
 	}
+	if strings.EqualFold(strings.TrimSpace(req.AgentType), "hermes") {
+		if err := prepareHermesLiteTeamWorkerHome(workspacePath, req); err != nil {
+			return err
+		}
+	}
 	return ensureLiteTeamWorkspaceAliases(workspacePath, sharedDir, req)
+}
+
+func prepareHermesLiteTeamWorkerHome(workspacePath string, req CreateGatewayRequest) error {
+	realWorkspace, err := filepath.EvalSymlinks(workspacePath)
+	if err != nil {
+		return fmt.Errorf("resolve Hermes Team instance workspace: %w", err)
+	}
+	workerHome := filepath.Join(workspacePath, "home", ".clawmanager-team-worker")
+	managedDirectories := []string{
+		workerHome,
+		filepath.Join(workerHome, ".hermes"),
+		filepath.Join(workerHome, ".cache"),
+		filepath.Join(workerHome, ".cache", "npm"),
+		filepath.Join(workerHome, ".cache", "uv"),
+		filepath.Join(workerHome, ".config"),
+		filepath.Join(workerHome, ".local"),
+		filepath.Join(workerHome, ".local", "share"),
+	}
+	for _, directory := range managedDirectories {
+		if !pathWithin(workspacePath, directory) {
+			return fmt.Errorf("Hermes Team worker directory escaped the instance workspace: %s", directory)
+		}
+		if err := os.MkdirAll(directory, 0o750); err != nil {
+			return fmt.Errorf("create Hermes Team worker directory %s: %w", directory, err)
+		}
+		info, err := os.Lstat(directory)
+		if err != nil {
+			return fmt.Errorf("inspect Hermes Team worker directory %s: %w", directory, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("Hermes Team worker path must be a real directory: %s", directory)
+		}
+		realDirectory, err := filepath.EvalSymlinks(directory)
+		if err != nil {
+			return fmt.Errorf("resolve Hermes Team worker directory %s: %w", directory, err)
+		}
+		if !pathWithin(realWorkspace, realDirectory) {
+			return fmt.Errorf("Hermes Team worker directory real path escaped the instance workspace: %s", directory)
+		}
+		if err := ChownWorkspace(directory, req.UID, req.GID); err != nil {
+			return fmt.Errorf("chown Hermes Team worker directory %s: %w", directory, err)
+		}
+		if err := os.Chmod(directory, 0o750); err != nil {
+			return fmt.Errorf("chmod Hermes Team worker directory %s: %w", directory, err)
+		}
+	}
+	return nil
 }
 
 func validateLiteTeamSharedPath(workspaceRoot string, req CreateGatewayRequest, workspacePath, sharedDir string) error {

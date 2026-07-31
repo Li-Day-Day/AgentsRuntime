@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -233,6 +234,7 @@ func itoa(v int) string {
 type fakeStarter struct {
 	mu      sync.Mutex
 	nextPID int
+	done    <-chan error
 	started []GatewayStartSpec
 	stopped []int
 }
@@ -245,12 +247,56 @@ func (f *fakeStarter) StartGateway(_ context.Context, spec GatewayStartSpec) (Ma
 	if pid == 0 {
 		pid = 1
 	}
-	return ManagedProcess{PID: pid, Stop: func(context.Context) error {
+	return ManagedProcess{PID: pid, Done: f.done, Stop: func(context.Context) error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.stopped = append(f.stopped, pid)
 		return nil
 	}}, nil
+}
+
+func TestCreateGatewayReportsProcessExitBeforeHealthReadiness(t *testing.T) {
+	cfg := testConfig(t)
+	processDone := make(chan error, 1)
+	starter := &fakeStarter{nextPID: 4243, done: processDone}
+	health := newBlockingHealthChecker()
+	mgr := NewGatewayManager(cfg, starter, NewPortAllocator(func(int) bool { return false }))
+	mgr.SetHealthChecker(health)
+
+	if _, err := mgr.CreateGateway(context.Background(), testGatewayRequest(cfg.WorkspaceRoot, 64, 45, 7)); err != nil {
+		t.Fatalf("CreateGateway() error = %v", err)
+	}
+	eventually(t, func() bool { return starter.startCount() == 1 })
+	processDone <- errors.New("Hermes Redis Team consumer exited before readiness")
+	eventually(t, func() bool {
+		states := mgr.GatewayStates()
+		return len(states) == 1 &&
+			states[0].State == "error" &&
+			strings.Contains(states[0].ErrorMessage, "consumer exited before readiness")
+	})
+}
+
+func TestCreateGatewayContinuesSupervisingProcessAfterHealthReadiness(t *testing.T) {
+	cfg := testConfig(t)
+	processDone := make(chan error, 1)
+	starter := &fakeStarter{nextPID: 4244, done: processDone}
+	mgr := NewGatewayManager(cfg, starter, NewPortAllocator(func(int) bool { return false }))
+	mgr.SetHealthChecker(&fakeHealthChecker{})
+
+	if _, err := mgr.CreateGateway(context.Background(), testGatewayRequest(cfg.WorkspaceRoot, 65, 45, 7)); err != nil {
+		t.Fatalf("CreateGateway() error = %v", err)
+	}
+	eventually(t, func() bool {
+		states := mgr.GatewayStates()
+		return len(states) == 1 && states[0].State == "running"
+	})
+	processDone <- errors.New("required Team gateway component stopped")
+	eventually(t, func() bool {
+		states := mgr.GatewayStates()
+		return len(states) == 1 &&
+			states[0].State == "error" &&
+			strings.Contains(states[0].ErrorMessage, "required Team gateway component stopped")
+	})
 }
 
 func (f *fakeStarter) startCount() int {

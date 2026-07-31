@@ -24,20 +24,24 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 		`.clawmanager-team-worker`,
 		`export HERMES_HOME="${team_worker_home}/.hermes"`,
 		`export CLAWMANAGER_GATEWAY_PORT="${team_worker_port}"`,
+		`CLAWMANAGER_TEAM_READY_FILE`,
+		`HERMES_TEAM_STARTUP_TIMEOUT_SECONDS`,
 		`[ "${team_worker_port}" -eq "${port}" ]`,
 		`[ "${team_worker_port}" -gt 65535 ]`,
 		`/usr/local/bin/hermes-apply-runtime-config`,
 		`for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md`,
 		"hermes gateway run --accept-hooks --no-supervise",
+		`while [ ! -s "${team_ready_file}" ]`,
+		`wait -n "${wait_pids[@]}"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("start-hermes-dashboard-gateway missing %q", want)
 		}
 	}
-	dashboardStart := strings.Index(script, "hermes dashboard")
-	teamStart := strings.Index(script, "exec hermes gateway run --accept-hooks --no-supervise")
-	if dashboardStart < 0 || teamStart < 0 || dashboardStart > teamStart {
-		t.Fatalf("dashboard must bind before the isolated Team consumer starts")
+	teamStart := strings.LastIndex(script, "start_team_gateway")
+	dashboardStart := strings.LastIndex(script, `echo "Starting Hermes dashboard gateway`)
+	if dashboardStart < 0 || teamStart < 0 || teamStart > dashboardStart {
+		t.Fatalf("Team consumer readiness must be established before the dashboard becomes healthy")
 	}
 }
 

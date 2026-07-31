@@ -188,10 +188,45 @@ func (m *GatewayManager) startGatewayInBackground(gatewayID string, req CreateGa
 		return
 	}
 
-	if err := m.health.WaitReady(context.Background(), spec); err != nil {
-		m.stopProcessAsync(process)
-		m.markGatewayError(gatewayID, process.PID, fmt.Errorf("%w: %v", ErrGatewayStartFailed, err))
-		return
+	healthCtx, cancelHealth := context.WithCancel(context.Background())
+	healthResult := make(chan error, 1)
+	go func() {
+		healthResult <- m.health.WaitReady(healthCtx, spec)
+	}()
+	if process.Done != nil {
+		select {
+		case processErr := <-process.Done:
+			cancelHealth()
+			if processErr == nil {
+				processErr = fmt.Errorf("gateway process exited before readiness")
+			}
+			m.markGatewayError(gatewayID, process.PID, fmt.Errorf("%w: %v", ErrGatewayStartFailed, processErr))
+			return
+		case healthErr := <-healthResult:
+			cancelHealth()
+			if healthErr != nil {
+				m.stopProcessAsync(process)
+				m.markGatewayError(gatewayID, process.PID, fmt.Errorf("%w: %v", ErrGatewayStartFailed, healthErr))
+				return
+			}
+		}
+		select {
+		case processErr := <-process.Done:
+			if processErr == nil {
+				processErr = fmt.Errorf("gateway process exited at readiness boundary")
+			}
+			m.markGatewayError(gatewayID, process.PID, fmt.Errorf("%w: %v", ErrGatewayStartFailed, processErr))
+			return
+		default:
+		}
+	} else {
+		healthErr := <-healthResult
+		cancelHealth()
+		if healthErr != nil {
+			m.stopProcessAsync(process)
+			m.markGatewayError(gatewayID, process.PID, fmt.Errorf("%w: %v", ErrGatewayStartFailed, healthErr))
+			return
+		}
 	}
 	m.markGatewayRunning(gatewayID, req, process.PID)
 	if process.Done != nil {

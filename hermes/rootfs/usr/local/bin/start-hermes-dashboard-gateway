@@ -143,21 +143,8 @@ shutdown() {
 
 trap shutdown INT TERM
 
-
-start_instance_agent
-
-echo "Starting Hermes dashboard gateway: dashboard_port=${port} host=${host}"
-hermes dashboard \
-    --host "${host}" \
-    --port "${port}" \
-    --no-open \
-    --insecure \
-    --skip-build &
-dashboard_pid="$!"
-echo "Hermes dashboard gateway started: dashboard_pid=${dashboard_pid} dashboard_port=${port}"
-
-if should_start_team_gateway; then
-    echo "Starting Hermes Redis Team consumer: member=${CLAWMANAGER_TEAM_MEMBER_ID} dashboard_port=${port} team_worker_port=${team_worker_port}"
+start_team_gateway() {
+    echo "Preparing Hermes Redis Team consumer: member=${CLAWMANAGER_TEAM_MEMBER_ID} dashboard_port=${port} team_worker_port=${team_worker_port}"
     (
         dashboard_hermes_home="${HERMES_HOME}"
         team_worker_home="${HERMES_TEAM_WORKER_HOME:-${HOME}/.clawmanager-team-worker}"
@@ -170,30 +157,121 @@ if should_start_team_gateway; then
         export UV_CACHE_DIR="${XDG_CACHE_HOME}/uv"
         export CLAWMANAGER_GATEWAY_PORT="${team_worker_port}"
         export PORT="${team_worker_port}"
+        export CLAWMANAGER_TEAM_READY_FILE="${CLAWMANAGER_TEAM_READY_FILE:-${HERMES_HOME}/runtime/redis-team.ready.json}"
         mkdir -p \
             "${HERMES_HOME}" \
             "${NPM_CONFIG_CACHE}" \
             "${UV_CACHE_DIR}" \
             "${XDG_CONFIG_HOME}" \
-            "${XDG_DATA_HOME}"
+            "${XDG_DATA_HOME}" \
+            "$(dirname "${CLAWMANAGER_TEAM_READY_FILE}")"
+        rm -f "${CLAWMANAGER_TEAM_READY_FILE}"
         for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md; do
             if [ -f "${dashboard_hermes_home}/${managed_identity}" ] && [ ! -e "${HERMES_HOME}/${managed_identity}" ]; then
                 cp "${dashboard_hermes_home}/${managed_identity}" "${HERMES_HOME}/${managed_identity}"
             fi
         done
-        /usr/local/bin/hermes-apply-runtime-config >/dev/null 2>&1 || true
+        /usr/local/bin/hermes-apply-runtime-config
         cd "${team_worker_home}"
         exec hermes gateway run --accept-hooks --no-supervise
     ) &
     team_gateway_pid="$!"
-    echo "Hermes Redis Team consumer started: team_gateway_pid=${team_gateway_pid} team_worker_port=${team_worker_port}"
+
+    team_startup_timeout="${HERMES_TEAM_STARTUP_TIMEOUT_SECONDS:-90}"
+    case "${team_startup_timeout}" in
+        ''|*[!0-9]*)
+            echo "invalid Hermes Redis Team startup timeout: ${team_startup_timeout}" >&2
+            kill "${team_gateway_pid}" 2>/dev/null || true
+            wait "${team_gateway_pid}" 2>/dev/null || true
+            team_gateway_pid=""
+            return 64
+            ;;
+    esac
+    if [ "${team_startup_timeout}" -lt 1 ]; then
+        echo "Hermes Redis Team startup timeout must be positive: ${team_startup_timeout}" >&2
+        kill "${team_gateway_pid}" 2>/dev/null || true
+        wait "${team_gateway_pid}" 2>/dev/null || true
+        team_gateway_pid=""
+        return 64
+    fi
+
+    team_ready_file="${HERMES_TEAM_WORKER_HOME:-${HOME}/.clawmanager-team-worker}/.hermes/runtime/redis-team.ready.json"
+    if [ -n "${CLAWMANAGER_TEAM_READY_FILE:-}" ]; then
+        team_ready_file="${CLAWMANAGER_TEAM_READY_FILE}"
+    fi
+    started_at="${SECONDS}"
+    while [ ! -s "${team_ready_file}" ]; do
+        if ! kill -0 "${team_gateway_pid}" 2>/dev/null; then
+            set +e
+            wait "${team_gateway_pid}"
+            team_status="$?"
+            set -e
+            team_gateway_pid=""
+            if [ "${team_status}" -eq 0 ]; then
+                team_status=1
+            fi
+            echo "Hermes Redis Team consumer exited before readiness: status=${team_status}" >&2
+            return "${team_status}"
+        fi
+        if [ "$((SECONDS - started_at))" -ge "${team_startup_timeout}" ]; then
+            echo "Hermes Redis Team consumer did not become ready within ${team_startup_timeout}s" >&2
+            kill "${team_gateway_pid}" 2>/dev/null || true
+            wait "${team_gateway_pid}" 2>/dev/null || true
+            team_gateway_pid=""
+            return 124
+        fi
+        sleep 0.25
+    done
+    echo "Hermes Redis Team consumer ready: team_gateway_pid=${team_gateway_pid} team_worker_port=${team_worker_port}"
+    return 0
+}
+
+start_instance_agent
+
+if should_start_team_gateway; then
+    set +e
+    start_team_gateway
+    team_start_status="$?"
+    set -e
+    if [ "${team_start_status}" -ne 0 ]; then
+        if [ -n "${agent_pid}" ]; then
+            kill "${agent_pid}" 2>/dev/null || true
+            wait "${agent_pid}" 2>/dev/null || true
+            agent_pid=""
+        fi
+        exit "${team_start_status}"
+    fi
+fi
+
+echo "Starting Hermes dashboard gateway: dashboard_port=${port} host=${host}"
+hermes dashboard \
+    --host "${host}" \
+    --port "${port}" \
+    --no-open \
+    --insecure \
+    --skip-build &
+dashboard_pid="$!"
+echo "Hermes dashboard gateway started: dashboard_pid=${dashboard_pid} dashboard_port=${port}"
+
+wait_pids=("${dashboard_pid}")
+if [ -n "${team_gateway_pid}" ]; then
+    wait_pids+=("${team_gateway_pid}")
+fi
+if [ -n "${team_gateway_pid}" ] && [ -n "${agent_pid}" ]; then
+    wait_pids+=("${agent_pid}")
 fi
 
 set +e
-wait "${dashboard_pid}"
+wait -n "${wait_pids[@]}"
 status="$?"
 set -e
-dashboard_pid=""
+
+if [ "${#wait_pids[@]}" -gt 1 ]; then
+    echo "A required Hermes Team gateway component stopped: status=${status}" >&2
+    if [ "${status}" -eq 0 ]; then
+        status=1
+    fi
+fi
 
 if [ -n "${agent_pid}" ]; then
     kill "${agent_pid}" 2>/dev/null || true
@@ -205,6 +283,10 @@ if [ -n "${team_gateway_pid}" ]; then
     team_status=0
     wait "${team_gateway_pid}" 2>/dev/null || team_status="$?"
     echo "Hermes Redis Team consumer stopped: team_gateway_pid=${team_gateway_pid} status=${team_status}"
+fi
+if [ -n "${dashboard_pid}" ]; then
+    kill "${dashboard_pid}" 2>/dev/null || true
+    wait "${dashboard_pid}" 2>/dev/null || true
 fi
 
 exit "${status}"

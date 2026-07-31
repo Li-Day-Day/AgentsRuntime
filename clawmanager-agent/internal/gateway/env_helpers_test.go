@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -123,6 +124,22 @@ func TestHermesLiteTeamEnvironmentAndConfigMatchOpenClawContract(t *testing.T) {
 			t.Fatalf("Hermes Team alias = %q want %q", target, shared)
 		}
 	}
+	for _, directory := range []string{
+		filepath.Join(workspace, "home", ".clawmanager-team-worker"),
+		filepath.Join(workspace, "home", ".clawmanager-team-worker", ".hermes"),
+		filepath.Join(workspace, "home", ".clawmanager-team-worker", ".cache", "npm"),
+		filepath.Join(workspace, "home", ".clawmanager-team-worker", ".cache", "uv"),
+		filepath.Join(workspace, "home", ".clawmanager-team-worker", ".config"),
+		filepath.Join(workspace, "home", ".clawmanager-team-worker", ".local", "share"),
+	} {
+		info, err := os.Lstat(directory)
+		if err != nil {
+			t.Fatalf("Hermes Team worker directory %s missing: %v", directory, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			t.Fatalf("Hermes Team worker path %s is not a real directory", directory)
+		}
+	}
 }
 
 func TestOpenClawNonTeamDoesNotCreateTeamWorkspace(t *testing.T) {
@@ -139,6 +156,34 @@ func TestOpenClawNonTeamDoesNotCreateTeamWorkspace(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(workspace, "home", ".openclaw", "workspace", "team")); !os.IsNotExist(err) {
 		t.Fatalf("non-Team OpenClaw runtime created Team alias: %v", err)
+	}
+}
+
+func TestHermesLiteTeamRejectsSymlinkedWorkerHome(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "hermes", "user-1", "instance-3")
+	shared := filepath.Join(root, "teams", "user-1", "team-55-shared")
+	workerParent := filepath.Join(workspace, "home")
+	if err := os.MkdirAll(workerParent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(workerParent, ".clawmanager-team-worker")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	req := CreateGatewayRequest{
+		AgentType:     "hermes",
+		InstanceID:    3,
+		UserID:        1,
+		WorkspacePath: workspace,
+		Environment: map[string]string{
+			"CLAWMANAGER_TEAM_ENABLED":    "true",
+			"CLAWMANAGER_TEAM_ID":         "55",
+			"CLAWMANAGER_TEAM_MEMBER_ID":  "developer",
+			"CLAWMANAGER_TEAM_SHARED_DIR": shared,
+		},
+	}
+	if _, err := PrepareWorkspace(root, "hermes", req); err == nil || !strings.Contains(err.Error(), "real directory") {
+		t.Fatalf("PrepareWorkspace() error = %v, want symlink rejection", err)
 	}
 }
 

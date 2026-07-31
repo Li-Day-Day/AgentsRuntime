@@ -138,6 +138,7 @@ class RedisTeamSettings:
     manager_url: str = ""
     preview_origin: str = ""
     team_token: str = ""
+    ready_file: str = ""
 
     @property
     def shared_path(self) -> Path:
@@ -189,6 +190,7 @@ def load_settings(config: PlatformConfig | None = None) -> RedisTeamSettings:
         manager_url=_trim(pick("manager_url", "CLAWMANAGER_TEAM_MANAGER_URL", "", "managerUrl")),
         preview_origin=_trim(pick("preview_origin", "CLAWMANAGER_TEAM_PREVIEW_ORIGIN", "", "previewOrigin")),
         team_token=_trim(pick("team_token", "CLAWMANAGER_TEAM_TOKEN", "", "teamToken")),
+        ready_file=_trim(pick("ready_file", "CLAWMANAGER_TEAM_READY_FILE", "", "readyFile")),
     )
 
 
@@ -536,6 +538,53 @@ def write_local_status(settings: RedisTeamSettings, patch: Optional[dict[str, An
         status.update({k: v for k, v in patch.items() if v is not None})
     _atomic_write_json(path, status)
     return status
+
+
+def _clear_ready_file(settings: RedisTeamSettings) -> None:
+    raw = _trim(settings.ready_file)
+    if not raw:
+        return
+    path = Path(raw)
+    if not path.is_absolute():
+        raise ValueError("CLAWMANAGER_TEAM_READY_FILE must be absolute")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _publish_ready_file(settings: RedisTeamSettings, status: dict[str, Any]) -> None:
+    raw = _trim(settings.ready_file)
+    if not raw:
+        return
+    path = Path(raw)
+    if not path.is_absolute():
+        raise ValueError("CLAWMANAGER_TEAM_READY_FILE must be absolute")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(
+        json.dumps(
+            {
+                "ready": True,
+                "teamId": settings.team_id,
+                "memberId": settings.member_id,
+                "runtime": "hermes",
+                "protocolVersion": PROTOCOL_VERSION,
+                "readyAt": _now_iso(),
+                "presence": {
+                    "liveness": status.get("liveness"),
+                    "availability": status.get("availability"),
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tmp.chmod(0o600)
+    tmp.replace(path)
+    path.chmod(0o600)
 
 
 def read_team_statuses(settings: RedisTeamSettings, member_id: str = "") -> Any:
@@ -1298,6 +1347,12 @@ class RedisTeamAdapter(BasePlatformAdapter):
 
     async def connect(self, is_reconnect: bool = False, **_kwargs: Any) -> bool:
         async with self._lifecycle_lock:
+            try:
+                _clear_ready_file(self.settings)
+            except Exception as exc:
+                logger.error("Redis Team: invalid readiness path: %s", exc)
+                self._set_fatal_error("readiness_path_invalid", str(exc), retryable=False)
+                return False
             if not self.settings.enabled:
                 logger.info("Redis Team: disabled")
                 return False
@@ -1341,9 +1396,20 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 except RespError as exc:
                     if "BUSYGROUP" not in str(exc):
                         raise
+                initial_status = write_local_status(self.settings, {"availability": "idle"})
+                await self._redis.command(
+                    "HSET",
+                    presence_key(self.settings),
+                    self.settings.member_id,
+                    json.dumps(initial_status, ensure_ascii=False),
+                )
             except Exception as exc:
                 logger.error("Redis Team: failed to connect: %s", exc)
                 self._set_fatal_error("connect_failed", str(exc), retryable=True)
+                try:
+                    _clear_ready_file(self.settings)
+                except Exception:
+                    pass
                 if self._consumer_redis:
                     self._consumer_redis.close()
                     self._consumer_redis = None
@@ -1355,6 +1421,13 @@ class RedisTeamAdapter(BasePlatformAdapter):
             self._mark_connected()
             self._presence_task = asyncio.create_task(self._presence_loop())
             self._consumer_task = asyncio.create_task(self._consumer_loop())
+            try:
+                _publish_ready_file(self.settings, initial_status)
+            except Exception as exc:
+                logger.error("Redis Team: failed to publish readiness: %s", exc)
+                self._set_fatal_error("readiness_publish_failed", str(exc), retryable=False)
+                await self._disconnect_unlocked(mark_offline=False)
+                return False
             logger.info(
                 "Redis Team: connected team=%s member=%s group=%s",
                 self.settings.team_id,
@@ -1369,6 +1442,10 @@ class RedisTeamAdapter(BasePlatformAdapter):
 
     async def _disconnect_unlocked(self, *, mark_offline: bool) -> None:
         self._mark_disconnected()
+        try:
+            _clear_ready_file(self.settings)
+        except Exception:
+            pass
         for task in (self._consumer_task, self._presence_task):
             if task and not task.done():
                 task.cancel()

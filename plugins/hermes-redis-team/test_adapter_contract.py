@@ -101,6 +101,54 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertIn("automatic_turn_completion_v2", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("team_artifact_preview_v1", adapter.PROTOCOL_CAPABILITIES)
 
+    def test_consumer_readiness_requires_group_and_initial_presence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ready_file = Path(tmp) / "private" / "redis-team.ready.json"
+            settings = adapter.RedisTeamSettings(
+                enabled=True,
+                redis_url="redis://example.invalid:6379/0",
+                team_id="117",
+                member_id="developer",
+                role="developer",
+                shared_dir=str(Path(tmp) / "team"),
+                ready_file=str(ready_file),
+            )
+            commands = []
+
+            class FakeRedis:
+                def __init__(self, _redis_url):
+                    pass
+
+                async def connect(self):
+                    pass
+
+                async def command(self, *args):
+                    commands.append(args)
+                    return "OK"
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with (
+                    mock.patch.object(adapter, "load_settings", return_value=settings),
+                    mock.patch.object(adapter, "AsyncRedisClient", FakeRedis),
+                ):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                    self.assertTrue(await instance.connect())
+                    self.assertTrue(ready_file.is_file())
+                    ready = json.loads(ready_file.read_text(encoding="utf-8"))
+                    self.assertTrue(ready["ready"])
+                    self.assertEqual(ready["teamId"], "117")
+                    self.assertEqual(ready["memberId"], "developer")
+                    xgroup_index = next(index for index, command in enumerate(commands) if command[:2] == ("XGROUP", "CREATE"))
+                    presence_index = next(index for index, command in enumerate(commands) if command[0] == "HSET")
+                    self.assertLess(xgroup_index, presence_index)
+                    await instance.disconnect()
+                    self.assertFalse(ready_file.exists())
+
+            asyncio.run(run_test())
+
     def test_control_plane_redis_keys_preserve_completion_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.settings(Path(tmp))
