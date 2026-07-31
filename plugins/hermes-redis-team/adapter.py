@@ -37,6 +37,7 @@ PROTOCOL_VERSION = 4
 PROTOCOL_CAPABILITIES = [
     "completion_ack_v1",
     "automatic_turn_completion_v2",
+    "assignment_lifecycle_v1",
     "assignment_heartbeat_v1",
     "durable_turn_facts_v1",
     "team_artifact_preview_v1",
@@ -306,6 +307,10 @@ def assignment_activity_key(settings: RedisTeamSettings, root_task_id: str, assi
         f"{_key_prefix(settings)}:assignment-activity:"
         f"{_redis_key_part(root_task_id)}:{_redis_key_part(assignment_id)}"
     )
+
+
+def root_workflow_state_key(settings: RedisTeamSettings, root_task_id: str) -> str:
+    return f"{_key_prefix(settings)}:root:{_redis_key_part(root_task_id)}:state"
 
 
 def event_for(settings: RedisTeamSettings, event: str, extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -862,6 +867,59 @@ def _assignment_identity(envelope: dict[str, Any]) -> tuple[str, str]:
         _trim(envelope.get("rootTaskId") or envelope.get("taskId")),
         _trim(envelope.get("assignmentId") or envelope.get("workId")),
     )
+
+
+def _is_context_only_envelope(envelope: dict[str, Any]) -> bool:
+    if not envelope:
+        return False
+    if not _truthy(envelope.get("requiresCompletion"), True):
+        return True
+    metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
+    intent = _trim(envelope.get("intent") or metadata.get("intent") or envelope.get("type")).lower()
+    return intent in {"member_result_confirmed", "context", "notification"}
+
+
+def _is_formal_assignment(envelope: dict[str, Any]) -> bool:
+    root_task_id, assignment_id = _assignment_identity(envelope)
+    return bool(
+        root_task_id
+        and assignment_id
+        and _truthy(envelope.get("requiresCompletion"), True)
+        and not _is_monitor_envelope(envelope)
+        and not _is_context_only_envelope(envelope)
+    )
+
+
+def _root_workflow_state_is_terminal(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value.get("terminal") is True:
+        return True
+    status = _trim(value.get("status") or value.get("workflowState") or value.get("workflow_state")).lower()
+    return status in {"succeeded", "failed", "cancelled", "completed"}
+
+
+async def _root_task_is_terminal(
+    redis: "AsyncRedisClient",
+    settings: RedisTeamSettings,
+    envelope: dict[str, Any],
+) -> bool:
+    root_task_id, _ = _assignment_identity(envelope)
+    if not root_task_id:
+        return False
+    try:
+        raw = await redis.command("GET", root_workflow_state_key(settings, root_task_id))
+        if not raw:
+            return False
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        value = json.loads(raw) if isinstance(raw, str) else raw
+        return _root_workflow_state_is_terminal(value)
+    except Exception:
+        # Older ClawManager versions may not publish root workflow state.
+        # Keep the Runtime compatible and rely on the control-plane terminal
+        # barrier rather than turning a transient read failure into task loss.
+        return False
 
 
 def _is_monitor_envelope(envelope: dict[str, Any]) -> bool:
@@ -1522,18 +1580,114 @@ class RedisTeamAdapter(BasePlatformAdapter):
         # correction may legitimately enqueue more than one turn for the same
         # assignment; completing one turn must not make the other look stale.
         self._accepted_messages: Dict[str, tuple[str, str]] = {}
+        # Business Assignment lifetime is intentionally separate from the
+        # Redis transport and from an individual Hermes model turn. It remains
+        # active while completion is pending/deferred or a corrective turn is
+        # still required, and ends only after an accepted terminal outcome.
+        self._active_assignments: Dict[tuple[str, str], dict[str, Any]] = {}
         # A message can be accepted by Hermes before Redis records the
         # processed marker/ACK. Keep that transport boundary distinct from
         # model activity so a reconnect finalizes delivery without dispatching
         # the same turn twice.
         self._transport_accepted_messages: set[str] = set()
         self._redis_reply_metadata: Dict[str, Dict[str, Any]] = {}
+        self._turn_responses: Dict[str, str] = {}
         self._approval_session_by_key: Dict[str, str] = {}
         self._latest_approval_session_key = ""
 
     @property
     def name(self) -> str:
         return "Redis Team"
+
+    def _track_active_assignment(self, envelope: dict[str, Any]) -> tuple[str, str]:
+        identity = _assignment_identity(envelope)
+        if not all(identity):
+            return identity
+        current = self._active_assignments.get(identity, {})
+        message_ids = set(current.get("messageIds") or [])
+        message_id = _trim(envelope.get("messageId"))
+        if message_id:
+            message_ids.add(message_id)
+        self._active_assignments[identity] = {
+            "envelope": dict(envelope),
+            "messageIds": message_ids,
+            "startedAt": current.get("startedAt") or _now_iso(),
+        }
+        return identity
+
+    def _assignment_is_locally_terminal(self, identity: tuple[str, str]) -> bool:
+        root_task_id, assignment_id = identity
+        if not root_task_id or not assignment_id:
+            return False
+        active = _load_active_envelope(self.settings)
+        if _assignment_identity(active) == identity and active.get("terminal") is True:
+            return True
+        status = read_team_statuses(self.settings, self.settings.member_id) or {}
+        status_task_id = _trim(status.get("currentTaskId"))
+        status_assignment_id = _trim(status.get("currentAssignmentId"))
+        runtime_status = _trim(status.get("runtimeStatus")).lower()
+        return bool(
+            status_task_id == root_task_id
+            and (not status_assignment_id or status_assignment_id == assignment_id)
+            and runtime_status in {"succeeded", "failed", "cancelled"}
+        )
+
+    def _retire_terminal_assignment(self, identity: tuple[str, str]) -> bool:
+        if identity not in self._active_assignments:
+            return False
+        if not self._assignment_is_locally_terminal(identity):
+            return False
+        self._active_assignments.pop(identity, None)
+        return True
+
+    def _has_active_assignment(self, identity: tuple[str, str]) -> bool:
+        if not all(identity):
+            return False
+        if self._assignment_is_locally_terminal(identity):
+            self._active_assignments.pop(identity, None)
+            return False
+        if identity in self._active_assignments:
+            return True
+        active = _load_active_envelope(self.settings)
+        if _is_formal_assignment(active) and _assignment_identity(active) == identity and not active.get("terminal"):
+            self._track_active_assignment(active)
+            return True
+        return False
+
+    async def _emit_assignment_lifecycle(
+        self,
+        event_name: str,
+        envelope: dict[str, Any],
+        *,
+        status: str,
+        summary: str,
+    ) -> None:
+        if not self._redis:
+            raise RuntimeError("Redis Team presence connection is unavailable")
+        message_id = _trim(envelope.get("messageId"))
+        event_id = (
+            f"assignment-lifecycle:{_safe_name(message_id)}:{event_name}"
+            if message_id
+            else f"assignment-lifecycle:{_safe_name(envelope.get('taskId'))}:{event_name}"
+        )
+        await xadd_json(
+            self._redis,
+            events_key(self.settings),
+            _task_event(
+                self.settings,
+                event_name,
+                envelope,
+                {
+                    "eventId": event_id,
+                    "availability": "busy",
+                    "runtimeStatus": "running",
+                    "status": status,
+                    "summary": summary,
+                    "visibleToChat": False,
+                    "chatPolicy": "hidden",
+                },
+            ),
+        )
 
     async def _open_redis_clients(
         self,
@@ -1726,6 +1880,55 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 return False
 
             self._mark_connected()
+            persisted_active = _load_active_envelope(self.settings)
+            if _is_formal_assignment(persisted_active) and not persisted_active.get("terminal"):
+                persisted_status = read_team_statuses(self.settings, self.settings.member_id) or {}
+                root_terminal = await _root_task_is_terminal(self._redis, self.settings, persisted_active)
+                if root_terminal:
+                    persisted_active["terminal"] = True
+                    # The root projection may be succeeded, failed or
+                    # cancelled. Do not invent a member outcome while merely
+                    # suppressing a stale local Assignment after restart.
+                    persisted_active["terminalStatus"] = ""
+                    persisted_active["completedAt"] = _now_iso()
+                    persisted_active["terminalNarrativePublished"] = True
+                    _persist_active_envelope(self.settings, persisted_active)
+                    initial_status = write_local_status(
+                        self.settings,
+                        {
+                            "availability": "idle",
+                            "runtimeStatus": "idle",
+                            "currentTaskId": persisted_active.get("rootTaskId") or persisted_active.get("taskId"),
+                            "currentAssignmentId": persisted_active.get("assignmentId") or persisted_active.get("workId"),
+                        },
+                    )
+                elif _trim(persisted_status.get("runtimeStatus")).lower() not in {
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                }:
+                    self._track_active_assignment(persisted_active)
+                    initial_status = write_local_status(
+                        self.settings,
+                        {
+                            "availability": "busy",
+                            "runtimeStatus": _trim(persisted_status.get("runtimeStatus")) or "running",
+                            "currentTaskId": persisted_active.get("rootTaskId") or persisted_active.get("taskId"),
+                            "currentAssignmentId": persisted_active.get("assignmentId") or persisted_active.get("workId"),
+                        },
+                    )
+                try:
+                    await self._redis.command(
+                        "HSET",
+                        presence_key(self.settings),
+                        self.settings.member_id,
+                        json.dumps(initial_status, ensure_ascii=False),
+                    )
+                except Exception as exc:
+                    # Readiness still carries the coherent local status and
+                    # the presence loop immediately retries projection. Do not
+                    # turn a transient second HSET into a false startup death.
+                    logger.warning("Redis Team: restored presence projection deferred: %s", exc)
             self._presence_task = asyncio.create_task(self._presence_loop())
             self._consumer_task = asyncio.create_task(self._consumer_loop())
             try:
@@ -1771,7 +1974,9 @@ class RedisTeamAdapter(BasePlatformAdapter):
         self._consumer_task = None
         self._presence_task = None
         self._accepted_messages.clear()
+        self._active_assignments.clear()
         self._transport_accepted_messages.clear()
+        self._turn_responses.clear()
         if mark_offline and self._redis:
             try:
                 await self._redis.command(
@@ -1814,9 +2019,24 @@ class RedisTeamAdapter(BasePlatformAdapter):
         task_id = metadata.get("task_id") or chat_id
         target = _reply_target(self.settings, metadata)
         active = _load_active_envelope(self.settings)
-        active["lastAssistantResponse"] = content
-        active["lastAssistantResponseAt"] = _now_iso()
-        _persist_active_envelope(self.settings, active)
+        source_message_id = _trim(metadata.get("source_message_id") or metadata.get("message_id"))
+        if not source_message_id:
+            source_message_id = _trim(active.get("messageId"))
+        if source_message_id:
+            self._turn_responses[source_message_id] = content
+        active_identity = _assignment_identity(active)
+        active_assignment = _is_formal_assignment(active) and self._has_active_assignment(active_identity)
+        terminal_callback = _is_formal_assignment(active) and not active_assignment
+        active_message_id = _trim(active.get("messageId"))
+        terminal_delivery_visible = bool(
+            terminal_callback
+            and not active.get("terminalNarrativePublished")
+            and (not source_message_id or source_message_id == active_message_id)
+        )
+        if not terminal_callback and (not source_message_id or source_message_id == active_message_id):
+            active["lastAssistantResponse"] = content
+            active["lastAssistantResponseAt"] = _now_iso()
+            _persist_active_envelope(self.settings, active)
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         message_id = f"agent-narrative:{_safe_name(str(active.get('messageId') or task_id))}:{content_hash[:24]}"
         event = _task_event(
@@ -1825,6 +2045,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
             active,
             {
                 "messageId": message_id,
+                "eventId": message_id,
                 "taskId": task_id,
                 "conversationId": metadata.get("conversation_id") or chat_id,
                 "to": target,
@@ -1833,30 +2054,49 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 "replyTo": reply_to,
                 "eventKind": "agent_narrative",
                 "messageKind": "narrative",
-                "chatPolicy": "visible",
-                "visibleToChat": True,
+                # An explicit completion can be accepted before Hermes emits
+                # its final assistant body. Keep that one delivery visible;
+                # later callbacks for the terminal turn are audit-only.
+                "chatPolicy": "visible" if not terminal_callback or terminal_delivery_visible else "hidden",
+                "visibleToChat": not terminal_callback or terminal_delivery_visible,
                 "nonAuthoritative": True,
                 "stateEffect": "none",
                 "contentHash": content_hash,
                 "narrativeSource": "hermes_deliver_callback",
+                "lateProjection": terminal_callback or None,
+                "terminalDelivery": terminal_delivery_visible or None,
+                "suppressedAfterTerminal": terminal_callback and not terminal_delivery_visible or None,
             },
         )
         try:
-            write_local_status(
-                self.settings,
-                {
-                    "availability": "idle",
-                    "currentTaskId": task_id,
-                    "lastSummary": _short_text(content),
-                },
-            )
-            if self._redis:
-                await _publish_once(
-                    self._redis,
+            projection_committed = False
+            if not terminal_callback:
+                write_local_status(
                     self.settings,
-                    _processed_message_key(self.settings, message_id),
-                    event,
+                    {
+                        # Narrative delivery is not a business state
+                        # transition. Preserve running/waiting state while
+                        # allowing active work to refresh its summary.
+                        "lastSummary": _short_text(content),
+                    },
                 )
+            if not self._redis:
+                raise RuntimeError("Redis Team presence connection is unavailable")
+            # The stable eventId/messageId makes retries idempotent at the
+            # ClawManager ingestion boundary. Publish the event directly; a
+            # separate pre-XADD marker could otherwise lose the final delivery
+            # if Redis disconnected between the two commands.
+            await xadd_json(self._redis, events_key(self.settings), event)
+            projection_committed = True
+            if terminal_delivery_visible and projection_committed:
+                # Record the one canonical post-ACK delivery only after Redis
+                # accepted its projection. A transient publish failure must
+                # leave the callback retryable and visible.
+                latest_active = _load_active_envelope(self.settings)
+                if _assignment_identity(latest_active) == active_identity:
+                    latest_active["terminalNarrativePublished"] = True
+                    latest_active["terminalNarrativePublishedAt"] = _now_iso()
+                    _persist_active_envelope(self.settings, latest_active)
         except Exception as exc:
             logger.warning("Redis Team: failed to publish reply: %s", exc)
             return SendResult(success=False, error=str(exc))
@@ -1982,13 +2222,25 @@ class RedisTeamAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         try:
+            active = _load_active_envelope(self.settings)
+            identity = _assignment_identity(active)
+            status = read_team_statuses(self.settings, self.settings.member_id) or {}
+            patch: dict[str, Any] = {
+                "lastSummary": "Hermes is processing the Redis Team task",
+            }
+            if _is_formal_assignment(active) and self._has_active_assignment(identity):
+                patch.update(
+                    {
+                        "availability": "busy",
+                        "currentTaskId": active.get("rootTaskId") or active.get("taskId") or chat_id,
+                        "currentAssignmentId": active.get("assignmentId") or active.get("workId"),
+                    }
+                )
+                if _trim(status.get("runtimeStatus")).lower() in {"", "idle"}:
+                    patch["runtimeStatus"] = "running"
             write_local_status(
                 self.settings,
-                {
-                    "availability": "running",
-                    "currentTaskId": chat_id,
-                    "lastSummary": "Hermes is processing the Redis Team task",
-                },
+                patch,
             )
         except Exception:
             pass
@@ -2003,7 +2255,8 @@ class RedisTeamAdapter(BasePlatformAdapter):
         if not root_task_id or not assignment_id:
             return False
 
-        accepted = (root_task_id, assignment_id) in self._accepted_messages.values()
+        identity = (root_task_id, assignment_id)
+        accepted = identity in self._accepted_messages.values() or self._has_active_assignment(identity)
         status = read_team_statuses(self.settings, self.settings.member_id) or {}
         status_task_id = _trim(status.get("currentTaskId"))
         status_assignment_id = _trim(status.get("currentAssignmentId"))
@@ -2082,6 +2335,12 @@ class RedisTeamAdapter(BasePlatformAdapter):
             message_id = _trim(envelope.get("messageId") or event.message_id)
             if message_id:
                 self._accepted_messages.pop(message_id, None)
+                self._turn_responses.pop(message_id, None)
+            identity = _assignment_identity(envelope)
+            if all(identity):
+                self._retire_terminal_assignment(identity)
+            for tracked_identity in list(self._active_assignments):
+                self._retire_terminal_assignment(tracked_identity)
             self._redis_reply_metadata.pop(task_id, None)
 
     async def _on_processing_complete_inner(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
@@ -2090,7 +2349,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
         message_id = str(envelope.get("messageId") or event.message_id or "")
         if outcome == ProcessingOutcome.SUCCESS:
             active = _load_active_envelope(self.settings)
-            response = _trim(active.get("lastAssistantResponse"))
+            response = _trim(self._turn_responses.get(message_id) or active.get("lastAssistantResponse"))
             if not _truthy(envelope.get("requiresCompletion"), True):
                 if self._redis:
                     await xadd_json(
@@ -2109,17 +2368,30 @@ class RedisTeamAdapter(BasePlatformAdapter):
                             },
                         ),
                     )
-                write_local_status(
-                    self.settings,
-                    {
-                        "availability": "idle",
-                        "runtimeStatus": "idle",
-                        "currentTaskId": task_id,
-                        "lastSummary": _short_text(response) or "Non-terminal Team turn finished",
-                    },
-                )
+                active_identity = _assignment_identity(active)
+                if _is_formal_assignment(active) and self._has_active_assignment(active_identity):
+                    write_local_status(
+                        self.settings,
+                        {
+                            # A context/notification turn may finish while a
+                            # formal Assignment remains active. Do not let the
+                            # auxiliary turn make that Assignment look idle.
+                            "lastSummary": _short_text(response) or "Non-terminal Team turn finished",
+                        },
+                    )
+                else:
+                    write_local_status(
+                        self.settings,
+                        {
+                            "availability": "idle",
+                            "runtimeStatus": "idle",
+                            "currentTaskId": task_id,
+                            "lastSummary": _short_text(response) or "Non-terminal Team turn finished",
+                        },
+                    )
             elif active.get("terminal"):
                 terminal_status = _trim(active.get("terminalStatus")) or "succeeded"
+                current_status = read_team_statuses(self.settings, self.settings.member_id) or {}
                 write_local_status(
                     self.settings,
                     {
@@ -2127,7 +2399,9 @@ class RedisTeamAdapter(BasePlatformAdapter):
                         "runtimeStatus": terminal_status,
                         "currentTaskId": task_id,
                         "progress": 100,
-                        "lastSummary": _short_text(response) or f"Completion {terminal_status}",
+                        "lastSummary": _trim(current_status.get("lastSummary"))
+                        or _short_text(response)
+                        or f"Completion {terminal_status}",
                     },
                 )
             elif _trim(active.get("completionDecision")).lower() == "rejected":
@@ -2226,7 +2500,23 @@ class RedisTeamAdapter(BasePlatformAdapter):
         assert self._redis is not None
         while self.is_connected:
             try:
+                for identity in list(self._active_assignments):
+                    self._retire_terminal_assignment(identity)
                 status = write_local_status(self.settings)
+                if self._active_assignments:
+                    runtime_status = _trim(status.get("runtimeStatus")).lower()
+                    availability = _trim(status.get("availability")).lower()
+                    if runtime_status not in {"succeeded", "failed", "cancelled"} and availability == "idle":
+                        latest = next(reversed(self._active_assignments.values()))
+                        latest_envelope = latest.get("envelope") or {}
+                        patch: dict[str, Any] = {
+                            "availability": "busy",
+                            "currentTaskId": latest_envelope.get("rootTaskId") or latest_envelope.get("taskId"),
+                            "currentAssignmentId": latest_envelope.get("assignmentId") or latest_envelope.get("workId"),
+                        }
+                        if runtime_status in {"", "idle"}:
+                            patch["runtimeStatus"] = "running"
+                        status = write_local_status(self.settings, patch)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2245,15 +2535,11 @@ class RedisTeamAdapter(BasePlatformAdapter):
                     self.settings.member_id,
                     json.dumps(status, ensure_ascii=False),
                 )
-                active = _load_active_envelope(self.settings)
-                root_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
-                assignment_id = _trim(active.get("assignmentId") or active.get("workId"))
-                if (
-                    root_task_id
-                    and assignment_id
-                    and (root_task_id, assignment_id) in self._accepted_messages.values()
-                    and not active.get("terminal")
-                ):
+                for identity, tracked in list(self._active_assignments.items()):
+                    if self._retire_terminal_assignment(identity):
+                        continue
+                    root_task_id, assignment_id = identity
+                    active = tracked.get("envelope") or {}
                     activity = {
                         "teamId": self.settings.team_id,
                         "memberId": self.settings.member_id,
@@ -2418,19 +2704,88 @@ class RedisTeamAdapter(BasePlatformAdapter):
             if not handled_without_dispatch:
                 handled_without_dispatch = await self._report_monitor_without_model(envelope)
             if not handled_without_dispatch and self.settings.auto_run:
-                envelope["explicitCompletionSubmitted"] = False
-                envelope.pop("lastAssistantResponse", None)
-                _persist_active_envelope(self.settings, envelope)
-                await self._dispatch_envelope(envelope)
+                formal_assignment = _is_formal_assignment(envelope)
+                context_only = _is_context_only_envelope(envelope) or not formal_assignment
+                if formal_assignment and await _root_task_is_terminal(self._redis, self.settings, envelope):
+                    await xadd_json(
+                        self._redis,
+                        events_key(self.settings),
+                        _task_event(
+                            self.settings,
+                            "late_assignment_ignored",
+                            envelope,
+                            {
+                                "summary": "Ignored assignment for terminal root task",
+                                "stateEffect": "none",
+                                "nonAuthoritative": True,
+                                "visibleToChat": False,
+                                "chatPolicy": "hidden",
+                            },
+                        ),
+                    )
+                else:
+                    if formal_assignment:
+                        envelope["explicitCompletionSubmitted"] = False
+                        envelope.pop("lastAssistantResponse", None)
+                        _persist_active_envelope(self.settings, envelope)
+                        self._track_active_assignment(envelope)
+                        write_local_status(
+                            self.settings,
+                            {
+                                "availability": "busy",
+                                "runtimeStatus": "running",
+                                "currentTaskId": envelope["taskId"],
+                                "currentAssignmentId": envelope.get("assignmentId") or envelope.get("workId"),
+                                "lastSummary": "Redis Team task received",
+                            },
+                        )
+                        await self._emit_assignment_lifecycle(
+                            "task_received",
+                            envelope,
+                            status="acknowledged",
+                            summary="Redis Team task received",
+                        )
+                    await self._dispatch_envelope(envelope, context_only=context_only)
             elif not handled_without_dispatch:
-                write_local_status(
-                    self.settings,
-                    {
-                        "availability": "idle",
-                        "currentTaskId": envelope["taskId"],
-                        "lastSummary": "Redis Team task received; autorun is disabled",
-                    },
-                )
+                if _is_formal_assignment(envelope):
+                    if await _root_task_is_terminal(self._redis, self.settings, envelope):
+                        await xadd_json(
+                            self._redis,
+                            events_key(self.settings),
+                            _task_event(
+                                self.settings,
+                                "late_assignment_ignored",
+                                envelope,
+                                {
+                                    "summary": "Ignored assignment for terminal root task",
+                                    "stateEffect": "none",
+                                    "nonAuthoritative": True,
+                                    "visibleToChat": False,
+                                    "chatPolicy": "hidden",
+                                },
+                            ),
+                        )
+                    else:
+                        _persist_active_envelope(self.settings, envelope)
+                        self._track_active_assignment(envelope)
+                        await self._emit_assignment_lifecycle(
+                            "task_received",
+                            envelope,
+                            status="acknowledged",
+                            summary="Redis Team task received",
+                        )
+                        write_local_status(
+                            self.settings,
+                            {
+                                "availability": "waiting_manual",
+                                "runtimeStatus": "waiting_manual",
+                                "currentTaskId": envelope["taskId"],
+                                "currentAssignmentId": envelope.get("assignmentId") or envelope.get("workId"),
+                                "lastSummary": "Redis Team task received; autorun is disabled",
+                            },
+                        )
+                else:
+                    write_local_status(self.settings, {"lastContextAt": _now_iso()})
         except Exception as exc:
             error = str(exc)
             logger.warning("Redis Team: message processing failed: %s", error)
@@ -2488,6 +2843,24 @@ class RedisTeamAdapter(BasePlatformAdapter):
                         "explicitCompletion": False,
                     },
                 ),
+            )
+            identity = _assignment_identity(envelope)
+            active = _load_active_envelope(self.settings)
+            if _assignment_identity(active) == identity:
+                active["terminal"] = True
+                active["terminalStatus"] = "failed"
+                active["completedAt"] = _now_iso()
+                _persist_active_envelope(self.settings, active)
+            self._active_assignments.pop(identity, None)
+            write_local_status(
+                self.settings,
+                {
+                    "availability": "blocked",
+                    "runtimeStatus": "failed",
+                    "currentTaskId": envelope["taskId"],
+                    "currentAssignmentId": envelope.get("assignmentId") or envelope.get("workId"),
+                    "lastSummary": error,
+                },
             )
             if redis_id:
                 await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
@@ -2548,14 +2921,28 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 key: value for key, value in self._approval_session_by_key.items() if value != session_key
             }
         status_text = "denied" if command_name == "deny" else "approved"
+        active = _load_active_envelope(self.settings)
+        active_identity = _assignment_identity(active)
+        formal_active = _is_formal_assignment(active) and self._has_active_assignment(active_identity)
+        status_patch: dict[str, Any] = {
+            "currentTaskId": envelope["taskId"],
+            "lastSummary": f"Redis Team approval {status_text}: {count} command(s)",
+            "approvalSessionKey": session_key,
+        }
+        if formal_active:
+            status_patch.update(
+                {
+                    "availability": "busy",
+                    "runtimeStatus": "running",
+                    "currentTaskId": active.get("rootTaskId") or active.get("taskId"),
+                    "currentAssignmentId": active.get("assignmentId") or active.get("workId"),
+                }
+            )
+        else:
+            status_patch.update({"availability": "idle", "runtimeStatus": "idle"})
         write_local_status(
             self.settings,
-            {
-                "availability": "running" if count else "idle",
-                "currentTaskId": envelope["taskId"],
-                "lastSummary": f"Redis Team approval {status_text}: {count} command(s)",
-                "approvalSessionKey": session_key,
-            },
+            status_patch,
         )
         await xadd_json(
             self._redis,
@@ -2577,7 +2964,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
         )
         return True
 
-    async def _dispatch_envelope(self, envelope: dict[str, Any]) -> None:
+    async def _dispatch_envelope(self, envelope: dict[str, Any], *, context_only: bool = False) -> None:
         source = SessionSource(
             platform=Platform("redis_team"),
             chat_id=str(envelope["taskId"]),
@@ -2602,21 +2989,22 @@ class RedisTeamAdapter(BasePlatformAdapter):
             if root_task_id and assignment_id
             else ""
         )
-        text += (
-            "\n\nClawManager Team context:\n"
-            f"- rootTaskId: {root_task_id}\n"
-            f"- rootMessageId: {_trim(envelope.get('rootMessageId'))}\n"
-            f"- assignmentId/workId: {assignment_id}\n"
-            f"- revision: {max(1, int(envelope.get('revision') or 1))}\n"
-            f"- requiresCompletion: {bool(envelope.get('requiresCompletion', True))}\n"
-        )
-        if member_artifact_root:
-            text += f"- Current member artifact root: {member_artifact_root}\n"
-        text += (
-            "- The Runtime inherits these IDs for Team tools; omit optional IDs instead of inventing replacements.\n"
-            "- A substantive final response is submitted automatically. Use team_complete_task for explicit "
-            "failure/cancellation, review metadata, or when you need to control final result fields.\n"
-        )
+        if not context_only:
+            text += (
+                "\n\nClawManager Team context:\n"
+                f"- rootTaskId: {root_task_id}\n"
+                f"- rootMessageId: {_trim(envelope.get('rootMessageId'))}\n"
+                f"- assignmentId/workId: {assignment_id}\n"
+                f"- revision: {max(1, int(envelope.get('revision') or 1))}\n"
+                f"- requiresCompletion: {bool(envelope.get('requiresCompletion', True))}\n"
+            )
+            if member_artifact_root:
+                text += f"- Current member artifact root: {member_artifact_root}\n"
+            text += (
+                "- The Runtime inherits these IDs for Team tools; omit optional IDs instead of inventing replacements.\n"
+                "- A substantive final response is submitted automatically. Use team_complete_task for explicit "
+                "failure/cancellation, review metadata, or when you need to control final result fields.\n"
+            )
 
         event = MessageEvent(
             text=text,
@@ -2637,26 +3025,73 @@ class RedisTeamAdapter(BasePlatformAdapter):
             "assignment_id": envelope.get("assignmentId"),
             "phase_id": envelope.get("phaseId"),
             "revision": envelope.get("revision"),
+            "source_message_id": envelope.get("messageId"),
+            "context_only": context_only,
         }
-        write_local_status(
-            self.settings,
-            {
-                "availability": "running",
-                "runtimeStatus": "running",
-                "currentTaskId": envelope["taskId"],
-                "currentAssignmentId": assignment_id or None,
-                "lastSummary": text[:500],
-            },
-        )
+        if not context_only:
+            if self._redis and await _root_task_is_terminal(self._redis, self.settings, envelope):
+                identity = _assignment_identity(envelope)
+                self._active_assignments.pop(identity, None)
+                active = _load_active_envelope(self.settings)
+                if _assignment_identity(active) == identity:
+                    active["terminal"] = True
+                    active["terminalStatus"] = ""
+                    active["completedAt"] = _now_iso()
+                    active["terminalNarrativePublished"] = True
+                    _persist_active_envelope(self.settings, active)
+                write_local_status(
+                    self.settings,
+                    {
+                        "availability": "idle",
+                        "runtimeStatus": "idle",
+                        "currentTaskId": root_task_id,
+                        "currentAssignmentId": assignment_id or None,
+                        "lastSummary": "Assignment ignored because the root task is already terminal",
+                    },
+                )
+                await xadd_json(
+                    self._redis,
+                    events_key(self.settings),
+                    _task_event(
+                        self.settings,
+                        "late_assignment_ignored",
+                        envelope,
+                        {
+                            "summary": "Ignored assignment before Hermes dispatch because the root task is terminal",
+                            "stateEffect": "none",
+                            "nonAuthoritative": True,
+                            "visibleToChat": False,
+                            "chatPolicy": "hidden",
+                        },
+                    ),
+                )
+                return
+            write_local_status(
+                self.settings,
+                {
+                    "availability": "busy",
+                    "runtimeStatus": "running",
+                    "currentTaskId": envelope["taskId"],
+                    "currentAssignmentId": assignment_id or None,
+                    "lastSummary": "Redis Team task started",
+                },
+            )
         self._redis_reply_metadata[str(envelope["taskId"])] = metadata
         identity = _assignment_identity(envelope)
         message_id = _trim(envelope.get("messageId"))
-        if message_id and all(identity):
+        if not context_only and message_id and all(identity):
             self._accepted_messages[message_id] = identity
+            self._track_active_assignment(envelope)
+            await self._emit_assignment_lifecycle(
+                "task_started",
+                envelope,
+                status="running",
+                summary="Redis Team task started",
+            )
         try:
             await self.handle_message(event)
         except Exception:
-            if message_id:
+            if not context_only and message_id:
                 self._accepted_messages.pop(message_id, None)
             raise
 

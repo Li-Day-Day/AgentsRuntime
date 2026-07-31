@@ -55,6 +55,20 @@ Hermes final response is proposed automatically, while Monitor/status turns and
 empty or question-only responses remain non-terminal. ClawManager remains the
 authority that accepts or rejects completion.
 
+Formal assignments use the same lifecycle projection as OpenClaw Lite:
+
+```text
+task_received -> task_started -> narrative/heartbeat -> completion_proposed -> completion acknowledgement
+```
+
+`inbound` is transport audit only. `task_received` and `task_started` are
+hidden business-state events; narratives are visible but non-authoritative;
+heartbeats and Monitor replies are hidden evidence and cannot complete or
+reopen work. Redis delivery, an individual Hermes model turn, and the business
+Assignment are tracked independently so a finished turn does not make a still
+active Assignment appear idle. Only an accepted completion acknowledgement or
+an explicit terminal failure ends the Assignment.
+
 ## Shared workspace ownership
 
 ClawManager prepares the Team shared tree with a stable shared group and

@@ -40,7 +40,8 @@ def install_gateway_stubs():
             pass
 
     class MessageEvent:
-        pass
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
 
     class MessageType:
         TEXT = "text"
@@ -100,6 +101,7 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertEqual(adapter.PROTOCOL_VERSION, 4)
         self.assertIn("completion_ack_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("automatic_turn_completion_v2", adapter.PROTOCOL_CAPABILITIES)
+        self.assertIn("assignment_lifecycle_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("team_artifact_preview_v1", adapter.PROTOCOL_CAPABILITIES)
 
     def test_managed_startup_identity_loads_from_environment(self):
@@ -489,6 +491,472 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertEqual(adapter._parse_stream_response([]), [])
         self.assertEqual(adapter._parse_stream_response([["team-inbox", []]]), [])
 
+    def test_formal_assignment_emits_received_and_started_before_model_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            commands = []
+            envelope = {
+                "messageId": "msg-lifecycle-1",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "rootMessageId": "root-message-7",
+                "assignmentId": "dev-1",
+                "workId": "dev-1",
+                "teamId": "42",
+                "from": "leader",
+                "to": "developer",
+                "text": "Implement the requested artifact.",
+                "requiresCompletion": True,
+                "redisId": "1-0",
+            }
+
+            class FakeRedis:
+                async def command(self, *args):
+                    commands.append(args)
+                    if args[0] == "GET":
+                        return None
+                    if args[0] == "XADD":
+                        return f"{len(commands)}-0"
+                    return "OK"
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+                instance.handle_message = mock.AsyncMock()
+                await instance._handle_redis_message(envelope)
+                instance.handle_message.assert_awaited_once()
+                self.assertIn(("team-42-task-7", "dev-1"), instance._active_assignments)
+
+            asyncio.run(run_test())
+            events = [
+                json.loads(command[-1])
+                for command in commands
+                if command[0] == "XADD" and command[1] == adapter.events_key(settings)
+            ]
+            lifecycle = [event for event in events if event.get("event") in {"task_received", "task_started"}]
+            self.assertEqual([event["event"] for event in lifecycle], ["task_received", "task_started"])
+            self.assertEqual(lifecycle[0]["eventId"], "assignment-lifecycle:msg-lifecycle-1:task_received")
+            self.assertEqual(lifecycle[1]["eventId"], "assignment-lifecycle:msg-lifecycle-1:task_started")
+            self.assertTrue(all(event["visibleToChat"] is False for event in lifecycle))
+            status = adapter.read_team_statuses(settings, settings.member_id)
+            self.assertEqual(status["availability"], "busy")
+            self.assertEqual(status["runtimeStatus"], "running")
+            self.assertEqual(status["currentAssignmentId"], "dev-1")
+
+    def test_context_only_turn_preserves_formal_assignment_and_emits_no_start_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            commands = []
+            formal = {
+                "messageId": "formal-1",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "dev-1",
+                "workId": "dev-1",
+                "teamId": "42",
+                "from": "leader",
+                "to": "developer",
+                "requiresCompletion": True,
+            }
+            context = {
+                "messageId": "context-1",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "teamId": "42",
+                "from": "leader",
+                "to": "developer",
+                "intent": "context",
+                "text": "Additional context only.",
+                "requiresCompletion": False,
+                "redisId": "2-0",
+            }
+
+            class FakeRedis:
+                async def command(self, *args):
+                    commands.append(args)
+                    if args[0] == "GET":
+                        return None
+                    return "OK"
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+                adapter._persist_active_envelope(settings, formal)
+                instance._track_active_assignment(formal)
+                dispatch = mock.AsyncMock()
+                instance._dispatch_envelope = dispatch
+                await instance._handle_redis_message(context)
+                dispatch.assert_awaited_once_with(mock.ANY, context_only=True)
+                self.assertEqual(adapter._load_active_envelope(settings)["messageId"], "formal-1")
+
+            asyncio.run(run_test())
+            events = [
+                json.loads(command[-1])
+                for command in commands
+                if command[0] == "XADD" and command[1] == adapter.events_key(settings)
+            ]
+            self.assertFalse(any(event.get("event") in {"task_received", "task_started"} for event in events))
+
+    def test_terminal_root_rejects_late_assignment_before_model_dispatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            commands = []
+            envelope = {
+                "messageId": "late-assignment",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "dev-1",
+                "workId": "dev-1",
+                "teamId": "42",
+                "from": "leader",
+                "to": "developer",
+                "text": "This assignment arrived after root completion.",
+                "requiresCompletion": True,
+                "redisId": "3-0",
+            }
+
+            class FakeRedis:
+                async def command(self, *args):
+                    commands.append(args)
+                    if args[0] == "GET":
+                        if args[1] == adapter.root_workflow_state_key(settings, envelope["rootTaskId"]):
+                            return json.dumps({"terminal": True, "status": "succeeded"})
+                        return None
+                    return "OK"
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+                dispatch = mock.AsyncMock()
+                instance._dispatch_envelope = dispatch
+                await instance._handle_redis_message(envelope)
+                dispatch.assert_not_awaited()
+                self.assertFalse(instance._active_assignments)
+
+            asyncio.run(run_test())
+            events = [
+                json.loads(command[-1])
+                for command in commands
+                if command[0] == "XADD" and command[1] == adapter.events_key(settings)
+            ]
+            self.assertTrue(any(event.get("event") == "late_assignment_ignored" for event in events))
+            self.assertFalse(any(event.get("event") in {"task_received", "task_started"} for event in events))
+
+    def test_root_terminal_race_after_receive_clears_busy_assignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            commands = []
+            envelope = {
+                "messageId": "terminal-race",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "dev-1",
+                "workId": "dev-1",
+                "teamId": "42",
+                "from": "leader",
+                "to": "developer",
+                "text": "Assignment races with root completion.",
+                "requiresCompletion": True,
+                "redisId": "4-0",
+            }
+
+            class FakeRedis:
+                async def command(self, *args):
+                    commands.append(args)
+                    if args[0] == "GET":
+                        return None
+                    return "OK"
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+                instance.handle_message = mock.AsyncMock()
+                with mock.patch.object(
+                    adapter,
+                    "_root_task_is_terminal",
+                    new=mock.AsyncMock(side_effect=[False, True]),
+                ):
+                    await instance._handle_redis_message(envelope)
+                instance.handle_message.assert_not_awaited()
+                self.assertFalse(instance._active_assignments)
+
+            asyncio.run(run_test())
+            status = adapter.read_team_statuses(settings, settings.member_id)
+            self.assertEqual(status["availability"], "idle")
+            self.assertEqual(status["runtimeStatus"], "idle")
+            self.assertTrue(adapter._load_active_envelope(settings)["terminal"])
+            events = [
+                json.loads(command[-1])
+                for command in commands
+                if command[0] == "XADD" and command[1] == adapter.events_key(settings)
+            ]
+            self.assertTrue(any(event.get("event") == "task_received" for event in events))
+            self.assertTrue(any(event.get("event") == "late_assignment_ignored" for event in events))
+            self.assertFalse(any(event.get("event") == "task_started" for event in events))
+
+    def test_narrative_preserves_running_assignment_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            commands = []
+            formal = {
+                "messageId": "formal-1",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "dev-1",
+                "workId": "dev-1",
+                "requiresCompletion": True,
+            }
+
+            class FakeRedis:
+                async def command(self, *args):
+                    commands.append(args)
+                    if args[0] == "SET":
+                        return "OK"
+                    if args[0] == "XADD":
+                        return "1-0"
+                    return None
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+                adapter._persist_active_envelope(settings, formal)
+                adapter.write_local_status(
+                    settings,
+                    {
+                        "availability": "busy",
+                        "runtimeStatus": "running",
+                        "currentTaskId": formal["taskId"],
+                        "currentAssignmentId": formal["assignmentId"],
+                    },
+                )
+                instance._track_active_assignment(formal)
+                result = await instance.send(
+                    formal["taskId"],
+                    "Implementation is still progressing.",
+                    metadata={"source_message_id": formal["messageId"]},
+                )
+                self.assertTrue(result.success)
+
+            asyncio.run(run_test())
+            status = adapter.read_team_statuses(settings, settings.member_id)
+            self.assertEqual(status["availability"], "busy")
+            self.assertEqual(status["runtimeStatus"], "running")
+            replies = [
+                json.loads(command[-1])
+                for command in commands
+                if command[0] == "XADD" and command[1] == adapter.events_key(settings)
+            ]
+            self.assertEqual(len(replies), 1)
+            self.assertTrue(replies[0]["visibleToChat"])
+            self.assertEqual(replies[0]["stateEffect"], "none")
+
+    def test_terminal_assignment_shows_final_delivery_once_then_hides_late_narrative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            commands = []
+            formal = {
+                "messageId": "formal-terminal",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "dev-1",
+                "workId": "dev-1",
+                "requiresCompletion": True,
+                "terminal": True,
+                "terminalStatus": "succeeded",
+            }
+
+            class FakeRedis:
+                async def command(self, *args):
+                    commands.append(args)
+                    if args[0] == "SET":
+                        return "OK"
+                    if args[0] == "XADD":
+                        return "1-0"
+                    return None
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+                adapter._persist_active_envelope(settings, formal)
+                adapter.write_local_status(
+                    settings,
+                    {
+                        "availability": "idle",
+                        "runtimeStatus": "succeeded",
+                        "currentTaskId": formal["taskId"],
+                        "currentAssignmentId": formal["assignmentId"],
+                        "lastSummary": "Accepted implementation result",
+                    },
+                )
+                result = await instance.send(
+                    formal["taskId"],
+                    "Final implementation report with verified artifacts.",
+                    metadata={"source_message_id": formal["messageId"]},
+                )
+                self.assertTrue(result.success)
+                late = await instance.send(
+                    formal["taskId"],
+                    "Internal post-completion bookkeeping.",
+                    metadata={"source_message_id": formal["messageId"]},
+                )
+                self.assertTrue(late.success)
+
+            asyncio.run(run_test())
+            status = adapter.read_team_statuses(settings, settings.member_id)
+            self.assertEqual(status["availability"], "idle")
+            self.assertEqual(status["runtimeStatus"], "succeeded")
+            self.assertEqual(status["lastSummary"], "Accepted implementation result")
+            replies = [
+                json.loads(command[-1])
+                for command in commands
+                if command[0] == "XADD" and command[1] == adapter.events_key(settings)
+            ]
+            self.assertEqual(len(replies), 2)
+            self.assertTrue(replies[0]["visibleToChat"])
+            self.assertEqual(replies[0]["chatPolicy"], "visible")
+            self.assertTrue(replies[0]["terminalDelivery"])
+            self.assertIsNone(replies[0].get("suppressedAfterTerminal"))
+            self.assertFalse(replies[1]["visibleToChat"])
+            self.assertEqual(replies[1]["chatPolicy"], "hidden")
+            self.assertTrue(replies[1]["lateProjection"])
+            self.assertTrue(replies[1]["suppressedAfterTerminal"])
+
+    def test_failed_terminal_delivery_projection_remains_retryable_and_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            commands = []
+            formal = {
+                "messageId": "formal-terminal-retry",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "dev-1",
+                "workId": "dev-1",
+                "requiresCompletion": True,
+                "terminal": True,
+                "terminalStatus": "succeeded",
+            }
+
+            class FakeRedis:
+                def __init__(self):
+                    self.fail_once = True
+
+                async def command(self, *args):
+                    commands.append(args)
+                    if args[0] == "XADD" and self.fail_once:
+                        self.fail_once = False
+                        raise ConnectionError("projection interrupted")
+                    if args[0] == "XADD":
+                        return "2-0"
+                    return None
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+                adapter._persist_active_envelope(settings, formal)
+                adapter.write_local_status(
+                    settings,
+                    {
+                        "availability": "idle",
+                        "runtimeStatus": "succeeded",
+                        "currentTaskId": formal["taskId"],
+                        "currentAssignmentId": formal["assignmentId"],
+                    },
+                )
+                first = await instance.send(
+                    formal["taskId"],
+                    "Final verified delivery.",
+                    metadata={"source_message_id": formal["messageId"]},
+                )
+                self.assertFalse(first.success)
+                self.assertFalse(adapter._load_active_envelope(settings).get("terminalNarrativePublished"))
+                retry = await instance.send(
+                    formal["taskId"],
+                    "Final verified delivery.",
+                    metadata={"source_message_id": formal["messageId"]},
+                )
+                self.assertTrue(retry.success)
+                self.assertTrue(adapter._load_active_envelope(settings)["terminalNarrativePublished"])
+
+            asyncio.run(run_test())
+            published = [
+                json.loads(command[-1])
+                for command in commands
+                if command[0] == "XADD" and len(command) >= 5 and command[1] == adapter.events_key(settings)
+            ]
+            self.assertEqual(len(published), 2)
+            self.assertTrue(all(event["visibleToChat"] for event in published))
+            self.assertEqual(published[0]["eventId"], published[1]["eventId"])
+
+    def test_turn_without_completion_keeps_assignment_active_for_monitoring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            formal = {
+                "messageId": "formal-no-result",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "dev-1",
+                "workId": "dev-1",
+                "requiresCompletion": True,
+            }
+
+            class FakeRedis:
+                async def command(self, *args):
+                    if args[0] == "XADD":
+                        return "1-0"
+                    return None
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+                adapter._persist_active_envelope(settings, formal)
+                instance._track_active_assignment(formal)
+                instance._accepted_messages[formal["messageId"]] = adapter._assignment_identity(formal)
+                event = types.SimpleNamespace(
+                    raw_message=formal,
+                    message_id=formal["messageId"],
+                    source=types.SimpleNamespace(chat_id=formal["taskId"]),
+                )
+                await instance.on_processing_complete(event, adapter.ProcessingOutcome.SUCCESS)
+                self.assertNotIn(formal["messageId"], instance._accepted_messages)
+                self.assertIn(adapter._assignment_identity(formal), instance._active_assignments)
+
+            asyncio.run(run_test())
+            status = adapter.read_team_statuses(settings, settings.member_id)
+            self.assertEqual(status["availability"], "busy")
+            self.assertEqual(status["runtimeStatus"], "running")
+
     def test_consumer_switches_from_empty_pending_to_new_messages(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.settings(Path(tmp))
@@ -686,7 +1154,7 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                     instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
                 instance._redis = FakeRedis()
 
-                async def dispatch(value):
+                async def dispatch(value, **_kwargs):
                     dispatches.append(value["messageId"])
 
                 instance._dispatch_envelope = dispatch
@@ -767,7 +1235,7 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                     instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
                 instance._redis = FakeRedis()
 
-                async def dispatch(envelope):
+                async def dispatch(envelope, **_kwargs):
                     dispatched.append(envelope["messageId"])
                     instance._accepted_messages[envelope["messageId"]] = adapter._assignment_identity(envelope)
                     adapter.write_local_status(
