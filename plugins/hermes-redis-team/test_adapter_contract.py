@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -101,6 +102,103 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertIn("automatic_turn_completion_v2", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("team_artifact_preview_v1", adapter.PROTOCOL_CAPABILITIES)
 
+    def test_existing_cooperative_directories_are_never_chmoded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "team"
+            directories = [
+                root,
+                *(root / child for child in ("inbox", "status", "tasks", "results", "artifacts", "tmp", ".hermes-redis-team")),
+            ]
+            for directory in directories:
+                directory.mkdir(parents=True, exist_ok=True)
+            settings = self.settings(root)
+            with mock.patch.object(Path, "chmod", side_effect=AssertionError("existing shared directory chmod attempted")):
+                adapter.ensure_team_dirs(settings)
+
+    def test_atomic_write_does_not_chmod_existing_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "team" / "status"
+            parent.mkdir(parents=True)
+            target = parent / "developer.json"
+            original_chmod = Path.chmod
+
+            def reject_parent_chmod(path, mode, *args, **kwargs):
+                if path == parent:
+                    raise AssertionError("existing shared parent chmod attempted")
+                return original_chmod(path, mode, *args, **kwargs)
+
+            with mock.patch.object(Path, "chmod", autospec=True, side_effect=reject_parent_chmod):
+                adapter._atomic_write_json(target, {"ok": True})
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"ok": True})
+
+    def test_concurrent_members_can_create_the_same_shared_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "team" / "artifacts" / "team-42-task-7" / "members"
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(adapter._ensure_shared_directory, target) for _ in range(24)]
+                for future in futures:
+                    future.result()
+            self.assertTrue(target.is_dir())
+
+    def test_shared_directory_rejects_files_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            file_path = root / "not-a-directory"
+            file_path.write_text("x", encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "not a directory"):
+                adapter._ensure_shared_directory(file_path)
+
+            link_path = root / "linked-directory"
+            target = root / "target"
+            target.mkdir()
+            try:
+                link_path.symlink_to(target, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symlink creation is unavailable: {exc}")
+            with self.assertRaisesRegex(PermissionError, "symbolic links"):
+                adapter._ensure_shared_directory(link_path)
+
+    def test_existing_shared_directory_must_be_cooperatively_accessible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "team"
+            target.mkdir()
+            with (
+                mock.patch.object(adapter, "_effective_access", return_value=False),
+                self.assertRaisesRegex(PermissionError, "lacks read/write/execute access"),
+            ):
+                adapter._ensure_shared_directory(target)
+
+    def test_unusable_shared_workspace_publishes_non_retryable_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shared_file = root / "team"
+            shared_file.write_text("not a directory", encoding="utf-8")
+            ready_file = root / "private" / "redis-team.ready.json"
+            settings = adapter.RedisTeamSettings(
+                enabled=True,
+                redis_url="redis://example.invalid:6379/0",
+                team_id="118",
+                member_id="developer",
+                role="developer",
+                shared_dir=str(shared_file),
+                ready_file=str(ready_file),
+            )
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                    self.assertFalse(await instance.connect())
+                    await instance.disconnect()
+
+            asyncio.run(run_test())
+            failure_file = adapter._startup_failure_path(ready_file)
+            self.assertTrue(failure_file.is_file())
+            failure = json.loads(failure_file.read_text(encoding="utf-8"))
+            self.assertEqual(failure["state"], "failed")
+            self.assertEqual(failure["error"]["code"], "shared_workspace_unusable")
+            self.assertFalse(failure["error"]["retryable"])
+            self.assertFalse(ready_file.exists())
+
     def test_consumer_readiness_requires_group_and_initial_presence(self):
         with tempfile.TemporaryDirectory() as tmp:
             ready_file = Path(tmp) / "private" / "redis-team.ready.json"
@@ -134,11 +232,16 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                     mock.patch.object(adapter, "load_settings", return_value=settings),
                     mock.patch.object(adapter, "AsyncRedisClient", FakeRedis),
                 ):
+                    failure_file = adapter._startup_failure_path(ready_file)
+                    failure_file.parent.mkdir(parents=True, exist_ok=True)
+                    failure_file.write_text('{"state":"failed"}\n', encoding="utf-8")
                     instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
                     self.assertTrue(await instance.connect())
                     self.assertTrue(ready_file.is_file())
+                    self.assertFalse(failure_file.exists())
                     ready = json.loads(ready_file.read_text(encoding="utf-8"))
                     self.assertTrue(ready["ready"])
+                    self.assertEqual(ready["state"], "ready")
                     self.assertEqual(ready["teamId"], "117")
                     self.assertEqual(ready["memberId"], "developer")
                     xgroup_index = next(index for index, command in enumerate(commands) if command[:2] == ("XGROUP", "CREATE"))

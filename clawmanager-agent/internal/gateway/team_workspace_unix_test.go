@@ -21,6 +21,15 @@ func TestPrepareLiteTeamSharedWorkspaceRepairsPermissionsAndCreatesInstanceAlias
 	if err := os.WriteFile(file, []byte("ok"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	ownerBeforeInfo, err := os.Stat(nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerBefore, ok := ownerBeforeInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("nested stat type before preparation = %T", ownerBeforeInfo.Sys())
+	}
+	ownerUIDBefore := ownerBefore.Uid
 	req := CreateGatewayRequest{
 		AgentType: "openclaw",
 		UserID:    1,
@@ -42,6 +51,13 @@ func TestPrepareLiteTeamSharedWorkspaceRepairsPermissionsAndCreatesInstanceAlias
 	}
 	if dirInfo.Mode().Perm()&0o020 == 0 || dirInfo.Mode()&os.ModeSetgid == 0 {
 		t.Fatalf("nested directory mode = %v, want group-write and setgid", dirInfo.Mode())
+	}
+	dirStat, ok := dirInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("nested stat type after preparation = %T", dirInfo.Sys())
+	}
+	if dirStat.Uid != ownerUIDBefore {
+		t.Fatalf("nested directory uid changed from %d to %d", ownerUIDBefore, dirStat.Uid)
 	}
 	fileInfo, err := os.Stat(file)
 	if err != nil {

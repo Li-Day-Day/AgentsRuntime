@@ -31,7 +31,9 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 		`/usr/local/bin/hermes-apply-runtime-config`,
 		`for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md`,
 		"hermes gateway run --accept-hooks --no-supervise",
-		`while [ ! -s "${team_ready_file}" ]`,
+		`team_failure_file="${team_ready_file}.failed"`,
+		`grep -Eq '"ready"[[:space:]]*:[[:space:]]*true' "${team_ready_file}"`,
+		`Hermes Redis Team consumer reported a non-retryable startup failure`,
 		`wait -n "${wait_pids[@]}"`,
 	} {
 		if !strings.Contains(script, want) {

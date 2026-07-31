@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import ssl
+import stat
 import time
 import uuid
 from dataclasses import dataclass
@@ -97,9 +98,80 @@ def _short_text(value: str, limit: int = 500) -> str:
     return text[: max(0, limit - 3)] + "..."
 
 
+def _effective_access(path: Path, mode: int) -> bool:
+    try:
+        return os.access(path, mode, effective_ids=True)
+    except (NotImplementedError, TypeError):
+        return os.access(path, mode)
+
+
+def _shared_directory_error(path: Path, detail: str) -> PermissionError:
+    try:
+        info = path.lstat()
+        owner = f"uid={info.st_uid} gid={info.st_gid} mode={oct(stat.S_IMODE(info.st_mode))}"
+    except OSError as exc:
+        owner = f"stat_error={exc}"
+    effective_uid = os.geteuid() if hasattr(os, "geteuid") else -1
+    effective_gid = os.getegid() if hasattr(os, "getegid") else -1
+    groups = ",".join(str(value) for value in os.getgroups()) if hasattr(os, "getgroups") else ""
+    return PermissionError(
+        f"Team shared directory is unusable: {path} ({detail}; {owner}; "
+        f"euid={effective_uid} egid={effective_gid} groups={groups})"
+    )
+
+
+def _validate_shared_directory(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise _shared_directory_error(path, f"unable to inspect directory: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise _shared_directory_error(path, "symbolic links are not allowed")
+    if not stat.S_ISDIR(info.st_mode):
+        raise _shared_directory_error(path, "path is not a directory")
+    if not _effective_access(path, os.R_OK | os.W_OK | os.X_OK):
+        raise _shared_directory_error(path, "current Worker lacks read/write/execute access")
+
+
+def _ensure_shared_directory(path: Path) -> None:
+    """Create a cooperative Team directory without chmod-ing foreign NFS owners."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        info = None
+    except OSError as exc:
+        raise _shared_directory_error(path, f"unable to inspect directory: {exc}") from exc
+
+    if info is not None:
+        _validate_shared_directory(path)
+        return
+
+    parent = path.parent
+    if parent == path:
+        raise _shared_directory_error(path, "directory has no creatable parent")
+    _ensure_shared_directory(parent)
+
+    created = False
+    try:
+        path.mkdir(mode=TEAM_SHARED_DIR_MODE)
+        created = True
+    except FileExistsError:
+        # Another Team member may have won the creation race.
+        pass
+    except OSError as exc:
+        raise _shared_directory_error(path, f"unable to create directory: {exc}") from exc
+
+    if created:
+        try:
+            path.chmod(TEAM_SHARED_DIR_MODE)
+        except OSError as exc:
+            raise _shared_directory_error(path, f"unable to set newly-created directory permissions: {exc}") from exc
+    _validate_shared_directory(path)
+
+
 def _atomic_write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=TEAM_SHARED_DIR_MODE)
-    path.parent.chmod(TEAM_SHARED_DIR_MODE)
+    _ensure_shared_directory(path.parent)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.chmod(TEAM_SHARED_FILE_MODE)
@@ -108,8 +180,7 @@ def _atomic_write_json(path: Path, value: Any) -> None:
 
 
 def _atomic_write_text(path: Path, value: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=TEAM_SHARED_DIR_MODE)
-    path.parent.chmod(TEAM_SHARED_DIR_MODE)
+    _ensure_shared_directory(path.parent)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(value, encoding="utf-8")
     tmp.chmod(TEAM_SHARED_FILE_MODE)
@@ -243,8 +314,7 @@ def ensure_team_dirs(settings: RedisTeamSettings) -> None:
         settings.shared_path,
         *(settings.shared_path / child for child in ("inbox", "status", "tasks", "results", "artifacts", "tmp", ".hermes-redis-team")),
     ]:
-        directory.mkdir(parents=True, exist_ok=True, mode=TEAM_SHARED_DIR_MODE)
-        directory.chmod(TEAM_SHARED_DIR_MODE)
+        _ensure_shared_directory(directory)
 
 
 def _active_envelope_path(settings: RedisTeamSettings) -> Path:
@@ -444,8 +514,7 @@ async def _tool_team_artifact_mkdir(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     try:
         target = _artifact_path(settings, args, default_scope="member", write=True)
-        target.mkdir(parents=True, exist_ok=True, mode=TEAM_SHARED_DIR_MODE)
-        target.chmod(TEAM_SHARED_DIR_MODE)
+        _ensure_shared_directory(target)
         return json.dumps(
             {"ok": True, "artifact": {"path": canonical_artifact_ref(settings, target)}},
             ensure_ascii=False,
@@ -547,10 +616,61 @@ def _clear_ready_file(settings: RedisTeamSettings) -> None:
     path = Path(raw)
     if not path.is_absolute():
         raise ValueError("CLAWMANAGER_TEAM_READY_FILE must be absolute")
+    for candidate in (path, _startup_failure_path(path)):
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _startup_failure_path(ready_path: Path) -> Path:
+    return ready_path.with_name(ready_path.name + ".failed")
+
+
+def _write_private_startup_state(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.chmod(0o700)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(path)
+    path.chmod(0o600)
+
+
+def _publish_startup_failure(
+    settings: RedisTeamSettings,
+    *,
+    code: str,
+    message: str,
+    retryable: bool,
+) -> None:
+    raw = _trim(settings.ready_file)
+    if not raw:
+        return
+    ready_path = Path(raw)
+    if not ready_path.is_absolute():
+        raise ValueError("CLAWMANAGER_TEAM_READY_FILE must be absolute")
     try:
-        path.unlink()
+        ready_path.unlink()
     except FileNotFoundError:
         pass
+    _write_private_startup_state(
+        _startup_failure_path(ready_path),
+        {
+            "ready": False,
+            "state": "failed",
+            "teamId": settings.team_id,
+            "memberId": settings.member_id,
+            "runtime": "hermes",
+            "protocolVersion": PROTOCOL_VERSION,
+            "failedAt": _now_iso(),
+            "error": {
+                "code": _safe_name(code),
+                "message": _short_text(message, 1000),
+                "retryable": retryable,
+            },
+        },
+    )
 
 
 def _publish_ready_file(settings: RedisTeamSettings, status: dict[str, Any]) -> None:
@@ -560,31 +680,44 @@ def _publish_ready_file(settings: RedisTeamSettings, status: dict[str, Any]) -> 
     path = Path(raw)
     if not path.is_absolute():
         raise ValueError("CLAWMANAGER_TEAM_READY_FILE must be absolute")
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.parent.chmod(0o700)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(
-        json.dumps(
-            {
-                "ready": True,
-                "teamId": settings.team_id,
-                "memberId": settings.member_id,
-                "runtime": "hermes",
-                "protocolVersion": PROTOCOL_VERSION,
-                "readyAt": _now_iso(),
-                "presence": {
-                    "liveness": status.get("liveness"),
-                    "availability": status.get("availability"),
-                },
+    try:
+        _startup_failure_path(path).unlink()
+    except FileNotFoundError:
+        pass
+    _write_private_startup_state(
+        path,
+        {
+            "ready": True,
+            "state": "ready",
+            "teamId": settings.team_id,
+            "memberId": settings.member_id,
+            "runtime": "hermes",
+            "protocolVersion": PROTOCOL_VERSION,
+            "readyAt": _now_iso(),
+            "presence": {
+                "liveness": status.get("liveness"),
+                "availability": status.get("availability"),
             },
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
+        },
     )
-    tmp.chmod(0o600)
-    tmp.replace(path)
-    path.chmod(0o600)
+
+
+def _record_startup_failure(
+    settings: RedisTeamSettings,
+    *,
+    code: str,
+    message: str,
+    retryable: bool,
+) -> None:
+    try:
+        _publish_startup_failure(
+            settings,
+            code=code,
+            message=message,
+            retryable=retryable,
+        )
+    except Exception as exc:
+        logger.error("Redis Team: failed to publish startup failure state: %s", exc)
 
 
 def read_team_statuses(settings: RedisTeamSettings, member_id: str = "") -> Any:
@@ -1359,18 +1492,42 @@ class RedisTeamAdapter(BasePlatformAdapter):
             if not self.settings.valid:
                 logger.error("Redis Team: CLAWMANAGER_TEAM_REDIS_URL, TEAM_ID and MEMBER_ID are required")
                 self._set_fatal_error("config_missing", "Redis Team env is incomplete", retryable=False)
+                _record_startup_failure(
+                    self.settings,
+                    code="config_missing",
+                    message="Redis Team env is incomplete",
+                    retryable=False,
+                )
                 return False
             if not Path(self.settings.shared_dir).is_absolute():
                 logger.error("Redis Team: CLAWMANAGER_TEAM_SHARED_DIR must be absolute")
                 self._set_fatal_error("invalid_shared_dir", "CLAWMANAGER_TEAM_SHARED_DIR must be absolute", retryable=False)
+                _record_startup_failure(
+                    self.settings,
+                    code="invalid_shared_dir",
+                    message="CLAWMANAGER_TEAM_SHARED_DIR must be absolute",
+                    retryable=False,
+                )
                 return False
             if self._consumer_task and not self._consumer_task.done():
                 logger.info("Redis Team: consumer already running for member=%s", self.settings.member_id)
                 return True
 
             await self._disconnect_unlocked(mark_offline=False)
-            ensure_team_dirs(self.settings)
-            write_local_status(self.settings, {"availability": "idle"})
+            try:
+                ensure_team_dirs(self.settings)
+                write_local_status(self.settings, {"availability": "idle"})
+            except (OSError, ValueError) as exc:
+                message = str(exc)
+                logger.error("Redis Team: shared workspace is unusable: %s", message)
+                self._set_fatal_error("shared_workspace_unusable", message, retryable=False)
+                _record_startup_failure(
+                    self.settings,
+                    code="shared_workspace_unusable",
+                    message=message,
+                    retryable=False,
+                )
+                return False
             self._redis = AsyncRedisClient(self.settings.redis_url)
             self._consumer_redis = AsyncRedisClient(self.settings.redis_url)
             try:
@@ -1427,6 +1584,12 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 logger.error("Redis Team: failed to publish readiness: %s", exc)
                 self._set_fatal_error("readiness_publish_failed", str(exc), retryable=False)
                 await self._disconnect_unlocked(mark_offline=False)
+                _record_startup_failure(
+                    self.settings,
+                    code="readiness_publish_failed",
+                    message=str(exc),
+                    retryable=False,
+                )
                 return False
             logger.info(
                 "Redis Team: connected team=%s member=%s group=%s",
@@ -1441,11 +1604,13 @@ class RedisTeamAdapter(BasePlatformAdapter):
             await self._disconnect_unlocked(mark_offline=True)
 
     async def _disconnect_unlocked(self, *, mark_offline: bool) -> None:
+        was_connected = self.is_connected
         self._mark_disconnected()
-        try:
-            _clear_ready_file(self.settings)
-        except Exception:
-            pass
+        if was_connected or not mark_offline:
+            try:
+                _clear_ready_file(self.settings)
+            except Exception:
+                pass
         for task in (self._consumer_task, self._presence_task):
             if task and not task.done():
                 task.cancel()
@@ -1480,8 +1645,11 @@ class RedisTeamAdapter(BasePlatformAdapter):
         if self._redis:
             self._redis.close()
             self._redis = None
-        if mark_offline:
-            write_local_status(self.settings, {"liveness": "offline"})
+        if mark_offline and was_connected:
+            try:
+                write_local_status(self.settings, {"liveness": "offline"})
+            except Exception as exc:
+                logger.warning("Redis Team: unable to persist offline status: %s", exc)
 
     async def send(
         self,

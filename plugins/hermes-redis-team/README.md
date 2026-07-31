@@ -55,6 +55,19 @@ Hermes final response is proposed automatically, while Monitor/status turns and
 empty or question-only responses remain non-terminal. ClawManager remains the
 authority that accepts or rejects completion.
 
+## Shared workspace ownership
+
+ClawManager prepares the Team shared tree with a stable shared group and
+setgid/group-write permissions. Each Worker keeps its own UID and uses that
+shared GID. The Hermes adapter validates that existing shared directories are
+readable and writable, but it never changes their mode or owner. It only applies
+the cooperative mode to a directory it created itself. This is required for
+NFS-backed Teams, where a Worker can create files through group access but
+cannot `chmod` a directory owned by another runtime.
+
+Private readiness and startup-failure files remain in the Worker-owned private
+runtime directory and use restrictive permissions.
+
 ## AgentsRuntime packaging
 
 `plugins/hermes-redis-team` is the canonical source and is copied directly into

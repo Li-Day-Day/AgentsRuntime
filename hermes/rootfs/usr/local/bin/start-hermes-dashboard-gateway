@@ -165,7 +165,7 @@ start_team_gateway() {
             "${XDG_CONFIG_HOME}" \
             "${XDG_DATA_HOME}" \
             "$(dirname "${CLAWMANAGER_TEAM_READY_FILE}")"
-        rm -f "${CLAWMANAGER_TEAM_READY_FILE}"
+        rm -f "${CLAWMANAGER_TEAM_READY_FILE}" "${CLAWMANAGER_TEAM_READY_FILE}.failed"
         for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md; do
             if [ -f "${dashboard_hermes_home}/${managed_identity}" ] && [ ! -e "${HERMES_HOME}/${managed_identity}" ]; then
                 cp "${dashboard_hermes_home}/${managed_identity}" "${HERMES_HOME}/${managed_identity}"
@@ -199,8 +199,21 @@ start_team_gateway() {
     if [ -n "${CLAWMANAGER_TEAM_READY_FILE:-}" ]; then
         team_ready_file="${CLAWMANAGER_TEAM_READY_FILE}"
     fi
+    team_failure_file="${team_ready_file}.failed"
     started_at="${SECONDS}"
-    while [ ! -s "${team_ready_file}" ]; do
+    while true; do
+        if [ -s "${team_failure_file}" ]; then
+            failure_summary="$(tr '\r\n' '  ' <"${team_failure_file}")"
+            echo "Hermes Redis Team consumer reported a non-retryable startup failure: ${failure_summary}" >&2
+            kill "${team_gateway_pid}" 2>/dev/null || true
+            wait "${team_gateway_pid}" 2>/dev/null || true
+            team_gateway_pid=""
+            return 78
+        fi
+        if [ -s "${team_ready_file}" ] &&
+            grep -Eq '"ready"[[:space:]]*:[[:space:]]*true' "${team_ready_file}"; then
+            break
+        fi
         if ! kill -0 "${team_gateway_pid}" 2>/dev/null; then
             set +e
             wait "${team_gateway_pid}"
