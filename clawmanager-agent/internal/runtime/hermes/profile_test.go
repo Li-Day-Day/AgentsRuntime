@@ -83,11 +83,11 @@ func TestGatewayEnvSetsHermesWorkspace(t *testing.T) {
 	if values["CUSTOM_RUNTIME_ENV"] != "forwarded" {
 		t.Fatalf("CUSTOM_RUNTIME_ENV = %q, want forwarded", values["CUSTOM_RUNTIME_ENV"])
 	}
-	if _, ok := values["CLAWMANAGER_TEAM_CONFIG_PATH"]; ok {
-		t.Fatalf("CLAWMANAGER_TEAM_CONFIG_PATH = %q, want no Lite config remap", values["CLAWMANAGER_TEAM_CONFIG_PATH"])
+	if values["CLAWMANAGER_TEAM_CONFIG_PATH"] != workspacePath+"/team/team.json" {
+		t.Fatalf("CLAWMANAGER_TEAM_CONFIG_PATH = %q, want workspace Team config", values["CLAWMANAGER_TEAM_CONFIG_PATH"])
 	}
-	if values["CLAWMANAGER_TEAM_SHARED_DIR"] != "/team" {
-		t.Fatalf("CLAWMANAGER_TEAM_SHARED_DIR = %q, want transparent request value", values["CLAWMANAGER_TEAM_SHARED_DIR"])
+	if values["CLAWMANAGER_TEAM_SHARED_DIR"] != workspacePath+"/team" {
+		t.Fatalf("CLAWMANAGER_TEAM_SHARED_DIR = %q, want workspace Team directory", values["CLAWMANAGER_TEAM_SHARED_DIR"])
 	}
 }
 
@@ -106,8 +106,8 @@ func TestGatewayEnvMovesDefaultTeamSharedDirIntoWorkspace(t *testing.T) {
 
 	env := profile.GatewayEnv(nil, gateway.Config{RuntimeType: "hermes", GatewayAuthMode: "trusted-proxy"}, req, workspacePath, 20018)
 	values := envMap(env)
-	if values["CLAWMANAGER_TEAM_SHARED_DIR"] != "/team" {
-		t.Fatalf("CLAWMANAGER_TEAM_SHARED_DIR = %q, want transparent request value", values["CLAWMANAGER_TEAM_SHARED_DIR"])
+	if values["CLAWMANAGER_TEAM_SHARED_DIR"] != workspacePath+"/team" {
+		t.Fatalf("CLAWMANAGER_TEAM_SHARED_DIR = %q, want workspace Team directory", values["CLAWMANAGER_TEAM_SHARED_DIR"])
 	}
 	if _, ok := values["CLAWMANAGER_TEAM_CONFIG_PATH"]; ok {
 		t.Fatalf("CLAWMANAGER_TEAM_CONFIG_PATH = %q, want unset without config JSON", values["CLAWMANAGER_TEAM_CONFIG_PATH"])

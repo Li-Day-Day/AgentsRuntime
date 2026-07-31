@@ -128,8 +128,8 @@ func TestWriteGatewayConfigWritesHermesWorkspaceConfig(t *testing.T) {
 		t.Fatalf("trusted_proxies = %#v", gatewayConfig["trusted_proxies"])
 	}
 
-	if _, err := os.Stat(filepath.Join(workspace, "team", "team.json")); !os.IsNotExist(err) {
-		t.Fatalf("Hermes wrote Lite Team config: %v", err)
+	if _, err := os.Stat(filepath.Join(workspace, "team", "team.json")); err != nil {
+		t.Fatalf("Hermes Lite Team config missing: %v", err)
 	}
 }
 

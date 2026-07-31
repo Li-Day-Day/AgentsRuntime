@@ -19,11 +19,39 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 		"CLAWMANAGER_TEAM_REDIS_URL",
 		"CLAWMANAGER_TEAM_ID",
 		"CLAWMANAGER_TEAM_MEMBER_ID",
+		"HERMES_TEAM_WORKER_PORT",
+		"HERMES_TEAM_WORKER_HOME",
+		`.clawmanager-team-worker`,
+		`export HERMES_HOME="${team_worker_home}/.hermes"`,
+		`export CLAWMANAGER_GATEWAY_PORT="${team_worker_port}"`,
+		`[ "${team_worker_port}" -eq "${port}" ]`,
+		`[ "${team_worker_port}" -gt 65535 ]`,
+		`/usr/local/bin/hermes-apply-runtime-config`,
+		`for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md`,
 		"hermes gateway run --accept-hooks --no-supervise",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("start-hermes-dashboard-gateway missing %q", want)
 		}
+	}
+	dashboardStart := strings.Index(script, "hermes dashboard")
+	teamStart := strings.Index(script, "exec hermes gateway run --accept-hooks --no-supervise")
+	if dashboardStart < 0 || teamStart < 0 || dashboardStart > teamStart {
+		t.Fatalf("dashboard must bind before the isolated Team consumer starts")
+	}
+}
+
+func TestDockerfilePackagesCanonicalRedisTeamAdapter(t *testing.T) {
+	data, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	dockerfile := string(data)
+	if !strings.Contains(dockerfile, "COPY plugins/hermes-redis-team/ /tmp/hermes-vendor-plugins/redis_team/") {
+		t.Fatal("Dockerfile does not package the canonical Hermes Redis Team adapter")
+	}
+	if strings.Contains(dockerfile, "COPY hermes/vendor-plugins/redis_team/") {
+		t.Fatal("Dockerfile still packages the stale vendor mirror")
 	}
 }
 

@@ -1432,11 +1432,11 @@ def apply_redis_team_config(hermes_home, data):
         persist_bootstrap_payload(hermes_home, "redis-team", record)
         return record
 
-    for child in ("", "inbox", "status", "tasks", "results", ".hermes-redis-team"):
+    for child in ("", "inbox", "status", "tasks", "results", "artifacts", "tmp", ".hermes-redis-team"):
         try:
             path = Path(shared_dir) / child
             path.mkdir(parents=True, exist_ok=True)
-            path.chmod(0o775)
+            path.chmod(0o2775)
         except Exception as exc:
             record["error"] = f"mkdir {path}: {exc}"
             break
