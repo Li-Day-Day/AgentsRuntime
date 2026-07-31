@@ -48,6 +48,8 @@ DEFAULT_SHARED_DIR = "/team"
 DEFAULT_CONSUMER_GROUP = "team-members"
 READ_BLOCK_MS = 5000
 STATUS_INTERVAL_SECONDS = 30
+PENDING_DRAIN_BATCH_LIMIT = 3
+REDIS_RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 30)
 TEAM_SHARED_DIR_MODE = 0o2775
 TEAM_SHARED_FILE_MODE = 0o664
 MAX_ARTIFACT_BYTES = 1024 * 1024
@@ -816,11 +818,15 @@ def write_task_result(
 def normalize_envelope(raw: Any) -> Optional[dict[str, Any]]:
     if not isinstance(raw, dict):
         return None
+    message_id = _trim(raw.get("messageId") or raw.get("id"))
+    task_id = _trim(raw.get("taskId") or raw.get("task_id"))
+    if not message_id or not task_id:
+        return None
     return {
         "schemaVersion": raw.get("v") or raw.get("schemaVersion") or WIRE_SCHEMA_VERSION,
         "protocolVersion": raw.get("protocolVersion") or raw.get("protocol_version") or raw.get("v") or WIRE_SCHEMA_VERSION,
-        "messageId": raw.get("messageId") or raw.get("id") or f"msg_{uuid.uuid4().hex}",
-        "taskId": raw.get("taskId") or raw.get("task_id") or f"task_{uuid.uuid4().hex}",
+        "messageId": message_id,
+        "taskId": task_id,
         "rootTaskId": raw.get("rootTaskId") or raw.get("root_task_id") or raw.get("taskId") or raw.get("task_id"),
         "rootMessageId": raw.get("rootMessageId") or raw.get("root_message_id") or raw.get("messageId") or raw.get("id"),
         "workId": raw.get("workId") or raw.get("work_id") or raw.get("assignmentId") or raw.get("assignment_id"),
@@ -846,8 +852,28 @@ def normalize_envelope(raw: Any) -> Optional[dict[str, Any]]:
         "requiresCompletion": raw.get("requiresCompletion", raw.get("requires_completion", True)),
         "responseLocale": raw.get("responseLocale") or raw.get("response_locale") or "zh-CN",
         "sharedWorkspace": raw.get("sharedWorkspace") if isinstance(raw.get("sharedWorkspace"), dict) else {},
-        "idempotencyKey": raw.get("idempotencyKey") or raw.get("messageId") or raw.get("id"),
+        "idempotencyKey": raw.get("idempotencyKey") or message_id,
+        "redisId": raw.get("redisId"),
     }
+
+
+def _assignment_identity(envelope: dict[str, Any]) -> tuple[str, str]:
+    return (
+        _trim(envelope.get("rootTaskId") or envelope.get("taskId")),
+        _trim(envelope.get("assignmentId") or envelope.get("workId")),
+    )
+
+
+def _is_monitor_envelope(envelope: dict[str, Any]) -> bool:
+    metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
+    intent = _trim(envelope.get("intent") or metadata.get("intent")).lower()
+    monitor_type = _trim(metadata.get("monitorType") or metadata.get("monitor_type")).lower()
+    sender = _trim(envelope.get("from")).lower()
+    return (
+        not _truthy(envelope.get("requiresCompletion"), True)
+        and intent == "assignment_status_check"
+        and (sender == "clawmanager-monitor" or monitor_type == "assignment_status_check")
+    )
 
 
 def _reply_target(settings: RedisTeamSettings, metadata: dict[str, Any]) -> str:
@@ -1041,8 +1067,11 @@ class AsyncRedisClient:
         raise RespError(f"unknown Redis RESP prefix: {prefix!r}")
 
     def close(self) -> None:
-        if self._writer is not None:
-            self._writer.close()
+        writer = self._writer
+        self._reader = None
+        self._writer = None
+        if writer is not None:
+            writer.close()
 
 
 def _stream_fields_to_dict(fields: Any) -> dict[str, Any]:
@@ -1488,6 +1517,16 @@ class RedisTeamAdapter(BasePlatformAdapter):
         self._consumer_task: Optional[asyncio.Task] = None
         self._presence_task: Optional[asyncio.Task] = None
         self._lifecycle_lock = asyncio.Lock()
+        self._redis_reconnect_lock = asyncio.Lock()
+        # Track accepted work by message, not only by assignment. A recovery or
+        # correction may legitimately enqueue more than one turn for the same
+        # assignment; completing one turn must not make the other look stale.
+        self._accepted_messages: Dict[str, tuple[str, str]] = {}
+        # A message can be accepted by Hermes before Redis records the
+        # processed marker/ACK. Keep that transport boundary distinct from
+        # model activity so a reconnect finalizes delivery without dispatching
+        # the same turn twice.
+        self._transport_accepted_messages: set[str] = set()
         self._redis_reply_metadata: Dict[str, Dict[str, Any]] = {}
         self._approval_session_by_key: Dict[str, str] = {}
         self._latest_approval_session_key = ""
@@ -1495,6 +1534,129 @@ class RedisTeamAdapter(BasePlatformAdapter):
     @property
     def name(self) -> str:
         return "Redis Team"
+
+    async def _open_redis_clients(
+        self,
+        *,
+        status_patch: Optional[dict[str, Any]] = None,
+    ) -> tuple[AsyncRedisClient, AsyncRedisClient, dict[str, Any]]:
+        presence = AsyncRedisClient(self.settings.redis_url)
+        consumer = AsyncRedisClient(self.settings.redis_url)
+        try:
+            await presence.connect()
+            try:
+                await presence.command("CLIENT", "SETNAME", _redis_client_name(self.settings, "presence"))
+            except Exception:
+                pass
+            await consumer.connect()
+            try:
+                await consumer.command("CLIENT", "SETNAME", _redis_client_name(self.settings, "consumer"))
+            except Exception:
+                pass
+            try:
+                await presence.command(
+                    "XGROUP",
+                    "CREATE",
+                    inbox_key(self.settings),
+                    self.settings.consumer_group,
+                    "0",
+                    "MKSTREAM",
+                )
+            except RespError as exc:
+                if "BUSYGROUP" not in str(exc):
+                    raise
+            status = write_local_status(self.settings, status_patch or {"availability": "idle"})
+            await presence.command(
+                "HSET",
+                presence_key(self.settings),
+                self.settings.member_id,
+                json.dumps(status, ensure_ascii=False),
+            )
+            return presence, consumer, status
+        except Exception:
+            consumer.close()
+            presence.close()
+            raise
+
+    async def _reconnect_redis_clients(self, failed_client: AsyncRedisClient) -> bool:
+        async with self._redis_reconnect_lock:
+            if not self.is_connected:
+                return False
+            if failed_client is not self._redis and failed_client is not self._consumer_redis:
+                return True
+
+            try:
+                previous_status = read_team_statuses(self.settings, self.settings.member_id) or {}
+            except Exception as exc:
+                logger.warning("Redis Team: could not read local status before reconnect: %s", exc)
+                previous_status = {}
+            previous_runtime_status = _trim(previous_status.get("runtimeStatus")) or "idle"
+            previous_availability = _trim(previous_status.get("availability")) or "idle"
+            try:
+                _clear_ready_file(self.settings)
+            except Exception as exc:
+                logger.warning("Redis Team: failed to clear readiness during reconnect: %s", exc)
+            try:
+                write_local_status(
+                    self.settings,
+                    {
+                        "liveness": "reconnecting",
+                        "runtimeStatus": "reconnecting",
+                    },
+                )
+            except Exception:
+                pass
+
+            attempt = 0
+            while self.is_connected:
+                delay = REDIS_RECONNECT_BACKOFF_SECONDS[min(attempt, len(REDIS_RECONNECT_BACKOFF_SECONDS) - 1)]
+                try:
+                    presence, consumer, status = await self._open_redis_clients(
+                        status_patch={
+                            "liveness": "online",
+                            "runtimeStatus": previous_runtime_status,
+                            "availability": previous_availability,
+                        }
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    attempt += 1
+                    logger.warning(
+                        "Redis Team: reconnect attempt %s failed: %s; retrying in %ss",
+                        attempt,
+                        exc,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                old_presence = self._redis
+                old_consumer = self._consumer_redis
+                self._redis = presence
+                self._consumer_redis = consumer
+                if old_consumer:
+                    old_consumer.close()
+                if old_presence:
+                    old_presence.close()
+                try:
+                    _publish_ready_file(self.settings, status)
+                except Exception as exc:
+                    logger.error("Redis Team: failed to restore readiness after reconnect: %s", exc)
+                    consumer.close()
+                    presence.close()
+                    self._consumer_redis = None
+                    self._redis = None
+                    attempt += 1
+                    await asyncio.sleep(delay)
+                    continue
+                logger.info(
+                    "Redis Team: Redis connections restored team=%s member=%s",
+                    self.settings.team_id,
+                    self.settings.member_id,
+                )
+                return True
+            return False
 
     async def connect(self, is_reconnect: bool = False, **_kwargs: Any) -> bool:
         async with self._lifecycle_lock:
@@ -1546,38 +1708,8 @@ class RedisTeamAdapter(BasePlatformAdapter):
                     retryable=False,
                 )
                 return False
-            self._redis = AsyncRedisClient(self.settings.redis_url)
-            self._consumer_redis = AsyncRedisClient(self.settings.redis_url)
             try:
-                await self._redis.connect()
-                try:
-                    await self._redis.command("CLIENT", "SETNAME", _redis_client_name(self.settings, "presence"))
-                except Exception:
-                    pass
-                await self._consumer_redis.connect()
-                try:
-                    await self._consumer_redis.command("CLIENT", "SETNAME", _redis_client_name(self.settings, "consumer"))
-                except Exception:
-                    pass
-                try:
-                    await self._redis.command(
-                        "XGROUP",
-                        "CREATE",
-                        inbox_key(self.settings),
-                        self.settings.consumer_group,
-                        "0",
-                        "MKSTREAM",
-                    )
-                except RespError as exc:
-                    if "BUSYGROUP" not in str(exc):
-                        raise
-                initial_status = write_local_status(self.settings, {"availability": "idle"})
-                await self._redis.command(
-                    "HSET",
-                    presence_key(self.settings),
-                    self.settings.member_id,
-                    json.dumps(initial_status, ensure_ascii=False),
-                )
+                self._redis, self._consumer_redis, initial_status = await self._open_redis_clients()
             except Exception as exc:
                 logger.error("Redis Team: failed to connect: %s", exc)
                 self._set_fatal_error("connect_failed", str(exc), retryable=True)
@@ -1638,6 +1770,8 @@ class RedisTeamAdapter(BasePlatformAdapter):
                     pass
         self._consumer_task = None
         self._presence_task = None
+        self._accepted_messages.clear()
+        self._transport_accepted_messages.clear()
         if mark_offline and self._redis:
             try:
                 await self._redis.command(
@@ -1862,7 +1996,95 @@ class RedisTeamAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": f"Redis Team task {chat_id}", "type": "dm"}
 
+    async def _report_monitor_without_model(self, envelope: dict[str, Any]) -> bool:
+        if not _is_monitor_envelope(envelope) or not self._redis:
+            return False
+        root_task_id, assignment_id = _assignment_identity(envelope)
+        if not root_task_id or not assignment_id:
+            return False
+
+        accepted = (root_task_id, assignment_id) in self._accepted_messages.values()
+        status = read_team_statuses(self.settings, self.settings.member_id) or {}
+        status_task_id = _trim(status.get("currentTaskId"))
+        status_assignment_id = _trim(status.get("currentAssignmentId"))
+        runtime_status = _trim(status.get("runtimeStatus")).lower()
+        terminal = (
+            status_task_id == root_task_id
+            and (not status_assignment_id or status_assignment_id == assignment_id)
+            and runtime_status in {"succeeded", "failed", "cancelled"}
+        )
+        if not accepted and not terminal:
+            return False
+
+        metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
+        check_id = _trim(metadata.get("checkId") or metadata.get("check_id") or envelope.get("messageId"))
+        progress_status = runtime_status if terminal else "running"
+        availability = (
+            "idle"
+            if progress_status == "succeeded"
+            else "blocked"
+            if progress_status in {"failed", "cancelled"}
+            else "busy"
+        )
+        summary = _trim(status.get("lastSummary"))
+        if not summary:
+            summary = (
+                f"Hermes Team assignment {progress_status}"
+                if terminal
+                else "Hermes Team assignment is actively processing"
+            )
+        await xadd_json(
+            self._redis,
+            events_key(self.settings),
+            _task_event(
+                self.settings,
+                "task_progress",
+                envelope,
+                {
+                    "eventKind": "assignment_check_result",
+                    "intent": "assignment_status_check",
+                    "status": progress_status,
+                    "runtimeStatus": progress_status,
+                    "availability": availability,
+                    "progress": 100 if terminal and progress_status == "succeeded" else status.get("progress"),
+                    "summary": summary,
+                    "artifactRefs": status.get("artifactRefs") if isinstance(status.get("artifactRefs"), list) else [],
+                    "checkId": check_id,
+                    "checkSequence": metadata.get("checkSequence") or metadata.get("check_sequence"),
+                    "requestedAt": metadata.get("requestedAt") or metadata.get("requested_at"),
+                    "respondedAt": _now_iso(),
+                    "requiresCompletion": False,
+                    "terminalEvidence": terminal,
+                    "nonAuthoritative": True,
+                    "rootTaskTerminal": False,
+                    "visibleToChat": False,
+                    "chatPolicy": "hidden",
+                    # A monitor reply is evidence only. It must never close or
+                    # otherwise mutate the assignment on its own.
+                    "stateEffect": "none",
+                },
+            ),
+        )
+        logger.info(
+            "Redis Team: answered monitor without model task=%s assignment=%s status=%s",
+            root_task_id,
+            assignment_id,
+            progress_status,
+        )
+        return True
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        envelope = event.raw_message if isinstance(event.raw_message, dict) else {}
+        task_id = str(envelope.get("taskId") or event.source.chat_id)
+        try:
+            await self._on_processing_complete_inner(event, outcome)
+        finally:
+            message_id = _trim(envelope.get("messageId") or event.message_id)
+            if message_id:
+                self._accepted_messages.pop(message_id, None)
+            self._redis_reply_metadata.pop(task_id, None)
+
+    async def _on_processing_complete_inner(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         envelope = event.raw_message if isinstance(event.raw_message, dict) else _load_active_envelope(self.settings)
         task_id = str(envelope.get("taskId") or event.source.chat_id)
         message_id = str(envelope.get("messageId") or event.message_id or "")
@@ -2005,7 +2227,19 @@ class RedisTeamAdapter(BasePlatformAdapter):
         while self.is_connected:
             try:
                 status = write_local_status(self.settings)
-                await self._redis.command(
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Redis Team: local presence update failed: %s", exc)
+                await asyncio.sleep(STATUS_INTERVAL_SECONDS)
+                continue
+
+            redis = self._redis
+            if redis is None:
+                await asyncio.sleep(STATUS_INTERVAL_SECONDS)
+                continue
+            try:
+                await redis.command(
                     "HSET",
                     presence_key(self.settings),
                     self.settings.member_id,
@@ -2014,7 +2248,12 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 active = _load_active_envelope(self.settings)
                 root_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
                 assignment_id = _trim(active.get("assignmentId") or active.get("workId"))
-                if root_task_id and assignment_id and not active.get("terminal"):
+                if (
+                    root_task_id
+                    and assignment_id
+                    and (root_task_id, assignment_id) in self._accepted_messages.values()
+                    and not active.get("terminal")
+                ):
                     activity = {
                         "teamId": self.settings.team_id,
                         "memberId": self.settings.member_id,
@@ -2026,7 +2265,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
                         "observedAt": _now_iso(),
                         "runtime": "hermes",
                     }
-                    await self._redis.command(
+                    await redis.command(
                         "SET",
                         assignment_activity_key(self.settings, root_task_id, assignment_id),
                         json.dumps(activity, ensure_ascii=False),
@@ -2034,7 +2273,7 @@ class RedisTeamAdapter(BasePlatformAdapter):
                         120,
                     )
                     await xadd_json(
-                        self._redis,
+                        redis,
                         events_key(self.settings),
                         _task_event(
                             self.settings,
@@ -2051,49 +2290,114 @@ class RedisTeamAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("Redis Team: presence update failed: %s", exc)
+                logger.warning("Redis Team: presence connection failed: %s", exc)
+                await self._reconnect_redis_clients(redis)
             await asyncio.sleep(STATUS_INTERVAL_SECONDS)
 
     async def _consumer_loop(self) -> None:
         assert self._consumer_redis is not None
         redis = self._consumer_redis
-        pending = True
+        read_id = "0"
+        pending_batches = 0
         while self.is_connected:
             try:
-                response = await redis.command(
+                command = [
                     "XREADGROUP",
                     "GROUP",
                     self.settings.consumer_group,
                     self.settings.member_id,
                     "COUNT",
                     10,
-                    "BLOCK",
-                    READ_BLOCK_MS,
-                    "STREAMS",
-                    inbox_key(self.settings),
-                    "0" if pending else ">",
-                )
-                if pending and not response:
-                    pending = False
-                    continue
-                for raw in _parse_stream_response(response):
+                ]
+                if read_id == ">":
+                    command.extend(["BLOCK", READ_BLOCK_MS])
+                command.extend(["STREAMS", inbox_key(self.settings), read_id])
+                response = await redis.command(*command)
+                messages = _parse_stream_response(response)
+                if read_id != ">":
+                    if not messages:
+                        read_id = ">"
+                        logger.info("Redis Team: pending drain complete; switching to new messages")
+                    else:
+                        pending_batches += 1
+                        if pending_batches >= PENDING_DRAIN_BATCH_LIMIT:
+                            read_id = ">"
+                            logger.warning(
+                                "Redis Team: pending drain batch limit reached; switching to new messages"
+                            )
+                for raw in messages:
                     await self._handle_redis_message(raw)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning("Redis Team: consumer loop error: %s", exc)
-                await asyncio.sleep(5)
+                if not await self._reconnect_redis_clients(redis):
+                    return
+                assert self._consumer_redis is not None
+                redis = self._consumer_redis
+                read_id = "0"
+                pending_batches = 0
 
     async def _handle_redis_message(self, raw: dict[str, Any]) -> None:
         assert self._redis is not None
         redis_id = raw.get("redisId")
         envelope = normalize_envelope(raw)
+        invalid_reason = ""
         if not envelope:
+            invalid_reason = "missing stable messageId or taskId"
+        elif envelope.get("teamId") not in (None, "", self.settings.team_id):
+            invalid_reason = "message teamId does not match this Team consumer"
+        elif _trim(envelope.get("to")) not in {"", self.settings.member_id, "broadcast"}:
+            invalid_reason = "message recipient does not match this Team member"
+        if invalid_reason:
+            await xadd_json(
+                self._redis,
+                dlq_key(self.settings),
+                event_for(
+                    self.settings,
+                    "dlq",
+                    {"redisId": redis_id, "error": invalid_reason, "message": raw},
+                ),
+            )
+            await xadd_json(
+                self._redis,
+                events_key(self.settings),
+                event_for(
+                    self.settings,
+                    "invalid_inbound_message",
+                    {
+                        "redisId": redis_id,
+                        "summary": invalid_reason,
+                        "stateEffect": "none",
+                        "visibleToChat": False,
+                        "chatPolicy": "hidden",
+                    },
+                ),
+            )
+            if redis_id:
+                await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
             return
         dedup_key = envelope.get("idempotencyKey") or envelope["messageId"]
         if await self._redis.command("GET", _processed_message_key(self.settings, dedup_key)):
+            self._transport_accepted_messages.discard(envelope["messageId"])
             if redis_id:
                 await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
+            return
+
+        # The model/control action was already accepted and only the Redis
+        # marker or ACK failed. Never dispatch it a second time; finish the
+        # transport commit after the connection has recovered.
+        if envelope["messageId"] in self._transport_accepted_messages:
+            await self._redis.command(
+                "SET",
+                _processed_message_key(self.settings, dedup_key),
+                _now_iso(),
+                "EX",
+                7 * 24 * 60 * 60,
+            )
+            if redis_id:
+                await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
+            self._transport_accepted_messages.discard(envelope["messageId"])
             return
 
         try:
@@ -2110,16 +2414,15 @@ class RedisTeamAdapter(BasePlatformAdapter):
                     },
                 ),
             )
-            if await self._try_resolve_approval_response(envelope):
-                if redis_id:
-                    await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
-                return
-            if self.settings.auto_run:
+            handled_without_dispatch = await self._try_resolve_approval_response(envelope)
+            if not handled_without_dispatch:
+                handled_without_dispatch = await self._report_monitor_without_model(envelope)
+            if not handled_without_dispatch and self.settings.auto_run:
                 envelope["explicitCompletionSubmitted"] = False
                 envelope.pop("lastAssistantResponse", None)
                 _persist_active_envelope(self.settings, envelope)
                 await self._dispatch_envelope(envelope)
-            else:
+            elif not handled_without_dispatch:
                 write_local_status(
                     self.settings,
                     {
@@ -2128,15 +2431,6 @@ class RedisTeamAdapter(BasePlatformAdapter):
                         "lastSummary": "Redis Team task received; autorun is disabled",
                     },
                 )
-            await self._redis.command(
-                "SET",
-                _processed_message_key(self.settings, dedup_key),
-                _now_iso(),
-                "EX",
-                7 * 24 * 60 * 60,
-            )
-            if redis_id:
-                await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
         except Exception as exc:
             error = str(exc)
             logger.warning("Redis Team: message processing failed: %s", error)
@@ -2197,6 +2491,22 @@ class RedisTeamAdapter(BasePlatformAdapter):
             )
             if redis_id:
                 await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
+            return
+
+        # The business action is now accepted. Redis finalization is a
+        # transport concern: let failures bubble to the consumer reconnect
+        # path instead of reporting a false task failure or rerunning Hermes.
+        self._transport_accepted_messages.add(envelope["messageId"])
+        await self._redis.command(
+            "SET",
+            _processed_message_key(self.settings, dedup_key),
+            _now_iso(),
+            "EX",
+            7 * 24 * 60 * 60,
+        )
+        if redis_id:
+            await self._redis.command("XACK", inbox_key(self.settings), self.settings.consumer_group, redis_id)
+        self._transport_accepted_messages.discard(envelope["messageId"])
 
     async def _try_resolve_approval_response(self, envelope: dict[str, Any]) -> bool:
         parsed = _parse_approval_command(str(envelope.get("text") or ""))
@@ -2332,12 +2642,23 @@ class RedisTeamAdapter(BasePlatformAdapter):
             self.settings,
             {
                 "availability": "running",
+                "runtimeStatus": "running",
                 "currentTaskId": envelope["taskId"],
+                "currentAssignmentId": assignment_id or None,
                 "lastSummary": text[:500],
             },
         )
         self._redis_reply_metadata[str(envelope["taskId"])] = metadata
-        await self.handle_message(event)
+        identity = _assignment_identity(envelope)
+        message_id = _trim(envelope.get("messageId"))
+        if message_id and all(identity):
+            self._accepted_messages[message_id] = identity
+        try:
+            await self.handle_message(event)
+        except Exception:
+            if message_id:
+                self._accepted_messages.pop(message_id, None)
+            raise
 
     async def _send_with_retry(
         self,

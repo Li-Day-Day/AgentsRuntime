@@ -200,6 +200,12 @@ start_team_gateway() {
         export UV_CACHE_DIR="${XDG_CACHE_HOME}/uv"
         export CLAWMANAGER_GATEWAY_PORT="${team_worker_port}"
         export PORT="${team_worker_port}"
+        # Team control-plane packets must never interrupt an active Worker turn.
+        # Approval commands retain Hermes' native bypass path; ordinary follow-ups
+        # are queued and busy acknowledgements stay out of Team chat.
+        export HERMES_GATEWAY_BUSY_INPUT_MODE="${HERMES_TEAM_BUSY_INPUT_MODE:-queue}"
+        export HERMES_GATEWAY_BUSY_TEXT_MODE="${HERMES_TEAM_BUSY_TEXT_MODE:-queue}"
+        export HERMES_GATEWAY_BUSY_ACK_ENABLED="${HERMES_TEAM_BUSY_ACK_ENABLED:-false}"
         export CLAWMANAGER_TEAM_READY_FILE="${CLAWMANAGER_TEAM_READY_FILE:-${HERMES_HOME}/runtime/redis-team.ready.json}"
         mkdir -p \
             "${HERMES_HOME}" \

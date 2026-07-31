@@ -29,12 +29,18 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 		`[ "${team_worker_port}" -gt 65535 ]`,
 		`/usr/local/bin/hermes-apply-runtime-config`,
 		`for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md`,
+		`HERMES_GATEWAY_BUSY_INPUT_MODE="${HERMES_TEAM_BUSY_INPUT_MODE:-queue}"`,
+		`HERMES_GATEWAY_BUSY_TEXT_MODE="${HERMES_TEAM_BUSY_TEXT_MODE:-queue}"`,
+		`HERMES_GATEWAY_BUSY_ACK_ENABLED="${HERMES_TEAM_BUSY_ACK_ENABLED:-false}"`,
 		"hermes gateway run --accept-hooks --no-supervise",
 		`wait -n "${wait_pids[@]}"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("start-hermes-dashboard-gateway missing %q", want)
 		}
+	}
+	if strings.Count(script, "HERMES_GATEWAY_BUSY_TEXT_MODE") != 1 {
+		t.Fatal("Team busy-text mode must be scoped to the isolated Team gateway only")
 	}
 	teamStart := strings.LastIndex(script, "start_team_gateway")
 	dashboardStart := strings.LastIndex(script, `echo "Starting Hermes dashboard gateway`)

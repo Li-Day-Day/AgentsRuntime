@@ -479,6 +479,328 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertEqual(value["revision"], 3)
         self.assertFalse(value["requiresCompletion"])
 
+    def test_normalized_envelope_rejects_unstable_transport_identity(self):
+        self.assertIsNone(adapter.normalize_envelope({"taskId": "team-42-task-7"}))
+        self.assertIsNone(adapter.normalize_envelope({"messageId": "msg-1"}))
+        self.assertIsNone(adapter.normalize_envelope({"rawPayload": "not-json", "redisId": "1-0"}))
+
+    def test_stream_parser_treats_real_redis_empty_pending_shape_as_empty(self):
+        self.assertEqual(adapter._parse_stream_response(None), [])
+        self.assertEqual(adapter._parse_stream_response([]), [])
+        self.assertEqual(adapter._parse_stream_response([["team-inbox", []]]), [])
+
+    def test_consumer_switches_from_empty_pending_to_new_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            reads = []
+            handled = []
+
+            class FakeRedis:
+                async def command(self, *args):
+                    reads.append(args)
+                    read_id = args[-1]
+                    if read_id == "0":
+                        return [[adapter.inbox_key(settings), []]]
+                    return [
+                        [
+                            adapter.inbox_key(settings),
+                            [["2-0", ["payload", json.dumps({"messageId": "msg-2", "taskId": "task-2"})]]],
+                        ]
+                    ]
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._consumer_redis = FakeRedis()
+                instance.is_connected = True
+
+                async def handle(raw):
+                    handled.append(raw["messageId"])
+                    instance.is_connected = False
+
+                instance._handle_redis_message = handle
+                await instance._consumer_loop()
+
+            asyncio.run(run_test())
+            self.assertEqual(handled, ["msg-2"])
+            self.assertEqual(reads[0][-1], "0")
+            self.assertNotIn("BLOCK", reads[0])
+            self.assertEqual(reads[1][-1], ">")
+            self.assertIn("BLOCK", reads[1])
+
+    def test_consumer_recovers_pending_before_new_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            pending_reads = 0
+            handled = []
+
+            class FakeRedis:
+                async def command(self, *args):
+                    nonlocal pending_reads
+                    read_id = args[-1]
+                    if read_id == "0":
+                        pending_reads += 1
+                        if pending_reads == 1:
+                            return [
+                                [
+                                    adapter.inbox_key(settings),
+                                    [["1-0", ["payload", json.dumps({"messageId": "pending", "taskId": "task-1"})]]],
+                                ]
+                            ]
+                        return [[adapter.inbox_key(settings), []]]
+                    return [
+                        [
+                            adapter.inbox_key(settings),
+                            [["2-0", ["payload", json.dumps({"messageId": "new", "taskId": "task-2"})]]],
+                        ]
+                    ]
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._consumer_redis = FakeRedis()
+                instance.is_connected = True
+
+                async def handle(raw):
+                    handled.append(raw["messageId"])
+                    if len(handled) == 2:
+                        instance.is_connected = False
+
+                instance._handle_redis_message = handle
+                await instance._consumer_loop()
+
+            asyncio.run(run_test())
+            self.assertEqual(handled, ["pending", "new"])
+
+    def test_redis_reconnect_swaps_both_clients_and_restores_readiness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+
+            class FakeRedis:
+                def __init__(self):
+                    self.closed = False
+
+                def close(self):
+                    self.closed = True
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                old_presence = FakeRedis()
+                old_consumer = FakeRedis()
+                new_presence = FakeRedis()
+                new_consumer = FakeRedis()
+                instance._redis = old_presence
+                instance._consumer_redis = old_consumer
+                instance.is_connected = True
+                adapter.write_local_status(
+                    settings,
+                    {"availability": "running", "runtimeStatus": "running"},
+                )
+                status = adapter.read_team_statuses(settings, settings.member_id)
+                with (
+                    mock.patch.object(
+                        instance,
+                        "_open_redis_clients",
+                        new=mock.AsyncMock(return_value=(new_presence, new_consumer, status)),
+                    ),
+                    mock.patch.object(adapter, "_publish_ready_file") as publish_ready,
+                ):
+                    self.assertTrue(await instance._reconnect_redis_clients(old_consumer))
+                    publish_ready.assert_called_once()
+                self.assertIs(instance._redis, new_presence)
+                self.assertIs(instance._consumer_redis, new_consumer)
+                self.assertTrue(old_presence.closed)
+                self.assertTrue(old_consumer.closed)
+
+            asyncio.run(run_test())
+
+    def test_completing_one_message_keeps_parallel_assignment_turn_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                identity = ("team-42-task-7", "dev-1")
+                instance._accepted_messages = {"msg-1": identity, "msg-2": identity}
+                event = types.SimpleNamespace(
+                    raw_message={
+                        "messageId": "msg-1",
+                        "taskId": identity[0],
+                        "rootTaskId": identity[0],
+                        "assignmentId": identity[1],
+                    },
+                    message_id="msg-1",
+                    source=types.SimpleNamespace(chat_id=identity[0]),
+                )
+                with mock.patch.object(instance, "_on_processing_complete_inner", new=mock.AsyncMock()):
+                    await instance.on_processing_complete(event, adapter.ProcessingOutcome.SUCCESS)
+                self.assertNotIn("msg-1", instance._accepted_messages)
+                self.assertEqual(instance._accepted_messages["msg-2"], identity)
+
+            asyncio.run(run_test())
+
+    def test_redis_finalize_retry_never_dispatches_the_same_turn_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            dispatches = []
+
+            class FakeRedis:
+                def __init__(self):
+                    self.fail_processed_set = True
+
+                async def command(self, *args):
+                    if args[0] == "GET":
+                        return None
+                    if args[0] == "SET" and self.fail_processed_set:
+                        self.fail_processed_set = False
+                        raise ConnectionError("connection dropped before processed marker")
+                    if args[0] == "XADD":
+                        return "1-0"
+                    return "OK"
+
+                def close(self):
+                    pass
+
+            envelope = {
+                "messageId": "msg-transport-retry",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "dev-1",
+                "teamId": "42",
+                "from": "leader",
+                "to": "developer",
+                "text": "Implement the requested artifact.",
+                "redisId": "7-0",
+            }
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+
+                async def dispatch(value):
+                    dispatches.append(value["messageId"])
+
+                instance._dispatch_envelope = dispatch
+                with self.assertRaises(ConnectionError):
+                    await instance._handle_redis_message(envelope)
+                self.assertIn(envelope["messageId"], instance._transport_accepted_messages)
+                await instance._handle_redis_message(envelope)
+                self.assertNotIn(envelope["messageId"], instance._transport_accepted_messages)
+
+            asyncio.run(run_test())
+            self.assertEqual(dispatches, ["msg-transport-retry"])
+
+    def test_invalid_inbound_message_is_dlqed_and_acked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            commands = []
+
+            class FakeRedis:
+                async def command(self, *args):
+                    commands.append(args)
+                    return "OK"
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+                await instance._handle_redis_message({"redisId": "9-0", "rawPayload": "not-json"})
+
+            asyncio.run(run_test())
+            self.assertTrue(any(command[0] == "XADD" and command[1] == adapter.dlq_key(settings) for command in commands))
+            self.assertTrue(any(command[0] == "XACK" and command[-1] == "9-0" for command in commands))
+
+    def test_backlogged_monitor_observes_active_assignment_without_dispatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            commands = []
+            dispatched = []
+            formal = {
+                "messageId": "assignment-1",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "dev-1",
+                "workId": "dev-1",
+                "teamId": "42",
+                "from": "leader",
+                "to": "developer",
+                "text": "Implement the requested artifact.",
+            }
+            monitor = {
+                "messageId": "monitor-1",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "assignmentId": "dev-1",
+                "workId": "dev-1",
+                "teamId": "42",
+                "from": "clawmanager-monitor",
+                "to": "developer",
+                "intent": "assignment_status_check",
+                "requiresCompletion": False,
+                "metadata": {"monitorType": "assignment_status_check", "checkId": "monitor-1"},
+            }
+
+            class FakeRedis:
+                async def command(self, *args):
+                    commands.append(args)
+                    if args[0] == "GET":
+                        return None
+                    return "OK"
+
+                def close(self):
+                    pass
+
+            async def run_test():
+                with mock.patch.object(adapter, "load_settings", return_value=settings):
+                    instance = adapter.RedisTeamAdapter(types.SimpleNamespace(extra={}))
+                instance._redis = FakeRedis()
+
+                async def dispatch(envelope):
+                    dispatched.append(envelope["messageId"])
+                    instance._accepted_messages[envelope["messageId"]] = adapter._assignment_identity(envelope)
+                    adapter.write_local_status(
+                        settings,
+                        {
+                            "availability": "running",
+                            "runtimeStatus": "running",
+                            "currentTaskId": envelope["taskId"],
+                            "currentAssignmentId": envelope["assignmentId"],
+                        },
+                    )
+
+                instance._dispatch_envelope = dispatch
+                await instance._handle_redis_message({**formal, "redisId": "1-0"})
+                active_before = adapter._load_active_envelope(settings)
+                await instance._handle_redis_message({**monitor, "redisId": "2-0"})
+                active_after = adapter._load_active_envelope(settings)
+
+                self.assertEqual(active_before["messageId"], "assignment-1")
+                self.assertEqual(active_after["messageId"], "assignment-1")
+
+            asyncio.run(run_test())
+            self.assertEqual(dispatched, ["assignment-1"])
+            monitor_events = []
+            for command in commands:
+                if command[0] == "XADD" and command[1] == adapter.events_key(settings):
+                    payload = json.loads(command[-1])
+                    if payload.get("eventKind") == "assignment_check_result":
+                        monitor_events.append(payload)
+            self.assertEqual(len(monitor_events), 1)
+            self.assertFalse(monitor_events[0]["visibleToChat"])
+            self.assertEqual(monitor_events[0]["stateEffect"], "none")
+
     def test_generic_processing_text_is_not_a_final_result(self):
         self.assertFalse(adapter._substantive_final_text("Redis Team task processing completed"))
         self.assertFalse(adapter._substantive_final_text("需要你确认下一步吗？"))
