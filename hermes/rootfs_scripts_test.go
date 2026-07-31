@@ -50,6 +50,27 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 	}
 }
 
+func TestDashboardGatewayScriptReusesValidatedManagedBundledSkills(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "start-hermes-dashboard-gateway"))
+	if err != nil {
+		t.Fatalf("read start-hermes-dashboard-gateway: %v", err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		`prepare_managed_bundled_skills`,
+		`/config/.hermes/skills`,
+		`.no-bundled-skills`,
+		`.clawmanager-managed-bundled-skills`,
+		`find "${bundled_root}"`,
+		`[ -f "${opt_out_marker}" ] && [ ! -f "${managed_marker}" ]`,
+		`rm -f "${opt_out_marker}" "${managed_marker}"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("start-hermes-dashboard-gateway missing managed skill fallback %q", want)
+		}
+	}
+}
+
 func TestDockerfilePackagesCanonicalRedisTeamAdapter(t *testing.T) {
 	data, err := os.ReadFile("Dockerfile")
 	if err != nil {

@@ -75,6 +75,43 @@ falsey() {
     esac
 }
 
+prepare_managed_bundled_skills() {
+    local profile_home="${1:-}"
+    local bundled_root="/config/.hermes/skills"
+    local managed_marker="${profile_home}/.clawmanager-managed-bundled-skills"
+    local opt_out_marker="${profile_home}/.no-bundled-skills"
+    local bundled_skill=""
+
+    if [ -z "${CLAWMANAGER_WORKSPACE_PATH:-}" ] || [ -z "${profile_home}" ]; then
+        return 0
+    fi
+
+    case ":${HERMES_SKILL_DIRS:-}:" in
+        *":${bundled_root}:"*)
+            bundled_skill="$(
+                find "${bundled_root}" -mindepth 2 -maxdepth 2 -type f -name SKILL.md -print -quit 2>/dev/null || true
+            )"
+            ;;
+    esac
+    if [ -n "${bundled_skill}" ]; then
+        if [ -f "${opt_out_marker}" ] && [ ! -f "${managed_marker}" ]; then
+            echo "Hermes profile already opted out of bundled skill seeding"
+            return 0
+        fi
+        if touch "${opt_out_marker}" "${managed_marker}" 2>/dev/null; then
+            echo "Hermes managed Lite profile will reuse bundled skills from ${bundled_root}"
+        else
+            echo "Hermes managed Lite profile could not enable bundled skill reuse; using native profile seeding" >&2
+        fi
+        return 0
+    fi
+
+    if [ -f "${managed_marker}" ]; then
+        rm -f "${opt_out_marker}" "${managed_marker}"
+        echo "Hermes global bundled skills are unavailable; restored native profile seeding"
+    fi
+}
+
 should_start_team_gateway() {
     truthy "${CLAWMANAGER_TEAM_ENABLED:-}" || return 1
     falsey "${CLAWMANAGER_TEAM_AUTORUN:-true}" && return 1
@@ -176,6 +213,7 @@ start_team_gateway() {
                 cp "${dashboard_hermes_home}/${managed_identity}" "${HERMES_HOME}/${managed_identity}"
             fi
         done
+        prepare_managed_bundled_skills "${HERMES_HOME}"
         /usr/local/bin/hermes-apply-runtime-config
         cd "${team_worker_home}"
         exec hermes gateway run --accept-hooks --no-supervise
@@ -192,6 +230,7 @@ if should_start_team_gateway; then
     prepare_team_startup_state
 fi
 
+prepare_managed_bundled_skills "${HERMES_HOME}"
 echo "Starting Hermes dashboard gateway: dashboard_port=${port} host=${host}"
 hermes dashboard \
     --host "${host}" \
