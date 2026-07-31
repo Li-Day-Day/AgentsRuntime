@@ -102,6 +102,23 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertIn("automatic_turn_completion_v2", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("team_artifact_preview_v1", adapter.PROTOCOL_CAPABILITIES)
 
+    def test_managed_startup_identity_loads_from_environment(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CLAWMANAGER_TEAM_ENABLED": "true",
+                "CLAWMANAGER_TEAM_REDIS_URL": "redis://example.invalid:6379/0",
+                "CLAWMANAGER_TEAM_ID": "119",
+                "CLAWMANAGER_TEAM_MEMBER_ID": "developer",
+                "CLAWMANAGER_INSTANCE_ID": "397",
+                "CLAWMANAGER_GATEWAY_GENERATION": "12",
+            },
+            clear=True,
+        ):
+            settings = adapter.load_settings(None)
+        self.assertEqual(settings.instance_id, 397)
+        self.assertEqual(settings.generation, 12)
+
     def test_existing_cooperative_directories_are_never_chmoded(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "team"
@@ -182,6 +199,8 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                 role="developer",
                 shared_dir=str(shared_file),
                 ready_file=str(ready_file),
+                instance_id=397,
+                generation=11,
             )
 
             async def run_test():
@@ -195,6 +214,8 @@ class HermesRedisTeamContractTests(unittest.TestCase):
             self.assertTrue(failure_file.is_file())
             failure = json.loads(failure_file.read_text(encoding="utf-8"))
             self.assertEqual(failure["state"], "failed")
+            self.assertEqual(failure["instanceId"], 397)
+            self.assertEqual(failure["generation"], 11)
             self.assertEqual(failure["error"]["code"], "shared_workspace_unusable")
             self.assertFalse(failure["error"]["retryable"])
             self.assertFalse(ready_file.exists())
@@ -210,6 +231,8 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                 role="developer",
                 shared_dir=str(Path(tmp) / "team"),
                 ready_file=str(ready_file),
+                instance_id=394,
+                generation=9,
             )
             commands = []
 
@@ -244,6 +267,8 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                     self.assertEqual(ready["state"], "ready")
                     self.assertEqual(ready["teamId"], "117")
                     self.assertEqual(ready["memberId"], "developer")
+                    self.assertEqual(ready["instanceId"], 394)
+                    self.assertEqual(ready["generation"], 9)
                     xgroup_index = next(index for index, command in enumerate(commands) if command[:2] == ("XGROUP", "CREATE"))
                     presence_index = next(index for index, command in enumerate(commands) if command[0] == "HSET")
                     self.assertLess(xgroup_index, presence_index)

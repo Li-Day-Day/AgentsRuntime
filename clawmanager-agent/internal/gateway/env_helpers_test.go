@@ -127,6 +127,7 @@ func TestHermesLiteTeamEnvironmentAndConfigMatchOpenClawContract(t *testing.T) {
 	for _, directory := range []string{
 		filepath.Join(workspace, "home", ".clawmanager-team-worker"),
 		filepath.Join(workspace, "home", ".clawmanager-team-worker", ".hermes"),
+		filepath.Join(workspace, "home", ".clawmanager-team-worker", ".hermes", "runtime"),
 		filepath.Join(workspace, "home", ".clawmanager-team-worker", ".cache", "npm"),
 		filepath.Join(workspace, "home", ".clawmanager-team-worker", ".cache", "uv"),
 		filepath.Join(workspace, "home", ".clawmanager-team-worker", ".config"),
@@ -138,6 +139,27 @@ func TestHermesLiteTeamEnvironmentAndConfigMatchOpenClawContract(t *testing.T) {
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			t.Fatalf("Hermes Team worker path %s is not a real directory", directory)
+		}
+	}
+	readyFile := filepath.Join(
+		workspace,
+		"home",
+		".clawmanager-team-worker",
+		".hermes",
+		"runtime",
+		"redis-team.ready.json",
+	)
+	for _, stale := range []string{readyFile, readyFile + ".failed"} {
+		if err := os.WriteFile(stale, []byte(`{"ready":true}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := PrepareWorkspace(root, "hermes", req); err != nil {
+		t.Fatalf("PrepareWorkspace() stale readiness cleanup error = %v", err)
+	}
+	for _, stale := range []string{readyFile, readyFile + ".failed"} {
+		if _, err := os.Lstat(stale); !os.IsNotExist(err) {
+			t.Fatalf("stale Hermes Team startup state was not cleared: %s (%v)", stale, err)
 		}
 	}
 }

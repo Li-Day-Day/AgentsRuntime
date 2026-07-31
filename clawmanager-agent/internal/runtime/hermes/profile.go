@@ -48,6 +48,7 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 	env = gateway.ApplyRequestEnvironment(env, req)
 	env = gateway.ApplyLiteTeamConfigEnvironment(env, req, workspacePath)
 	env = setEnv(env, "CLAWMANAGER_INSTANCE_ID", strconv.Itoa(req.InstanceID))
+	env = setEnv(env, "CLAWMANAGER_GATEWAY_GENERATION", strconv.Itoa(req.Generation))
 	env = setEnv(env, "CLAWMANAGER_USER_ID", strconv.Itoa(req.UserID))
 	env = setEnv(env, "CLAWMANAGER_RUNTIME_TYPE", cfg.RuntimeType)
 	env = setEnv(env, "CLAWMANAGER_WORKSPACE_PATH", workspacePath)
@@ -57,6 +58,13 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 	env = setEnv(env, "HOST", "0.0.0.0")
 	env = setEnv(env, "PORT", strconv.Itoa(port))
 	env = setEnv(env, "HERMES_ACCEPT_HOOKS", "1")
+	teamWorkerHome := path.Join(workspacePath, "home", ".clawmanager-team-worker")
+	env = setEnv(env, "HERMES_TEAM_WORKER_HOME", teamWorkerHome)
+	env = setEnv(
+		env,
+		"CLAWMANAGER_TEAM_READY_FILE",
+		path.Join(teamWorkerHome, ".hermes", "runtime", "redis-team.ready.json"),
+	)
 	env = unsetEnv(
 		env,
 		"RUNTIME_AGENT_CONTROL_TOKEN",
@@ -89,7 +97,7 @@ func (p Profile) WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewa
 }
 
 func (p Profile) HealthChecker(cfg gateway.Config) gateway.GatewayHealthChecker {
-	return gateway.NewHTTPGatewayHealthChecker(cfg)
+	return newHealthChecker(cfg)
 }
 
 func requestEnvValue(req gateway.CreateGatewayRequest, keys ...string) (string, bool) {

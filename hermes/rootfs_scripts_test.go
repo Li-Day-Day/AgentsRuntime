@@ -25,15 +25,11 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 		`export HERMES_HOME="${team_worker_home}/.hermes"`,
 		`export CLAWMANAGER_GATEWAY_PORT="${team_worker_port}"`,
 		`CLAWMANAGER_TEAM_READY_FILE`,
-		`HERMES_TEAM_STARTUP_TIMEOUT_SECONDS`,
 		`[ "${team_worker_port}" -eq "${port}" ]`,
 		`[ "${team_worker_port}" -gt 65535 ]`,
 		`/usr/local/bin/hermes-apply-runtime-config`,
 		`for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md`,
 		"hermes gateway run --accept-hooks --no-supervise",
-		`team_failure_file="${team_ready_file}.failed"`,
-		`grep -Eq '"ready"[[:space:]]*:[[:space:]]*true' "${team_ready_file}"`,
-		`Hermes Redis Team consumer reported a non-retryable startup failure`,
 		`wait -n "${wait_pids[@]}"`,
 	} {
 		if !strings.Contains(script, want) {
@@ -42,8 +38,15 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 	}
 	teamStart := strings.LastIndex(script, "start_team_gateway")
 	dashboardStart := strings.LastIndex(script, `echo "Starting Hermes dashboard gateway`)
-	if dashboardStart < 0 || teamStart < 0 || teamStart > dashboardStart {
-		t.Fatalf("Team consumer readiness must be established before the dashboard becomes healthy")
+	startupStateClear := strings.LastIndex(script, "prepare_team_startup_state")
+	waitStart := strings.LastIndex(script, `wait -n "${wait_pids[@]}"`)
+	if startupStateClear < 0 || dashboardStart < 0 || teamStart < 0 || waitStart < 0 ||
+		startupStateClear > dashboardStart || dashboardStart > teamStart || teamStart > waitStart {
+		t.Fatalf("dashboard and isolated Team consumer must both start before lifecycle supervision")
+	}
+	if strings.Contains(script, `while true; do`) &&
+		strings.Contains(script, `Hermes Redis Team consumer did not become ready`) {
+		t.Fatal("dashboard startup is still serialized behind the Team consumer readiness loop")
 	}
 }
 

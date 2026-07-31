@@ -210,6 +210,8 @@ class RedisTeamSettings:
     preview_origin: str = ""
     team_token: str = ""
     ready_file: str = ""
+    instance_id: int = 0
+    generation: int = 0
 
     @property
     def shared_path(self) -> Path:
@@ -245,6 +247,16 @@ def load_settings(config: PlatformConfig | None = None) -> RedisTeamSettings:
         timeout = int(timeout_raw)
     except (TypeError, ValueError):
         timeout = 1800
+    instance_id_raw = pick("instance_id", "CLAWMANAGER_INSTANCE_ID", 0, "instanceId")
+    generation_raw = pick("generation", "CLAWMANAGER_GATEWAY_GENERATION", 0)
+    try:
+        instance_id = int(instance_id_raw)
+    except (TypeError, ValueError):
+        instance_id = 0
+    try:
+        generation = int(generation_raw)
+    except (TypeError, ValueError):
+        generation = 0
 
     return RedisTeamSettings(
         enabled=_truthy(pick("enabled", "CLAWMANAGER_TEAM_ENABLED", False), False),
@@ -262,6 +274,8 @@ def load_settings(config: PlatformConfig | None = None) -> RedisTeamSettings:
         preview_origin=_trim(pick("preview_origin", "CLAWMANAGER_TEAM_PREVIEW_ORIGIN", "", "previewOrigin")),
         team_token=_trim(pick("team_token", "CLAWMANAGER_TEAM_TOKEN", "", "teamToken")),
         ready_file=_trim(pick("ready_file", "CLAWMANAGER_TEAM_READY_FILE", "", "readyFile")),
+        instance_id=instance_id,
+        generation=generation,
     )
 
 
@@ -661,6 +675,8 @@ def _publish_startup_failure(
             "state": "failed",
             "teamId": settings.team_id,
             "memberId": settings.member_id,
+            "instanceId": settings.instance_id,
+            "generation": settings.generation,
             "runtime": "hermes",
             "protocolVersion": PROTOCOL_VERSION,
             "failedAt": _now_iso(),
@@ -691,6 +707,8 @@ def _publish_ready_file(settings: RedisTeamSettings, status: dict[str, Any]) -> 
             "state": "ready",
             "teamId": settings.team_id,
             "memberId": settings.member_id,
+            "instanceId": settings.instance_id,
+            "generation": settings.generation,
             "runtime": "hermes",
             "protocolVersion": PROTOCOL_VERSION,
             "readyAt": _now_iso(),

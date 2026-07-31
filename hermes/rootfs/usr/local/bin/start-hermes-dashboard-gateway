@@ -75,7 +75,6 @@ falsey() {
     esac
 }
 
-
 should_start_team_gateway() {
     truthy "${CLAWMANAGER_TEAM_ENABLED:-}" || return 1
     falsey "${CLAWMANAGER_TEAM_AUTORUN:-true}" && return 1
@@ -87,6 +86,7 @@ should_start_team_gateway() {
 team_gateway_pid=""
 dashboard_pid=""
 agent_pid=""
+team_gateway_required="false"
 
 start_instance_agent() {
     if [ "${CLAWMANAGER_AGENT_ENABLED:-false}" != "true" ]; then
@@ -143,6 +143,12 @@ shutdown() {
 
 trap shutdown INT TERM
 
+prepare_team_startup_state() {
+    local team_ready_file="${CLAWMANAGER_TEAM_READY_FILE:-${HERMES_TEAM_WORKER_HOME:-${HOME}/.clawmanager-team-worker}/.hermes/runtime/redis-team.ready.json}"
+    mkdir -p "$(dirname "${team_ready_file}")"
+    rm -f "${team_ready_file}" "${team_ready_file}.failed"
+}
+
 start_team_gateway() {
     echo "Preparing Hermes Redis Team consumer: member=${CLAWMANAGER_TEAM_MEMBER_ID} dashboard_port=${port} team_worker_port=${team_worker_port}"
     (
@@ -165,7 +171,6 @@ start_team_gateway() {
             "${XDG_CONFIG_HOME}" \
             "${XDG_DATA_HOME}" \
             "$(dirname "${CLAWMANAGER_TEAM_READY_FILE}")"
-        rm -f "${CLAWMANAGER_TEAM_READY_FILE}" "${CLAWMANAGER_TEAM_READY_FILE}.failed"
         for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md; do
             if [ -f "${dashboard_hermes_home}/${managed_identity}" ] && [ ! -e "${HERMES_HOME}/${managed_identity}" ]; then
                 cp "${dashboard_hermes_home}/${managed_identity}" "${HERMES_HOME}/${managed_identity}"
@@ -176,84 +181,15 @@ start_team_gateway() {
         exec hermes gateway run --accept-hooks --no-supervise
     ) &
     team_gateway_pid="$!"
-
-    team_startup_timeout="${HERMES_TEAM_STARTUP_TIMEOUT_SECONDS:-90}"
-    case "${team_startup_timeout}" in
-        ''|*[!0-9]*)
-            echo "invalid Hermes Redis Team startup timeout: ${team_startup_timeout}" >&2
-            kill "${team_gateway_pid}" 2>/dev/null || true
-            wait "${team_gateway_pid}" 2>/dev/null || true
-            team_gateway_pid=""
-            return 64
-            ;;
-    esac
-    if [ "${team_startup_timeout}" -lt 1 ]; then
-        echo "Hermes Redis Team startup timeout must be positive: ${team_startup_timeout}" >&2
-        kill "${team_gateway_pid}" 2>/dev/null || true
-        wait "${team_gateway_pid}" 2>/dev/null || true
-        team_gateway_pid=""
-        return 64
-    fi
-
-    team_ready_file="${HERMES_TEAM_WORKER_HOME:-${HOME}/.clawmanager-team-worker}/.hermes/runtime/redis-team.ready.json"
-    if [ -n "${CLAWMANAGER_TEAM_READY_FILE:-}" ]; then
-        team_ready_file="${CLAWMANAGER_TEAM_READY_FILE}"
-    fi
-    team_failure_file="${team_ready_file}.failed"
-    started_at="${SECONDS}"
-    while true; do
-        if [ -s "${team_failure_file}" ]; then
-            failure_summary="$(tr '\r\n' '  ' <"${team_failure_file}")"
-            echo "Hermes Redis Team consumer reported a non-retryable startup failure: ${failure_summary}" >&2
-            kill "${team_gateway_pid}" 2>/dev/null || true
-            wait "${team_gateway_pid}" 2>/dev/null || true
-            team_gateway_pid=""
-            return 78
-        fi
-        if [ -s "${team_ready_file}" ] &&
-            grep -Eq '"ready"[[:space:]]*:[[:space:]]*true' "${team_ready_file}"; then
-            break
-        fi
-        if ! kill -0 "${team_gateway_pid}" 2>/dev/null; then
-            set +e
-            wait "${team_gateway_pid}"
-            team_status="$?"
-            set -e
-            team_gateway_pid=""
-            if [ "${team_status}" -eq 0 ]; then
-                team_status=1
-            fi
-            echo "Hermes Redis Team consumer exited before readiness: status=${team_status}" >&2
-            return "${team_status}"
-        fi
-        if [ "$((SECONDS - started_at))" -ge "${team_startup_timeout}" ]; then
-            echo "Hermes Redis Team consumer did not become ready within ${team_startup_timeout}s" >&2
-            kill "${team_gateway_pid}" 2>/dev/null || true
-            wait "${team_gateway_pid}" 2>/dev/null || true
-            team_gateway_pid=""
-            return 124
-        fi
-        sleep 0.25
-    done
-    echo "Hermes Redis Team consumer ready: team_gateway_pid=${team_gateway_pid} team_worker_port=${team_worker_port}"
+    echo "Hermes Redis Team consumer started: team_gateway_pid=${team_gateway_pid} team_worker_port=${team_worker_port}"
     return 0
 }
 
 start_instance_agent
 
 if should_start_team_gateway; then
-    set +e
-    start_team_gateway
-    team_start_status="$?"
-    set -e
-    if [ "${team_start_status}" -ne 0 ]; then
-        if [ -n "${agent_pid}" ]; then
-            kill "${agent_pid}" 2>/dev/null || true
-            wait "${agent_pid}" 2>/dev/null || true
-            agent_pid=""
-        fi
-        exit "${team_start_status}"
-    fi
+    team_gateway_required="true"
+    prepare_team_startup_state
 fi
 
 echo "Starting Hermes dashboard gateway: dashboard_port=${port} host=${host}"
@@ -265,6 +201,10 @@ hermes dashboard \
     --skip-build &
 dashboard_pid="$!"
 echo "Hermes dashboard gateway started: dashboard_pid=${dashboard_pid} dashboard_port=${port}"
+
+if truthy "${team_gateway_required}"; then
+    start_team_gateway
+fi
 
 wait_pids=("${dashboard_pid}")
 if [ -n "${team_gateway_pid}" ]; then

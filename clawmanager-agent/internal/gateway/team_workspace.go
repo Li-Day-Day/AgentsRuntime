@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -52,6 +53,7 @@ func prepareHermesLiteTeamWorkerHome(workspacePath string, req CreateGatewayRequ
 	managedDirectories := []string{
 		workerHome,
 		filepath.Join(workerHome, ".hermes"),
+		filepath.Join(workerHome, ".hermes", "runtime"),
 		filepath.Join(workerHome, ".cache"),
 		filepath.Join(workerHome, ".cache", "npm"),
 		filepath.Join(workerHome, ".cache", "uv"),
@@ -85,6 +87,22 @@ func prepareHermesLiteTeamWorkerHome(workspacePath string, req CreateGatewayRequ
 		}
 		if err := os.Chmod(directory, 0o750); err != nil {
 			return fmt.Errorf("chmod Hermes Team worker directory %s: %w", directory, err)
+		}
+	}
+	readyFile := filepath.Join(workerHome, ".hermes", "runtime", "redis-team.ready.json")
+	for _, startupState := range []string{readyFile, readyFile + ".failed"} {
+		info, err := os.Lstat(startupState)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect stale Hermes Team startup state %s: %w", startupState, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("Hermes Team startup state must be a regular file: %s", startupState)
+		}
+		if err := os.Remove(startupState); err != nil {
+			return fmt.Errorf("remove stale Hermes Team startup state %s: %w", startupState, err)
 		}
 	}
 	return nil

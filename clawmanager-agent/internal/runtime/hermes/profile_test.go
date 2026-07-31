@@ -1,8 +1,17 @@
 package hermes_test
 
 import (
+	"context"
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iamlovingit/clawmanager-agent/internal/gateway"
 	"github.com/iamlovingit/clawmanager-agent/internal/runtime/hermes"
@@ -48,11 +57,15 @@ func TestGatewayEnvSetsHermesWorkspace(t *testing.T) {
 		AgentType:  "hermes",
 		InstanceID: 63,
 		UserID:     45,
+		Generation: 7,
 		Environment: map[string]string{
 			"CLAWMANAGER_LLM_API_KEY":      "secret",
 			"CLAWMANAGER_TEAM_ENABLED":     "true",
+			"CLAWMANAGER_TEAM_ID":          "team-1",
+			"CLAWMANAGER_TEAM_MEMBER_ID":   "leader",
 			"CLAWMANAGER_TEAM_CONFIG_JSON": `{"teamId":"team-1","memberId":"leader"}`,
 			"CLAWMANAGER_TEAM_SHARED_DIR":  "/team",
+			"CLAWMANAGER_TEAM_READY_FILE":  "/tmp/untrusted-ready.json",
 			"CUSTOM_RUNTIME_ENV":           "forwarded",
 		},
 	}
@@ -88,6 +101,15 @@ func TestGatewayEnvSetsHermesWorkspace(t *testing.T) {
 	}
 	if values["CLAWMANAGER_TEAM_SHARED_DIR"] != workspacePath+"/team" {
 		t.Fatalf("CLAWMANAGER_TEAM_SHARED_DIR = %q, want workspace Team directory", values["CLAWMANAGER_TEAM_SHARED_DIR"])
+	}
+	if values["HERMES_TEAM_WORKER_HOME"] != workspacePath+"/home/.clawmanager-team-worker" {
+		t.Fatalf("HERMES_TEAM_WORKER_HOME = %q, want managed private Team home", values["HERMES_TEAM_WORKER_HOME"])
+	}
+	if values["CLAWMANAGER_TEAM_READY_FILE"] != workspacePath+"/home/.clawmanager-team-worker/.hermes/runtime/redis-team.ready.json" {
+		t.Fatalf("CLAWMANAGER_TEAM_READY_FILE = %q, want managed private readiness path", values["CLAWMANAGER_TEAM_READY_FILE"])
+	}
+	if values["CLAWMANAGER_GATEWAY_GENERATION"] != "7" {
+		t.Fatalf("CLAWMANAGER_GATEWAY_GENERATION = %q, want 7", values["CLAWMANAGER_GATEWAY_GENERATION"])
 	}
 }
 
@@ -153,6 +175,158 @@ func TestGatewayEnvRemovesRuntimePodAgentEnvAndKeepsInstanceAgentEnv(t *testing.
 	}
 	if values["CLAWMANAGER_AGENT_INSTANCE_ID"] != "65" {
 		t.Fatalf("CLAWMANAGER_AGENT_INSTANCE_ID = %q, want 65", values["CLAWMANAGER_AGENT_INSTANCE_ID"])
+	}
+}
+
+func TestTeamHealthRequiresDashboardAndMatchingConsumerReadiness(t *testing.T) {
+	server, port := newHermesHealthServer(t)
+	defer server.Close()
+
+	workspace := t.TempDir()
+	readyFile := filepath.Join(workspace, "home", ".clawmanager-team-worker", ".hermes", "runtime", "redis-team.ready.json")
+	spec := teamGatewayStartSpec(workspace, readyFile, port)
+	checker := hermes.NewProfile("hermes").HealthChecker(gateway.Config{GatewayStartupTimeout: 180 * time.Millisecond})
+
+	if err := checker.WaitReady(context.Background(), spec); err == nil || !strings.Contains(err.Error(), "consumer readiness") {
+		t.Fatalf("WaitReady() error = %v, want missing consumer readiness", err)
+	}
+
+	writeStartupState(t, readyFile, map[string]any{
+		"ready":      true,
+		"state":      "ready",
+		"runtime":    "hermes",
+		"teamId":     "team-42",
+		"memberId":   "developer",
+		"instanceId": 63,
+		"generation": 7,
+	})
+	if err := checker.WaitReady(context.Background(), spec); err != nil {
+		t.Fatalf("WaitReady() error = %v, want dashboard and consumer ready", err)
+	}
+}
+
+func TestTeamHealthRejectsStaleReadinessIdentity(t *testing.T) {
+	server, port := newHermesHealthServer(t)
+	defer server.Close()
+
+	workspace := t.TempDir()
+	readyFile := filepath.Join(workspace, "home", ".clawmanager-team-worker", ".hermes", "runtime", "redis-team.ready.json")
+	writeStartupState(t, readyFile, map[string]any{
+		"ready":      true,
+		"state":      "ready",
+		"runtime":    "hermes",
+		"teamId":     "team-42",
+		"memberId":   "developer",
+		"instanceId": 63,
+		"generation": 6,
+	})
+	checker := hermes.NewProfile("hermes").HealthChecker(gateway.Config{GatewayStartupTimeout: 180 * time.Millisecond})
+	err := checker.WaitReady(context.Background(), teamGatewayStartSpec(workspace, readyFile, port))
+	if err == nil || !strings.Contains(err.Error(), "generation") {
+		t.Fatalf("WaitReady() error = %v, want stale generation rejection", err)
+	}
+}
+
+func TestTeamHealthReturnsStructuredConsumerFailure(t *testing.T) {
+	server, port := newHermesHealthServer(t)
+	defer server.Close()
+
+	workspace := t.TempDir()
+	readyFile := filepath.Join(workspace, "home", ".clawmanager-team-worker", ".hermes", "runtime", "redis-team.ready.json")
+	writeStartupState(t, readyFile+".failed", map[string]any{
+		"ready":      false,
+		"state":      "failed",
+		"runtime":    "hermes",
+		"teamId":     "team-42",
+		"memberId":   "developer",
+		"instanceId": 63,
+		"generation": 7,
+		"error": map[string]any{
+			"code":      "shared_workspace_unusable",
+			"message":   "Team shared directory is unusable",
+			"retryable": false,
+		},
+	})
+	checker := hermes.NewProfile("hermes").HealthChecker(gateway.Config{GatewayStartupTimeout: time.Second})
+	startedAt := time.Now()
+	err := checker.WaitReady(context.Background(), teamGatewayStartSpec(workspace, readyFile, port))
+	if err == nil || !strings.Contains(err.Error(), "shared_workspace_unusable") {
+		t.Fatalf("WaitReady() error = %v, want structured consumer failure", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("structured failure took %s, want immediate failure", elapsed)
+	}
+}
+
+func TestNonTeamHealthRemainsHTTPOnly(t *testing.T) {
+	server, port := newHermesHealthServer(t)
+	defer server.Close()
+
+	checker := hermes.NewProfile("hermes").HealthChecker(gateway.Config{GatewayStartupTimeout: time.Second})
+	if err := checker.WaitReady(context.Background(), gateway.GatewayStartSpec{Port: port}); err != nil {
+		t.Fatalf("WaitReady() error = %v, want HTTP-only non-Team health", err)
+	}
+}
+
+func TestTeamHealthRejectsIncompleteConsumerConfiguration(t *testing.T) {
+	checker := hermes.NewProfile("hermes").HealthChecker(gateway.Config{GatewayStartupTimeout: time.Second})
+	err := checker.WaitReady(context.Background(), gateway.GatewayStartSpec{
+		Port: 20000,
+		Env:  []string{"CLAWMANAGER_TEAM_ENABLED=true"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "configuration is incomplete") {
+		t.Fatalf("WaitReady() error = %v, want incomplete Team configuration", err)
+	}
+}
+
+func newHermesHealthServer(t *testing.T) (*httptest.Server, int) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	host, rawPort, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+	if err != nil || host == "" {
+		server.Close()
+		t.Fatalf("parse test server URL %q: %v", server.URL, err)
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil {
+		server.Close()
+		t.Fatalf("parse test server port %q: %v", rawPort, err)
+	}
+	return server, port
+}
+
+func teamGatewayStartSpec(workspace, readyFile string, port int) gateway.GatewayStartSpec {
+	return gateway.GatewayStartSpec{
+		RuntimeType:   "hermes",
+		InstanceID:    63,
+		WorkspacePath: workspace,
+		Port:          port,
+		Generation:    7,
+		Env: []string{
+			"CLAWMANAGER_TEAM_ENABLED=true",
+			"CLAWMANAGER_TEAM_REDIS_URL=redis://redis.example.invalid:6379/0",
+			"CLAWMANAGER_TEAM_ID=team-42",
+			"CLAWMANAGER_TEAM_MEMBER_ID=developer",
+			"CLAWMANAGER_TEAM_READY_FILE=" + readyFile,
+			"CLAWMANAGER_INSTANCE_ID=63",
+			"CLAWMANAGER_GATEWAY_GENERATION=7",
+		},
+	}
+}
+
+func writeStartupState(t *testing.T, path string, value map[string]any) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
