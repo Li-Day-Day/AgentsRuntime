@@ -6,6 +6,11 @@ if [ -z "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ] && [ -z "${RUNTIME_AGENT_REPORT_TOK
   sleep infinity
 fi
 
+if [ -d /defaults/.openclaw/npm ]; then
+  chmod 0755 /defaults /defaults/.openclaw
+  chmod -R a+rX /defaults/.openclaw/npm
+fi
+
 AGENT_DATA_DIR="${RUNTIME_AGENT_DATA_DIR:-/var/lib/clawmanager-agent}"
 mkdir -p "$AGENT_DATA_DIR"
 

@@ -48,7 +48,7 @@ func (openClawCompatProfile) PrepareWorkspace(cfg Config, req CreateGatewayReque
 	return nil
 }
 
-func (openClawCompatProfile) WriteGatewayConfig(cfg Config, req CreateGatewayRequest, workspacePath string) error {
+func (openClawCompatProfile) WriteGatewayConfig(cfg Config, req CreateGatewayRequest, workspacePath string, port int) error {
 	return nil
 }
 

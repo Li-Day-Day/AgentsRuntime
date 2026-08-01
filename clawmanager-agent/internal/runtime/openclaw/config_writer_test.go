@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/iamlovingit/clawmanager-agent/internal/gateway"
@@ -32,6 +34,7 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	    "trustedProxies": ["127.0.0.1"],
 	    "keep": "value"
 	  },
+	  "cron": {"custom": "keep"},
 	  "agents": {"defaults": {"model": "auto/gpt-4.1"}}
 	}`)
 	if err := os.WriteFile(configPath, existing, 0o644); err != nil {
@@ -49,7 +52,7 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 		LLMAPIKeySet:    true,
 		LLMModelIDs:     []string{"gpt-5.5", "gpt-5.5-mini"},
 	}
-	if err := WriteGatewayConfig(cfg, req, workspace); err != nil {
+	if err := WriteGatewayConfig(cfg, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
@@ -63,6 +66,9 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	}
 
 	gateway := objectAt(t, merged, "gateway")
+	if gateway["port"] != float64(20003) {
+		t.Fatalf("gateway.port = %#v, want 20003", gateway["port"])
+	}
 	auth := objectAt(t, gateway, "auth")
 	if auth["mode"] != "trusted-proxy" {
 		t.Fatalf("gateway.auth.mode = %#v, want trusted-proxy", auth["mode"])
@@ -153,12 +159,26 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	if browser["executablePath"] != openClawBrowserExecutablePath {
 		t.Fatalf("browser.executablePath = %#v, want %s", browser["executablePath"], openClawBrowserExecutablePath)
 	}
+	openclawProfile := objectAt(t, objectAt(t, browser, "profiles"), "openclaw")
+	if openclawProfile["driver"] != "openclaw" {
+		t.Fatalf("browser.profiles.openclaw.driver = %#v, want openclaw", openclawProfile["driver"])
+	}
+	if openclawProfile["cdpPort"] != float64(20004) {
+		t.Fatalf("browser.profiles.openclaw.cdpPort = %#v, want 20004", openclawProfile["cdpPort"])
+	}
+	if openclawProfile["color"] != openClawManagedBrowserColor {
+		t.Fatalf("browser.profiles.openclaw.color = %#v, want %s", openclawProfile["color"], openClawManagedBrowserColor)
+	}
 	providerModels, ok := autoProvider["models"].([]any)
 	if !ok {
 		t.Fatalf("models.providers.auto.models = %#v, want array", autoProvider["models"])
 	}
 	if got := modelIDSet(providerModels); len(got) != 2 || !got["gpt-5.5"] || !got["gpt-5.5-mini"] {
 		t.Fatalf("models.providers.auto.models = %#v, want injected model ids", providerModels)
+	}
+	assertPlatformDefaults(t, merged)
+	if objectAt(t, merged, "cron")["custom"] != "keep" {
+		t.Fatalf("cron.custom was not preserved")
 	}
 	if runtime.GOOS != "windows" {
 		info, err := os.Stat(configPath)
@@ -182,7 +202,7 @@ func TestWriteOpenClawGatewayConfigCompletesPartialBrowserConfig(t *testing.T) {
 	}
 
 	req := CreateGatewayRequest{InstanceID: 64, UserID: 45, UID: 200064, GID: 200064}
-	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace); err != nil {
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
@@ -196,6 +216,10 @@ func TestWriteOpenClawGatewayConfigCompletesPartialBrowserConfig(t *testing.T) {
 	}
 	if browser["executablePath"] != openClawBrowserExecutablePath || browser["headless"] != true || browser["noSandbox"] != true {
 		t.Fatalf("completed browser config = %#v", browser)
+	}
+	openclawProfile := objectAt(t, objectAt(t, browser, "profiles"), "openclaw")
+	if openclawProfile["cdpPort"] != float64(20004) {
+		t.Fatalf("browser.profiles.openclaw.cdpPort = %#v, want 20004", openclawProfile["cdpPort"])
 	}
 }
 
@@ -211,7 +235,7 @@ func TestWriteOpenClawGatewayConfigPreservesExplicitBrowserConfig(t *testing.T) 
 	}
 
 	req := CreateGatewayRequest{InstanceID: 65, UserID: 45, UID: 200065, GID: 200065}
-	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace); err != nil {
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
@@ -251,7 +275,7 @@ func TestWriteOpenClawGatewayConfigForcesTeamBrowserThroughManagedProxy(t *testi
 			"CLAWMANAGER_BROWSER_PROXY_URL": proxyURL,
 		},
 	}
-	configureManagedOpenClawBrowser(config, req)
+	configureManagedOpenClawBrowser(config, req, 20003)
 
 	browser := objectAt(t, config, "browser")
 	if browser["enabled"] != true {
@@ -307,7 +331,7 @@ func TestWriteOpenClawGatewayConfigDoesNotRelaxSSRFWithoutManagedTeamProxy(t *te
 		},
 	}
 	config := map[string]any{}
-	configureManagedOpenClawBrowser(config, req)
+	configureManagedOpenClawBrowser(config, req, 20003)
 	browser := objectAt(t, config, "browser")
 	if _, exists := browser["ssrfPolicy"]; exists {
 		t.Fatalf("browser.ssrfPolicy was relaxed without a managed proxy: %#v", browser)
@@ -323,7 +347,7 @@ func TestManagedTeamBrowserUsesExistingClawManagerHTTPSProxyForUpgrades(t *testi
 		},
 	}
 	config := map[string]any{}
-	configureManagedOpenClawBrowser(config, req)
+	configureManagedOpenClawBrowser(config, req, 20003)
 	browser := objectAt(t, config, "browser")
 	if _, exists := browser["ssrfPolicy"]; !exists {
 		t.Fatalf("existing Team instance did not adopt managed Browser proxy: %#v", browser)
@@ -351,10 +375,219 @@ func TestManagedTeamBrowserRejectsUntrustedGenericProxyFallback(t *testing.T) {
 		},
 	}
 	config := map[string]any{}
-	configureManagedOpenClawBrowser(config, req)
+	configureManagedOpenClawBrowser(config, req, 20003)
 	browser := objectAt(t, config, "browser")
 	if _, exists := browser["ssrfPolicy"]; exists {
 		t.Fatalf("untrusted proxy fallback relaxed Browser SSRF: %#v", browser)
+	}
+}
+
+func TestWriteOpenClawGatewayConfigPinsManagedBrowserCDPInsideAllocatedPortBlock(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-415")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	existing := []byte(`{
+  "browser": {
+    "enabled": false,
+    "executablePath": "/opt/custom-browser",
+    "headless": false,
+    "noSandbox": false,
+    "profiles": {
+      "openclaw": {
+        "driver": "legacy",
+        "cdpPort": 20053,
+        "color": "#00AA00",
+        "viewport": "keep"
+      },
+      "remote-review": {
+        "driver": "remote",
+        "cdpPort": 41000
+      }
+    }
+  }
+}`)
+	if err := os.WriteFile(configPath, existing, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	req := CreateGatewayRequest{InstanceID: 415, UserID: 45, UID: 200415, GID: 200415}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20042); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(data), "20053") {
+		t.Fatalf("config still contains stale default CDP port 20053: %s", string(data))
+	}
+	merged := readOpenClawConfigForTest(t, configPath)
+	gatewayConfig := objectAt(t, merged, "gateway")
+	if gatewayConfig["port"] != float64(20042) {
+		t.Fatalf("gateway.port = %#v, want 20042", gatewayConfig["port"])
+	}
+	browser := objectAt(t, merged, "browser")
+	if browser["enabled"] != false || browser["executablePath"] != "/opt/custom-browser" || browser["headless"] != false || browser["noSandbox"] != false {
+		t.Fatalf("explicit browser config was overwritten: %#v", browser)
+	}
+	profiles := objectAt(t, browser, "profiles")
+	openclawProfile := objectAt(t, profiles, "openclaw")
+	if openclawProfile["driver"] != "openclaw" {
+		t.Fatalf("browser.profiles.openclaw.driver = %#v, want openclaw", openclawProfile["driver"])
+	}
+	if openclawProfile["cdpPort"] != float64(20043) {
+		t.Fatalf("browser.profiles.openclaw.cdpPort = %#v, want 20043", openclawProfile["cdpPort"])
+	}
+	if openclawProfile["color"] != "#00AA00" || openclawProfile["viewport"] != "keep" {
+		t.Fatalf("openclaw profile non-port config was not preserved: %#v", openclawProfile)
+	}
+	remoteProfile := objectAt(t, profiles, "remote-review")
+	if remoteProfile["driver"] != "remote" || remoteProfile["cdpPort"] != float64(41000) {
+		t.Fatalf("remote browser profile was not preserved: %#v", remoteProfile)
+	}
+	if gotBrowserControlPort := int(openclawProfile["cdpPort"].(float64)) + 1; gotBrowserControlPort != 20044 {
+		t.Fatalf("derived Browser Control port = %d, want 20044", gotBrowserControlPort)
+	}
+}
+
+func TestWriteOpenClawGatewayConfigRejectsPortBlockOutsideValidRange(t *testing.T) {
+	for _, port := range []int{0, 65534} {
+		t.Run(strconv.Itoa(port), func(t *testing.T) {
+			workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-67")
+			req := CreateGatewayRequest{InstanceID: 67, UserID: 45, UID: 200067, GID: 200067}
+
+			err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, port)
+			if err == nil {
+				t.Fatal("WriteGatewayConfig() error = nil, want invalid port error")
+			}
+			if !strings.Contains(err.Error(), "invalid gateway port") {
+				t.Fatalf("WriteGatewayConfig() error = %q, want invalid gateway port", err)
+			}
+		})
+	}
+}
+
+func TestWriteOpenClawGatewayConfigPreservesExplicitLiteDefaults(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-66")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	existing := []byte(`{
+  "models": {"mode": "replace"},
+  "agents": {
+    "defaults": {
+      "memorySearch": {"enabled": false, "provider": "local"},
+      "compaction": {
+        "mode": "safeguard",
+        "reserveTokens": 1024,
+        "reserveTokensFloor": 512,
+        "keepRecentTokens": 4096,
+        "maxHistoryShare": 0.5,
+        "notifyUser": false,
+        "memoryFlush": {"enabled": false}
+      },
+      "maxConcurrent": 2,
+      "subagents": {"maxConcurrent": 3}
+    }
+  },
+  "tools": {"profile": "minimal"},
+  "commands": {
+    "native": "off",
+    "nativeSkills": "off",
+    "restart": false,
+    "ownerDisplay": "friendly"
+  },
+  "messages": {"groupChat": {"visibleReplies": "message_tool_only"}},
+  "gateway": {
+    "mode": "remote",
+    "tailscale": {"mode": "on", "resetOnExit": true},
+    "nodes": {"denyCommands": ["custom.block"]}
+  },
+  "plugins": {
+    "entries": {
+      "bonjour": {"enabled": true},
+      "memory-core": {
+        "config": {
+          "dreaming": {
+            "enabled": false,
+            "frequency": "custom",
+            "timezone": "UTC"
+          }
+        }
+      }
+    }
+  }
+}`)
+	if err := os.WriteFile(configPath, existing, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	req := CreateGatewayRequest{InstanceID: 66, UserID: 45, UID: 200066, GID: 200066}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	merged := readOpenClawConfigForTest(t, configPath)
+	if got := objectAt(t, merged, "models")["mode"]; got != "replace" {
+		t.Fatalf("models.mode = %#v, want explicit replace preserved", got)
+	}
+	agentDefaults := objectAt(t, objectAt(t, merged, "agents"), "defaults")
+	memorySearch := objectAt(t, agentDefaults, "memorySearch")
+	if memorySearch["enabled"] != false || memorySearch["provider"] != "local" {
+		t.Fatalf("explicit memorySearch was overwritten: %#v", memorySearch)
+	}
+	compaction := objectAt(t, agentDefaults, "compaction")
+	if compaction["mode"] != "safeguard" ||
+		compaction["reserveTokens"] != float64(1024) ||
+		compaction["reserveTokensFloor"] != float64(512) ||
+		compaction["keepRecentTokens"] != float64(4096) ||
+		compaction["maxHistoryShare"] != 0.5 ||
+		compaction["notifyUser"] != false ||
+		objectAt(t, compaction, "memoryFlush")["enabled"] != false {
+		t.Fatalf("explicit compaction was overwritten: %#v", compaction)
+	}
+	if agentDefaults["maxConcurrent"] != float64(2) || objectAt(t, agentDefaults, "subagents")["maxConcurrent"] != float64(3) {
+		t.Fatalf("explicit agent concurrency was overwritten: %#v", agentDefaults)
+	}
+	if objectAt(t, merged, "tools")["profile"] != "minimal" {
+		t.Fatalf("explicit tools.profile was overwritten: %#v", objectAt(t, merged, "tools"))
+	}
+	commands := objectAt(t, merged, "commands")
+	if commands["native"] != "off" ||
+		commands["nativeSkills"] != "off" ||
+		commands["restart"] != false ||
+		commands["ownerDisplay"] != "friendly" {
+		t.Fatalf("explicit commands were overwritten: %#v", commands)
+	}
+	if objectAt(t, objectAt(t, merged, "messages"), "groupChat")["visibleReplies"] != "message_tool_only" {
+		t.Fatalf("explicit visibleReplies was overwritten")
+	}
+	gateway := objectAt(t, merged, "gateway")
+	if gateway["mode"] != "remote" {
+		t.Fatalf("gateway.mode = %#v, want explicit remote preserved", gateway["mode"])
+	}
+	tailscale := objectAt(t, gateway, "tailscale")
+	if tailscale["mode"] != "on" || tailscale["resetOnExit"] != true {
+		t.Fatalf("explicit gateway.tailscale was overwritten: %#v", tailscale)
+	}
+	deniedCommands, ok := objectAt(t, gateway, "nodes")["denyCommands"].([]any)
+	if !ok {
+		t.Fatalf("gateway.nodes.denyCommands = %#v, want array", objectAt(t, gateway, "nodes")["denyCommands"])
+	}
+	deniedSet := stringSet(deniedCommands)
+	if len(deniedSet) != len(openClawDefaultDeniedNodeCommands)+1 || !deniedSet["custom.block"] {
+		t.Fatalf("gateway.nodes.denyCommands = %#v, want custom command plus managed deny list", deniedCommands)
+	}
+	if objectAt(t, objectAt(t, objectAt(t, merged, "plugins"), "entries"), "bonjour")["enabled"] != true {
+		t.Fatalf("explicit bonjour enabled state was overwritten")
+	}
+	dreaming := objectAt(t, objectAt(t, objectAt(t, objectAt(t, objectAt(t, merged, "plugins"), "entries"), "memory-core"), "config"), "dreaming")
+	if dreaming["enabled"] != false || dreaming["frequency"] != "custom" || dreaming["timezone"] != "UTC" {
+		t.Fatalf("explicit memory-core dreaming config was overwritten: %#v", dreaming)
 	}
 }
 
@@ -386,7 +619,7 @@ func TestWriteOpenClawGatewayConfigUsesRequestEnvironmentLLMOverrides(t *testing
 	}
 	cfg := Config{GatewayAuthMode: "trusted-proxy"}
 
-	if err := WriteGatewayConfig(cfg, req, workspace); err != nil {
+	if err := WriteGatewayConfig(cfg, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
@@ -409,6 +642,222 @@ func TestWriteOpenClawGatewayConfigUsesRequestEnvironmentLLMOverrides(t *testing
 	}
 }
 
+func TestWriteOpenClawGatewayConfigMergesRequestChannelsIntoWorkspaceConfig(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-70")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{
+  "channels": {
+    "discord": {"enabled": true},
+    "telegram": {"enabled": false}
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write existing config: %v", err)
+	}
+
+	req := CreateGatewayRequest{
+		InstanceID: 70,
+		UserID:     45,
+		UID:        200070,
+		GID:        200070,
+		Environment: map[string]string{
+			"CLAWMANAGER_OPENCLAW_CHANNELS_JSON": `{"telegram":{"enabled":true},"feishu":{"enabled":true}}`,
+		},
+	}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read merged config: %v", err)
+	}
+	var merged map[string]any
+	if err := json.Unmarshal(data, &merged); err != nil {
+		t.Fatalf("parse merged config: %v", err)
+	}
+	channels := objectAt(t, merged, "channels")
+	if objectAt(t, channels, "telegram")["enabled"] != true {
+		t.Fatalf("channels.telegram.enabled = %#v, want true", objectAt(t, channels, "telegram")["enabled"])
+	}
+	if objectAt(t, channels, "feishu")["enabled"] != true {
+		t.Fatalf("channels.feishu.enabled = %#v, want true", objectAt(t, channels, "feishu")["enabled"])
+	}
+	if objectAt(t, channels, "discord")["enabled"] != true {
+		t.Fatalf("channels.discord.enabled = %#v, want preserved true", objectAt(t, channels, "discord")["enabled"])
+	}
+}
+
+func TestWriteOpenClawGatewayConfigReconcilesManagedChannelPluginEntries(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-72")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{
+  "plugins": {
+    "entries": {
+      "dingtalk-connector": {"enabled": false, "custom": "keep"},
+      "feishu": {"enabled": false},
+      "wecom-openclaw-plugin": {"enabled": true}
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write existing config: %v", err)
+	}
+
+	req := CreateGatewayRequest{
+		InstanceID: 72,
+		UserID:     45,
+		UID:        200072,
+		GID:        200072,
+		Environment: map[string]string{
+			"CLAWMANAGER_OPENCLAW_CHANNELS_JSON": `{"dingtalk":{},"feishu":{}}`,
+		},
+	}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read merged config: %v", err)
+	}
+	var merged map[string]any
+	if err := json.Unmarshal(data, &merged); err != nil {
+		t.Fatalf("parse merged config: %v", err)
+	}
+	entries := objectAt(t, objectAt(t, merged, "plugins"), "entries")
+	if got := objectAt(t, entries, "dingtalk-connector")["enabled"]; got != true {
+		t.Fatalf("plugins.entries.dingtalk-connector.enabled = %#v, want true", got)
+	}
+	if got := objectAt(t, entries, "feishu")["enabled"]; got != true {
+		t.Fatalf("plugins.entries.feishu.enabled = %#v, want true", got)
+	}
+	if got := objectAt(t, entries, "wecom-openclaw-plugin")["enabled"]; got != false {
+		t.Fatalf("plugins.entries.wecom-openclaw-plugin.enabled = %#v, want false", got)
+	}
+	if got := objectAt(t, entries, "dingtalk-connector")["custom"]; got != "keep" {
+		t.Fatalf("plugins.entries.dingtalk-connector.custom = %#v, want preserved value", got)
+	}
+	groupChat := objectAt(t, objectAt(t, merged, "messages"), "groupChat")
+	if got := groupChat["visibleReplies"]; got != "automatic" {
+		t.Fatalf("messages.groupChat.visibleReplies = %#v, want automatic", got)
+	}
+}
+
+func TestWriteOpenClawGatewayConfigPreservesExplicitDingTalkVisibleReplies(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-73")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{
+  "messages": {
+    "groupChat": {
+      "visibleReplies": "message_tool_only"
+    }
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write existing config: %v", err)
+	}
+
+	req := CreateGatewayRequest{
+		InstanceID: 73,
+		UserID:     45,
+		Environment: map[string]string{
+			"CLAWMANAGER_OPENCLAW_CHANNELS_JSON": `{"dingtalk-connector":{}}`,
+		},
+	}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read merged config: %v", err)
+	}
+	var merged map[string]any
+	if err := json.Unmarshal(data, &merged); err != nil {
+		t.Fatalf("parse merged config: %v", err)
+	}
+	groupChat := objectAt(t, objectAt(t, merged, "messages"), "groupChat")
+	if got := groupChat["visibleReplies"]; got != "message_tool_only" {
+		t.Fatalf("messages.groupChat.visibleReplies = %#v, want preserved explicit value", got)
+	}
+}
+
+func TestMergeOpenClawChannelsUsesEnvFallbackAndEnvironmentPriority(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		environment map[string]string
+		env         map[string]string
+		wantEnabled bool
+	}{
+		{
+			name: "Env fallback",
+			env: map[string]string{
+				openClawChannelsEnv: `{"telegram":{"enabled":false}}`,
+			},
+			wantEnabled: false,
+		},
+		{
+			name: "Environment priority",
+			environment: map[string]string{
+				openClawChannelsEnv: `{"telegram":{"enabled":true}}`,
+			},
+			env: map[string]string{
+				openClawChannelsEnv: `{"telegram":{"enabled":false}}`,
+			},
+			wantEnabled: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := map[string]any{}
+			req := CreateGatewayRequest{Environment: tc.environment, Env: tc.env}
+			if err := mergeOpenClawChannelsFromRequest(config, req); err != nil {
+				t.Fatalf("mergeOpenClawChannelsFromRequest() error = %v", err)
+			}
+			telegram := objectAt(t, objectAt(t, config, "channels"), "telegram")
+			if got := telegram["enabled"]; got != tc.wantEnabled {
+				t.Fatalf("channels.telegram.enabled = %#v, want %v", got, tc.wantEnabled)
+			}
+		})
+	}
+}
+
+func TestWriteOpenClawGatewayConfigRejectsInvalidRequestChannelsPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "array", payload: `[]`},
+		{name: "invalid json", payload: `{"telegram":`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-71")
+			req := CreateGatewayRequest{
+				InstanceID: 71,
+				UserID:     45,
+				UID:        200071,
+				GID:        200071,
+				Environment: map[string]string{
+					"CLAWMANAGER_OPENCLAW_CHANNELS_JSON": tc.payload,
+				},
+			}
+			err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003)
+			if err == nil {
+				t.Fatal("WriteGatewayConfig() error = nil, want invalid channels payload error")
+			}
+			if !strings.Contains(err.Error(), "CLAWMANAGER_OPENCLAW_CHANNELS_JSON") {
+				t.Fatalf("WriteGatewayConfig() error = %q, want environment name", err)
+			}
+		})
+	}
+}
+
 func TestWriteOpenClawGatewayConfigWritesLiteTeamConfigJSON(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-69")
 	req := CreateGatewayRequest{
@@ -423,7 +872,7 @@ func TestWriteOpenClawGatewayConfigWritesLiteTeamConfigJSON(t *testing.T) {
 		},
 	}
 
-	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace); err != nil {
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
@@ -477,7 +926,7 @@ func TestWriteOpenClawGatewayConfigEnablesRedisTeamForLiteTeam(t *testing.T) {
 		},
 	}
 
-	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace); err != nil {
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20003); err != nil {
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
