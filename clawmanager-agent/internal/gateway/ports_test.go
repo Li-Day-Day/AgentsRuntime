@@ -1,6 +1,9 @@
 package gateway
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 func TestPortAllocatorReservesCommitsAndReleasesPorts(t *testing.T) {
 	alloc := NewPortAllocator(func(int) bool { return false })
@@ -96,5 +99,48 @@ func TestPortAllocatorSkipsListeningPortsInsidePortBlock(t *testing.T) {
 	}
 	if port != 32003 {
 		t.Fatalf("Reserve = %d, want first block without listening sidecar port 32003", port)
+	}
+}
+
+func TestPortAllocatorConcurrentReserveReturnsUniquePortBlocks(t *testing.T) {
+	alloc := NewPortAllocator(func(int) bool { return false })
+	alloc.SetBlockSize(3)
+	rng := PortRange{Start: 40000, End: 40299}
+
+	const workers = 100
+	var wg sync.WaitGroup
+	results := make(chan int, workers)
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			port, err := alloc.Reserve(1000+index, 7, rng)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- port
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("Reserve() error = %v", err)
+	}
+	seen := map[int]bool{}
+	for port := range results {
+		if seen[port] {
+			t.Fatalf("duplicate primary port reserved: %d", port)
+		}
+		seen[port] = true
+	}
+	if len(seen) != workers {
+		t.Fatalf("reserved %d unique ports, want %d", len(seen), workers)
+	}
+	if used := len(alloc.ListUsed()); used != workers*3 {
+		t.Fatalf("reserved block members = %d, want %d", used, workers*3)
 	}
 }

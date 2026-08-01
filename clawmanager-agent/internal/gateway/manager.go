@@ -27,6 +27,7 @@ type GatewayManager struct {
 	mu       sync.RWMutex
 	draining bool
 	gateways map[string]*gatewayRecord
+	changes  chan struct{}
 }
 
 func NewGatewayManager(cfg Config, starter ProcessStarter, ports *PortAllocator) *GatewayManager {
@@ -51,6 +52,7 @@ func NewGatewayManager(cfg Config, starter ProcessStarter, ports *PortAllocator)
 		ports:    ports,
 		health:   health,
 		gateways: map[string]*gatewayRecord{},
+		changes:  make(chan struct{}, 1),
 	}
 }
 
@@ -155,6 +157,7 @@ func (m *GatewayManager) CreateGateway(_ context.Context, req CreateGatewayReque
 		UpdatedAt:     now,
 	}
 	m.gateways[gatewayID] = &gatewayRecord{state: state}
+	m.notifyGatewayStateChangedLocked()
 	resp := createGatewayResponse(state)
 	m.mu.Unlock()
 
@@ -167,14 +170,21 @@ func (m *GatewayManager) CreateGateway(_ context.Context, req CreateGatewayReque
 }
 
 func (m *GatewayManager) startGatewayInBackground(gatewayID string, req CreateGatewayRequest, workspacePath string, port int) {
+	startedAt := time.Now()
+	phaseStartedAt := startedAt
 	if err := m.profile().PrepareWorkspace(m.cfg, req, workspacePath); err != nil {
+		log.Printf("runtime-agent gateway startup failed: gateway_id=%s instance_id=%d phase=prepare_workspace phase_ms=%d total_ms=%d error=%v", gatewayID, req.InstanceID, time.Since(phaseStartedAt).Milliseconds(), time.Since(startedAt).Milliseconds(), err)
 		m.markGatewayError(gatewayID, 0, err)
 		return
 	}
+	prepareDuration := time.Since(phaseStartedAt)
+	phaseStartedAt = time.Now()
 	if err := m.profile().WriteGatewayConfig(m.cfg, req, workspacePath, port); err != nil {
+		log.Printf("runtime-agent gateway startup failed: gateway_id=%s instance_id=%d phase=write_config phase_ms=%d total_ms=%d error=%v", gatewayID, req.InstanceID, time.Since(phaseStartedAt).Milliseconds(), time.Since(startedAt).Milliseconds(), err)
 		m.markGatewayError(gatewayID, 0, err)
 		return
 	}
+	configDuration := time.Since(phaseStartedAt)
 
 	spec := GatewayStartSpec{
 		GatewayID:     gatewayID,
@@ -192,22 +202,29 @@ func (m *GatewayManager) startGatewayInBackground(gatewayID string, req CreateGa
 		Command:       append([]string(nil), m.cfg.GatewayCommand...),
 		Env:           m.profile().GatewayEnv(os.Environ(), m.cfg, req, workspacePath, port),
 	}
+	phaseStartedAt = time.Now()
 	process, err := m.starter.StartGateway(context.Background(), spec)
 	if err != nil {
+		log.Printf("runtime-agent gateway startup failed: gateway_id=%s instance_id=%d phase=start_process phase_ms=%d total_ms=%d error=%v", gatewayID, req.InstanceID, time.Since(phaseStartedAt).Milliseconds(), time.Since(startedAt).Milliseconds(), err)
 		m.markGatewayError(gatewayID, 0, fmt.Errorf("%w: %v", ErrGatewayStartFailed, err))
 		return
 	}
+	processStartDuration := time.Since(phaseStartedAt)
 	if !m.attachGatewayProcess(gatewayID, process) {
 		m.stopProcessAsync(process)
 		return
 	}
 
+	phaseStartedAt = time.Now()
 	if err := m.health.WaitReady(context.Background(), spec); err != nil {
+		log.Printf("runtime-agent gateway startup failed: gateway_id=%s instance_id=%d phase=wait_ready phase_ms=%d total_ms=%d error=%v", gatewayID, req.InstanceID, time.Since(phaseStartedAt).Milliseconds(), time.Since(startedAt).Milliseconds(), err)
 		m.stopProcessAsync(process)
 		m.markGatewayError(gatewayID, process.PID, fmt.Errorf("%w: %v", ErrGatewayStartFailed, err))
 		return
 	}
+	healthDuration := time.Since(phaseStartedAt)
 	m.markGatewayRunning(gatewayID, req, process.PID)
+	log.Printf("runtime-agent gateway ready: gateway_id=%s instance_id=%d port=%d pid=%d total_ms=%d prepare_ms=%d config_ms=%d process_ms=%d health_ms=%d", gatewayID, req.InstanceID, port, process.PID, time.Since(startedAt).Milliseconds(), prepareDuration.Milliseconds(), configDuration.Milliseconds(), processStartDuration.Milliseconds(), healthDuration.Milliseconds())
 	if process.Done != nil {
 		go m.watchGatewayProcess(gatewayID, process.Done)
 	}
@@ -266,6 +283,10 @@ func (m *GatewayManager) GatewayStates() []GatewayState {
 		states = append(states, record.state)
 	}
 	return states
+}
+
+func (m *GatewayManager) GatewayStateChanges() <-chan struct{} {
+	return m.changes
 }
 
 func (m *GatewayManager) Health() error {
@@ -365,6 +386,7 @@ func (m *GatewayManager) detachGatewayLocked(id string) ManagedProcess {
 	}
 	m.ports.Release(record.state.Port)
 	delete(m.gateways, id)
+	m.notifyGatewayStateChangedLocked()
 	return record.process
 }
 
@@ -396,6 +418,7 @@ func (m *GatewayManager) markGatewayRunning(id string, req CreateGatewayRequest,
 	record.state.ErrorMessage = resourceLimitDegradation(req)
 	record.state.HealthAt = now
 	record.state.UpdatedAt = now
+	m.notifyGatewayStateChangedLocked()
 }
 
 func (m *GatewayManager) markGatewayError(id string, pid int, cause error) {
@@ -415,6 +438,7 @@ func (m *GatewayManager) markGatewayError(id string, pid int, cause error) {
 	record.state.ErrorMessage = cause.Error()
 	record.state.HealthAt = now
 	record.state.UpdatedAt = now
+	m.notifyGatewayStateChangedLocked()
 }
 
 func (m *GatewayManager) watchGatewayProcess(id string, done <-chan error) {
@@ -433,10 +457,19 @@ func (m *GatewayManager) watchGatewayProcess(id string, done <-chan error) {
 	if err != nil {
 		record.state.State = "error"
 		record.state.ErrorMessage = err.Error()
+		m.notifyGatewayStateChangedLocked()
 		return
 	}
 	record.state.State = "stopped"
 	record.state.ErrorMessage = ""
+	m.notifyGatewayStateChangedLocked()
+}
+
+func (m *GatewayManager) notifyGatewayStateChangedLocked() {
+	select {
+	case m.changes <- struct{}{}:
+	default:
+	}
 }
 
 func (m *GatewayManager) stopProcessAsync(process ManagedProcess) {

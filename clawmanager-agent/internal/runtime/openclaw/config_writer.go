@@ -18,6 +18,8 @@ const openClawAutoProviderName = "auto"
 const openClawRedisTeamPluginID = "redis-team"
 const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR"
 const openClawBrowserExecutablePath = "/usr/bin/chromium"
+const openClawManagedBrowserProfile = "openclaw"
+const openClawManagedBrowserColor = "#FF4500"
 const openClawChannelsEnv = "CLAWMANAGER_OPENCLAW_CHANNELS_JSON"
 
 var openClawDefaultDeniedNodeCommands = []string{
@@ -52,8 +54,11 @@ var openClawEnvManagedChannelPlugins = map[string][]string{
 }
 
 func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string, port int) error {
-	if port <= 0 || port > 65535 {
+	if port <= 0 {
 		return fmt.Errorf("invalid gateway port %d", port)
+	}
+	if port > 65533 {
+		return fmt.Errorf("invalid gateway port %d: managed OpenClaw Lite port block exceeds 65535", port)
 	}
 	if err := gateway.WriteLiteTeamConfigJSON(req, workspacePath); err != nil {
 		return err
@@ -84,7 +89,7 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("read openclaw config: %w", err)
 	}
-	configureManagedOpenClawBrowser(config)
+	configureManagedOpenClawBrowser(config, port)
 	mergeOpenClawLiteDefaults(config)
 	if err := mergeOpenClawChannelsFromRequest(config, req); err != nil {
 		return err
@@ -159,14 +164,20 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 
 // configureManagedOpenClawBrowser supplies the safe Lite runtime defaults that
 // are present in the image template without replacing an instance's explicit
-// browser choices. New pooled workspaces start from an empty config, so relying
-// on the image template alone leaves Browser unavailable for those instances.
-func configureManagedOpenClawBrowser(config map[string]any) {
+// browser choices. The managed local openclaw profile always receives the CDP
+// port allocated inside this gateway's 3-port block.
+func configureManagedOpenClawBrowser(config map[string]any, gatewayPort int) {
 	browser := ensureObject(config, "browser")
 	setDefaultObjectValue(browser, "enabled", true)
 	setDefaultObjectValue(browser, "executablePath", openClawBrowserExecutablePath)
 	setDefaultObjectValue(browser, "headless", true)
 	setDefaultObjectValue(browser, "noSandbox", true)
+
+	profiles := ensureObject(browser, "profiles")
+	profile := ensureObject(profiles, openClawManagedBrowserProfile)
+	profile["driver"] = "openclaw"
+	profile["cdpPort"] = gatewayPort + 1
+	setDefaultObjectValue(profile, "color", openClawManagedBrowserColor)
 }
 
 func setDefaultObjectValue(object map[string]any, key string, value any) {

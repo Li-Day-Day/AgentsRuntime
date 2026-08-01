@@ -83,6 +83,34 @@ func TestControlHandlerCreatesIdempotentGatewayAndRejectsNoFreePort(t *testing.T
 	})
 }
 
+func TestGatewayManagerSignalsStartingAndRunningStateChanges(t *testing.T) {
+	cfg := testConfig(t)
+	health := newBlockingHealthChecker()
+	mgr := NewGatewayManager(cfg, &fakeStarter{nextPID: 4242}, NewPortAllocator(func(int) bool { return false }))
+	mgr.SetHealthChecker(health)
+
+	req := testGatewayRequest(cfg.WorkspaceRoot, 125, 45, 7)
+	if _, err := mgr.CreateGateway(context.Background(), req); err != nil {
+		t.Fatalf("CreateGateway() error = %v", err)
+	}
+	select {
+	case <-mgr.GatewayStateChanges():
+	case <-time.After(time.Second):
+		t.Fatal("starting state change was not signaled")
+	}
+
+	health.succeed()
+	select {
+	case <-mgr.GatewayStateChanges():
+	case <-time.After(time.Second):
+		t.Fatal("running state change was not signaled")
+	}
+	eventually(t, func() bool {
+		states := mgr.GatewayStates()
+		return len(states) == 1 && states[0].State == "running"
+	})
+}
+
 func TestControlHandlerSkillsResyncReportsInventory(t *testing.T) {
 	cfg := testConfig(t)
 	reporter := &fakeReporter{podID: 42}
@@ -354,6 +382,40 @@ func TestCreateGatewayWritesConfigPassesTokenAndDoesNotReportRunningWhenOriginPr
 	eventually(t, func() bool { return starter.stopCount() == 1 })
 	if mgr.UsedSlots() != 0 {
 		t.Fatalf("UsedSlots = %d, want failed gateway excluded from capacity", mgr.UsedSlots())
+	}
+}
+
+func TestCreateGatewayReleasesFullPortBlockAfterStartupFailure(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.GatewayPortStart = 20003
+	cfg.GatewayPortEnd = 20005
+	cfg.GatewayPortBlockSize = 3
+	health := &fakeHealthChecker{err: ErrGatewayStartFailed}
+	starter := &fakeStarter{nextPID: 4242}
+	alloc := NewPortAllocator(func(int) bool { return false })
+	mgr := NewGatewayManager(cfg, starter, alloc)
+	mgr.SetHealthChecker(health)
+
+	req := testGatewayRequest(cfg.WorkspaceRoot, 415, 45, 7)
+	req.PortRange = PortRange{Start: 20003, End: 20005}
+	req.GatewayPort = 20003
+	resp, err := mgr.CreateGateway(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateGateway() error = %v, want async starting response", err)
+	}
+	if resp.Port != 20003 || resp.Status != "starting" {
+		t.Fatalf("CreateGateway() = %+v, want starting on requested port 20003", resp)
+	}
+
+	eventually(t, func() bool {
+		states := mgr.GatewayStates()
+		return len(states) == 1 && states[0].State == "error"
+	})
+	if used := alloc.ListUsed(); len(used) != 0 {
+		t.Fatalf("reserved ports after startup failure = %#v, want all block members released", used)
+	}
+	if _, err := alloc.ReserveExact(416, 7, 20003); err != nil {
+		t.Fatalf("ReserveExact() after startup failure error = %v, want released 20003-20005 block", err)
 	}
 }
 

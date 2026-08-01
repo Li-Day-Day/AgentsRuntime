@@ -12,10 +12,13 @@ import (
 )
 
 const openClawDefaultsDirEnv = "CLAWMANAGER_OPENCLAW_DEFAULTS_DIR"
+const openClawNPMRuntimeModeEnv = "CLAWMANAGER_OPENCLAW_NPM_RUNTIME_MODE"
 const defaultOpenClawDefaultsDir = "/defaults/.openclaw"
 const defaultOpenClawGlobalPackageDir = "/usr/local/lib/node_modules/openclaw"
+const openClawNPMRuntimeModeShared = "shared"
+const openClawNPMRuntimeModeCopy = "copy"
 
-var openClawPluginRuntimeDirs = []string{"npm", "plugins", "extensions"}
+var openClawPluginRuntimeDirs = []string{"plugins", "extensions"}
 var openClawGlobalPackageDir = defaultOpenClawGlobalPackageDir
 
 type openClawInstancePaths struct {
@@ -73,6 +76,35 @@ func seedOpenClawPluginRuntimeFrom(defaultsRoot string, req gateway.CreateGatewa
 	if !info.IsDir() {
 		return fmt.Errorf("OpenClaw defaults path is not a directory: %s", defaultsRoot)
 	}
+	if err := ensureOpenClawDefaultsTraversal(defaultsRoot); err != nil {
+		return fmt.Errorf("prepare OpenClaw defaults traversal: %w", err)
+	}
+
+	mode, err := resolveOpenClawNPMRuntimeMode()
+	if err != nil {
+		return err
+	}
+	if mode == openClawNPMRuntimeModeShared {
+		if err := ensureDingTalkOpenClawPeer(defaultsRoot); err != nil {
+			return fmt.Errorf("prepare shared OpenClaw peer: %w", err)
+		}
+	}
+	npmSource := filepath.Join(defaultsRoot, "npm")
+	npmTarget := filepath.Join(activeRoot, "npm")
+	var npmSeeded bool
+	if mode == openClawNPMRuntimeModeCopy {
+		npmSeeded, err = copyOpenClawPluginDirIfMissing(npmSource, npmTarget)
+	} else {
+		npmSeeded, err = seedSharedOpenClawNPMIfMissing(npmSource, npmTarget)
+	}
+	if err != nil {
+		return fmt.Errorf("seed OpenClaw plugin runtime npm (%s): %w", mode, err)
+	}
+	if npmSeeded {
+		if err := chownTree(npmTarget, req.UID, req.GID); err != nil {
+			return fmt.Errorf("chown OpenClaw plugin runtime npm: %w", err)
+		}
+	}
 
 	for _, name := range openClawPluginRuntimeDirs {
 		source := filepath.Join(defaultsRoot, name)
@@ -101,6 +133,208 @@ func seedOpenClawPluginRuntimeFrom(defaultsRoot string, req gateway.CreateGatewa
 		}
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat OpenClaw plugin registry: %w", err)
+	}
+	return nil
+}
+
+func ensureOpenClawDefaultsTraversal(defaultsRoot string) error {
+	for _, dir := range []string{
+		filepath.Dir(defaultsRoot),
+		defaultsRoot,
+		filepath.Join(defaultsRoot, "npm"),
+	} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if !info.IsDir() {
+			continue
+		}
+		mode := info.Mode().Perm()
+		readableMode := mode | 0o055
+		if readableMode != mode {
+			if err := os.Chmod(dir, readableMode); err != nil {
+				return fmt.Errorf("chmod %s: %w", dir, err)
+			}
+		}
+	}
+	return nil
+}
+
+func resolveOpenClawNPMRuntimeMode() (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv(openClawNPMRuntimeModeEnv)))
+	if mode == "" {
+		return openClawNPMRuntimeModeShared, nil
+	}
+	switch mode {
+	case openClawNPMRuntimeModeShared, openClawNPMRuntimeModeCopy:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid %s %q: want %q or %q", openClawNPMRuntimeModeEnv, mode, openClawNPMRuntimeModeShared, openClawNPMRuntimeModeCopy)
+	}
+}
+
+// seedSharedOpenClawNPMIfMissing creates a small, instance-owned npm root and
+// links each image-provided package into it. The writable package parents let
+// an instance replace a default package or install additional packages without
+// copying the image's complete node_modules tree during gateway startup.
+func seedSharedOpenClawNPMIfMissing(source, target string) (bool, error) {
+	info, err := os.Stat(source)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !info.IsDir() {
+		return false, fmt.Errorf("source is not a directory: %s", source)
+	}
+	if _, err := os.Lstat(target); err == nil {
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+
+	parent := filepath.Dir(target)
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		return false, err
+	}
+	staging, err := os.MkdirTemp(parent, "."+filepath.Base(target)+".seed-*")
+	if err != nil {
+		return false, err
+	}
+	defer os.RemoveAll(staging)
+	if err := populateSharedOpenClawNPM(source, staging); err != nil {
+		return false, err
+	}
+	if err := os.Rename(staging, target); err != nil {
+		if _, targetErr := os.Lstat(target); targetErr == nil {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func populateSharedOpenClawNPM(source, target string) error {
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		sourcePath := filepath.Join(source, entry.Name())
+		targetPath := filepath.Join(target, entry.Name())
+		if entry.Name() == "node_modules" {
+			if err := populateSharedNodeModules(sourcePath, targetPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := copyOpenClawNPMRootEntry(sourcePath, targetPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func populateSharedNodeModules(source, target string) error {
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("source is not a directory: %s", source)
+	}
+	if err := os.MkdirAll(target, info.Mode().Perm()); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		sourcePath := filepath.Join(source, entry.Name())
+		targetPath := filepath.Join(target, entry.Name())
+		if entry.Name() == ".bin" && entry.IsDir() {
+			if err := copyDir(sourcePath, targetPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if strings.HasPrefix(entry.Name(), "@") && entry.IsDir() {
+			if err := linkOpenClawPackageScope(sourcePath, targetPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := linkOpenClawPackageEntry(sourcePath, targetPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func linkOpenClawPackageScope(source, target string) error {
+	info, err := os.Stat(source)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(target, info.Mode().Perm()); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := linkOpenClawPackageEntry(filepath.Join(source, entry.Name()), filepath.Join(target, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyOpenClawNPMRootEntry(source, target string) error {
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		linkTarget, err := os.Readlink(source)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(linkTarget, target)
+	}
+	if info.IsDir() {
+		return copyDir(source, target)
+	}
+	if info.Mode().IsRegular() {
+		return copyRegularFile(source, target, info.Mode().Perm())
+	}
+	return nil
+}
+
+func linkOpenClawPackageEntry(source, target string) error {
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		linkTarget, err := os.Readlink(source)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(linkTarget, target)
+	}
+	if info.IsDir() {
+		return os.Symlink(filepath.Clean(source), target)
+	}
+	if info.Mode().IsRegular() {
+		return copyRegularFile(source, target, info.Mode().Perm())
 	}
 	return nil
 }
@@ -145,6 +379,12 @@ func ensureDingTalkOpenClawPeer(activeRoot string) error {
 		return fmt.Errorf("create OpenClaw peer directory: %w", err)
 	}
 	if err := os.Symlink(openClawGlobalPackageDir, linkPath); err != nil {
+		if os.IsExist(err) {
+			currentTarget, readErr := os.Readlink(linkPath)
+			if readErr == nil && currentTarget == openClawGlobalPackageDir {
+				return nil
+			}
+		}
 		return fmt.Errorf("create OpenClaw peer symlink: %w", err)
 	}
 	return nil

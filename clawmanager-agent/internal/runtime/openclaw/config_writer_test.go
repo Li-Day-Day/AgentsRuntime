@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -158,6 +159,16 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	if browser["executablePath"] != openClawBrowserExecutablePath {
 		t.Fatalf("browser.executablePath = %#v, want %s", browser["executablePath"], openClawBrowserExecutablePath)
 	}
+	openclawProfile := objectAt(t, objectAt(t, browser, "profiles"), "openclaw")
+	if openclawProfile["driver"] != "openclaw" {
+		t.Fatalf("browser.profiles.openclaw.driver = %#v, want openclaw", openclawProfile["driver"])
+	}
+	if openclawProfile["cdpPort"] != float64(20004) {
+		t.Fatalf("browser.profiles.openclaw.cdpPort = %#v, want 20004", openclawProfile["cdpPort"])
+	}
+	if openclawProfile["color"] != openClawManagedBrowserColor {
+		t.Fatalf("browser.profiles.openclaw.color = %#v, want %s", openclawProfile["color"], openClawManagedBrowserColor)
+	}
 	providerModels, ok := autoProvider["models"].([]any)
 	if !ok {
 		t.Fatalf("models.providers.auto.models = %#v, want array", autoProvider["models"])
@@ -206,6 +217,10 @@ func TestWriteOpenClawGatewayConfigCompletesPartialBrowserConfig(t *testing.T) {
 	if browser["executablePath"] != openClawBrowserExecutablePath || browser["headless"] != true || browser["noSandbox"] != true {
 		t.Fatalf("completed browser config = %#v", browser)
 	}
+	openclawProfile := objectAt(t, objectAt(t, browser, "profiles"), "openclaw")
+	if openclawProfile["cdpPort"] != float64(20004) {
+		t.Fatalf("browser.profiles.openclaw.cdpPort = %#v, want 20004", openclawProfile["cdpPort"])
+	}
 }
 
 func TestWriteOpenClawGatewayConfigPreservesExplicitBrowserConfig(t *testing.T) {
@@ -227,6 +242,94 @@ func TestWriteOpenClawGatewayConfigPreservesExplicitBrowserConfig(t *testing.T) 
 	browser := objectAt(t, readOpenClawConfigForTest(t, configPath), "browser")
 	if browser["enabled"] != false || browser["executablePath"] != "/opt/custom-browser" || browser["headless"] != false || browser["noSandbox"] != false {
 		t.Fatalf("explicit browser config was overwritten: %#v", browser)
+	}
+}
+
+func TestWriteOpenClawGatewayConfigPinsManagedBrowserCDPInsideAllocatedPortBlock(t *testing.T) {
+	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-415")
+	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	existing := []byte(`{
+  "browser": {
+    "enabled": false,
+    "executablePath": "/opt/custom-browser",
+    "headless": false,
+    "noSandbox": false,
+    "profiles": {
+      "openclaw": {
+        "driver": "legacy",
+        "cdpPort": 20053,
+        "color": "#00AA00",
+        "viewport": "keep"
+      },
+      "remote-review": {
+        "driver": "remote",
+        "cdpPort": 41000
+      }
+    }
+  }
+}`)
+	if err := os.WriteFile(configPath, existing, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	req := CreateGatewayRequest{InstanceID: 415, UserID: 45, UID: 200415, GID: 200415}
+	if err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, 20042); err != nil {
+		t.Fatalf("WriteGatewayConfig() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(data), "20053") {
+		t.Fatalf("config still contains stale default CDP port 20053: %s", string(data))
+	}
+	merged := readOpenClawConfigForTest(t, configPath)
+	gatewayConfig := objectAt(t, merged, "gateway")
+	if gatewayConfig["port"] != float64(20042) {
+		t.Fatalf("gateway.port = %#v, want 20042", gatewayConfig["port"])
+	}
+	browser := objectAt(t, merged, "browser")
+	if browser["enabled"] != false || browser["executablePath"] != "/opt/custom-browser" || browser["headless"] != false || browser["noSandbox"] != false {
+		t.Fatalf("explicit browser config was overwritten: %#v", browser)
+	}
+	profiles := objectAt(t, browser, "profiles")
+	openclawProfile := objectAt(t, profiles, "openclaw")
+	if openclawProfile["driver"] != "openclaw" {
+		t.Fatalf("browser.profiles.openclaw.driver = %#v, want openclaw", openclawProfile["driver"])
+	}
+	if openclawProfile["cdpPort"] != float64(20043) {
+		t.Fatalf("browser.profiles.openclaw.cdpPort = %#v, want 20043", openclawProfile["cdpPort"])
+	}
+	if openclawProfile["color"] != "#00AA00" || openclawProfile["viewport"] != "keep" {
+		t.Fatalf("openclaw profile non-port config was not preserved: %#v", openclawProfile)
+	}
+	remoteProfile := objectAt(t, profiles, "remote-review")
+	if remoteProfile["driver"] != "remote" || remoteProfile["cdpPort"] != float64(41000) {
+		t.Fatalf("remote browser profile was not preserved: %#v", remoteProfile)
+	}
+	if gotBrowserControlPort := int(openclawProfile["cdpPort"].(float64)) + 1; gotBrowserControlPort != 20044 {
+		t.Fatalf("derived Browser Control port = %d, want 20044", gotBrowserControlPort)
+	}
+}
+
+func TestWriteOpenClawGatewayConfigRejectsPortBlockOutsideValidRange(t *testing.T) {
+	for _, port := range []int{0, 65534} {
+		t.Run(strconv.Itoa(port), func(t *testing.T) {
+			workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-67")
+			req := CreateGatewayRequest{InstanceID: 67, UserID: 45, UID: 200067, GID: 200067}
+
+			err := WriteGatewayConfig(Config{GatewayAuthMode: "trusted-proxy"}, req, workspace, port)
+			if err == nil {
+				t.Fatal("WriteGatewayConfig() error = nil, want invalid port error")
+			}
+			if !strings.Contains(err.Error(), "invalid gateway port") {
+				t.Fatalf("WriteGatewayConfig() error = %q, want invalid gateway port", err)
+			}
+		})
 	}
 }
 
