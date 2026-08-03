@@ -6,3 +6,4 @@ clawmanager-agent/clawmanager-agent-linux
 /runtime-team-optimization-docs/
 __pycache__/
 *.py[cod]
+.codex

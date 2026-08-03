@@ -1,5 +1,8 @@
 # ClawManager OpenClaw Image
 
+> 为多实例 Lite runtime 新增或升级 channel 插件前，请同时阅读
+> [OpenClaw Lite Channel 适配指南](../clawmanager-agent/docs/openclaw-lite-channel-adaptation.md)。
+
 <p align="center">
   <img src="docs//assets/openclaw_logo.jpg" alt="ClawManager" width="100%" />
 </p>

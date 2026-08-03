@@ -151,3 +151,22 @@ func TestDockerfilePinsHermesAgentVersion(t *testing.T) {
 		}
 	}
 }
+
+func TestDashboardGatewayScriptAppliesRuntimeConfigBeforeReadingEnvFile(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "start-hermes-dashboard-gateway"))
+	if err != nil {
+		t.Fatalf("read start-hermes-dashboard-gateway: %v", err)
+	}
+	script := string(data)
+	applyIndex := strings.Index(script, "/usr/local/bin/hermes-apply-runtime-config")
+	envFileIndex := strings.Index(script, `env_file="${HERMES_HOME}/.env"`)
+	if applyIndex < 0 {
+		t.Fatal("start-hermes-dashboard-gateway missing hermes-apply-runtime-config")
+	}
+	if envFileIndex < 0 {
+		t.Fatal("start-hermes-dashboard-gateway missing HERMES_HOME env file assignment")
+	}
+	if applyIndex >= envFileIndex {
+		t.Fatal("hermes-apply-runtime-config must run before reading HERMES_HOME/.env")
+	}
+}

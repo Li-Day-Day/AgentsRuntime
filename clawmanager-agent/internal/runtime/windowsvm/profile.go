@@ -1,7 +1,8 @@
-package generic
+package windowsvm
 
 import (
 	"fmt"
+	"path"
 	"strings"
 	"time"
 
@@ -21,31 +22,33 @@ func (p Profile) Type() string {
 }
 
 func (p Profile) DisplayName() string {
-	if p.runtimeType == "" {
-		return "Generic Runtime"
-	}
-	return p.runtimeType
+	return "Windows VM"
 }
 
 func (p Profile) Defaults() gateway.RuntimeDefaults {
 	return gateway.RuntimeDefaults{
 		WorkspaceRoot:         "/workspaces",
 		AgentDataDir:          "/var/lib/clawmanager-agent",
-		GatewayPortStart:      20000,
-		GatewayPortEnd:        20099,
+		GatewayPortStart:      8006,
+		GatewayPortEnd:        8006,
 		GatewayPortBlockSize:  1,
-		GatewayCapacity:       100,
+		GatewayCapacity:       1,
 		GatewayAuthMode:       "trusted-proxy",
-		GatewayStartupTimeout: 90 * time.Second,
+		GatewayStartupTimeout: 5 * time.Minute,
 	}
 }
 
 func (p Profile) GatewayCommand(string) []string {
-	return nil
+	return []string{"/usr/local/bin/windows-vm-gateway"}
 }
 
 func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string, port int) []string {
-	return gateway.GenericGatewayEnv(base, cfg, req, workspacePath, port)
+	env := gateway.GenericGatewayEnv(base, cfg, req, workspacePath, port)
+	env = setEnv(env, "WINDOWS_VM_STORAGE_DIR", path.Join(workspacePath, "storage"))
+	env = setEnv(env, "WINDOWS_VM_SHARED_DIR", path.Join(workspacePath, "shared"))
+	env = setEnv(env, "WINDOWS_VM_WEB_PORT", "8006")
+	env = setEnv(env, "WINDOWS_VM_RDP_PORT", "3389")
+	return env
 }
 
 func (p Profile) PrepareWorkspace(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string) error {
@@ -63,6 +66,17 @@ func (p Profile) WriteGatewayConfig(gateway.Config, gateway.CreateGatewayRequest
 	return nil
 }
 
-func (p Profile) HealthChecker(gateway.Config) gateway.GatewayHealthChecker {
-	return gateway.NewNoopGatewayHealthChecker()
+func (p Profile) HealthChecker(cfg gateway.Config) gateway.GatewayHealthChecker {
+	return gateway.NewHTTPGatewayHealthChecker(cfg)
+}
+
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for index, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			env[index] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }

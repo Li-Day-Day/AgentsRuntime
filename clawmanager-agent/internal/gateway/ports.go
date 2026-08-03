@@ -20,6 +20,15 @@ type portAllocation struct {
 	Status      portStatus
 }
 
+type portBlockConflict struct {
+	Port   int
+	Reason string
+}
+
+func (c portBlockConflict) Error() string {
+	return fmt.Sprintf("port block member %d is already %s", c.Port, c.Reason)
+}
+
 type PortAllocator struct {
 	mu          sync.Mutex
 	ports       map[int]portAllocation
@@ -60,7 +69,7 @@ func (a *PortAllocator) Reserve(instanceID, generation int, rng PortRange) (int,
 	}
 	lastPrimaryPort := rng.End - blockSize + 1
 	for port := rng.Start; port <= lastPrimaryPort; port += blockSize {
-		if !a.blockAvailableLocked(port, blockSize) {
+		if conflict := a.blockConflictLocked(port, blockSize); conflict != nil {
 			continue
 		}
 		allocation := portAllocation{
@@ -77,17 +86,47 @@ func (a *PortAllocator) Reserve(instanceID, generation int, rng PortRange) (int,
 	return 0, ErrNoFreePort
 }
 
-func (a *PortAllocator) blockAvailableLocked(port, blockSize int) bool {
+// ReserveExact reserves the supplied primary gateway port and its associated
+// port block. It intentionally does not constrain the port to a locally
+// configured range: the control plane owns exact port assignment.
+func (a *PortAllocator) ReserveExact(instanceID, generation, port int) (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	blockSize := a.blockSize
+	if blockSize <= 0 {
+		blockSize = 1
+	}
+	if port <= 0 || port > 65535 || port+blockSize-1 > 65535 {
+		return 0, fmt.Errorf("invalid requested gateway port %d", port)
+	}
+	if conflict := a.blockConflictLocked(port, blockSize); conflict != nil {
+		return 0, fmt.Errorf("requested gateway port %d is unavailable: %w: %w", port, conflict, ErrNoFreePort)
+	}
+
+	allocation := portAllocation{
+		InstanceID:  instanceID,
+		Generation:  generation,
+		PrimaryPort: port,
+		Status:      portReserved,
+	}
+	for offset := 0; offset < blockSize; offset++ {
+		a.ports[port+offset] = allocation
+	}
+	return port, nil
+}
+
+func (a *PortAllocator) blockConflictLocked(port, blockSize int) *portBlockConflict {
 	for offset := 0; offset < blockSize; offset++ {
 		member := port + offset
 		if _, exists := a.ports[member]; exists {
-			return false
+			return &portBlockConflict{Port: member, Reason: "reserved by AgentRuntime"}
 		}
 		if a.isListening(member) {
-			return false
+			return &portBlockConflict{Port: member, Reason: "listening"}
 		}
 	}
-	return true
+	return nil
 }
 
 func (a *PortAllocator) Commit(instanceID, generation, port int) {

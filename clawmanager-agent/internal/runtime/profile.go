@@ -42,7 +42,7 @@ func (p StaticProfile) PrepareWorkspace(_ gateway.Config, _ gateway.CreateGatewa
 	return nil
 }
 
-func (p StaticProfile) WriteGatewayConfig(gateway.Config, gateway.CreateGatewayRequest, string) error {
+func (p StaticProfile) WriteGatewayConfig(gateway.Config, gateway.CreateGatewayRequest, string, int) error {
 	return nil
 }
 

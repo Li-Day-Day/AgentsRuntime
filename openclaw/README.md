@@ -1,5 +1,8 @@
 # ClawManager OpenClaw Image
 
+> Maintainers adapting channel plugins for the multi-instance Lite runtime
+> should also read the [OpenClaw Lite Channel Adapter Guide](../clawmanager-agent/docs/openclaw-lite-channel-adaptation.md).
+
 <p align="center">
   <img src="docs//assets/openclaw_logo.jpg" alt="ClawManager" width="100%" />
 </p>
