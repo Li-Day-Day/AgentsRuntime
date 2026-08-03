@@ -9,6 +9,7 @@ The repository currently documents these runtime images:
 - `openclaw`
 - `openclaw-lite`
 - `openclaw-shell`
+- `windows-vm`
 
 ## Repository layout
 
@@ -17,6 +18,7 @@ The repository currently documents these runtime images:
 - `openclaw/`: OpenClaw runtime image, built from the repository root so it can include the shared `clawmanager-agent/`
 - `openclaw-lite`: lite OpenClaw runtime image, built from the repository root with `openclaw/Dockerfile.openclaw`
 - `openclaw-shell/`: Alpine-based OpenClaw shell runtime image, built from the repository root so it can reuse the OpenClaw agent implementation under `openclaw/`
+- `windows-vm/`: Windows VM runtime wrapper around `dockurr/windows`, built from the repository root so it can include the shared `clawmanager-agent/`
 - `clawmanager-agent/`: shared managed-runtime agent used by runtime images that need ClawManager runtime gateway control
 
 Before adding or upgrading a channel plugin in OpenClaw Lite, read the
@@ -72,6 +74,15 @@ docker build \
 ```
 
 This image does not include Webtop or a virtual desktop. It uses `/config` as the persistent directory, runs `openclaw-agent` on container start, and reports `runtime_type=openclaw-shell` to ClawManager when `CLAWMANAGER_AGENT_ENABLED=true`.
+
+### Windows VM
+
+```bash
+docker build \
+  -f windows-vm/Dockerfile \
+  -t windows-vm:local \
+  .
+```
 
 ## Manual multi-architecture builds
 
