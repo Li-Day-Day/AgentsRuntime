@@ -14,12 +14,53 @@ import (
 
 const openClawTrustedProxyUserHeader = "x-forwarded-prefix"
 const openClawTrustedProxyRequiredHeader = "x-forwarded-proto"
+const openClawTrustedProxyDefaultPassword = "9fb3edf4bf38bb834227d41fe9cc1196"
 const openClawAutoProviderName = "auto"
 const openClawRedisTeamPluginID = "redis-team"
 const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR"
 const openClawBrowserExecutablePath = "/usr/bin/chromium"
+const openClawManagedBrowserProfile = "openclaw"
+const openClawManagedBrowserColor = "#FF4500"
+const openClawChannelsEnv = "CLAWMANAGER_OPENCLAW_CHANNELS_JSON"
 
-func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string) error {
+var openClawDefaultDeniedNodeCommands = []string{
+	"camera.snap",
+	"camera.clip",
+	"screen.record",
+	"contacts.add",
+	"calendar.add",
+	"reminders.add",
+	"sms.send",
+}
+
+var openClawDefaultDisabledPlugins = []string{
+	"bonjour",
+	"acpx",
+	"browser",
+	"phone-control",
+	"talk-voice",
+	"device-pair",
+	"dingtalk-connector",
+	"wecom-openclaw-plugin",
+	"redis-team",
+}
+
+var openClawEnvManagedChannelPlugins = map[string][]string{
+	"dingtalk":              {"dingtalk-connector"},
+	"dingtalk-connector":    {"dingtalk-connector"},
+	"feishu":                {"feishu"},
+	"lark":                  {"feishu"},
+	"wecom":                 {"wecom-openclaw-plugin"},
+	"wecom-openclaw-plugin": {"wecom-openclaw-plugin"},
+}
+
+func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, workspacePath string, port int) error {
+	if port <= 0 {
+		return fmt.Errorf("invalid gateway port %d", port)
+	}
+	if port > 65533 {
+		return fmt.Errorf("invalid gateway port %d: managed OpenClaw Lite port block exceeds 65535", port)
+	}
 	if err := gateway.WriteLiteTeamConfigJSON(req, workspacePath); err != nil {
 		return err
 	}
@@ -29,9 +70,16 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	}
 	cfg = resolvedCfg
 
-	configPath := filepath.Join(workspacePath, "home", ".openclaw", "openclaw.json")
+	instancePaths, err := resolveOpenClawInstancePaths(req, workspacePath)
+	if err != nil {
+		return err
+	}
+	configPath := filepath.Join(instancePaths.Persistent, "openclaw.json")
 	if err := os.MkdirAll(filepath.Dir(configPath), 0o750); err != nil {
 		return fmt.Errorf("create openclaw config dir: %w", err)
+	}
+	if err := seedOpenClawPluginRuntime(req, instancePaths.Persistent); err != nil {
+		return err
 	}
 
 	config := map[string]any{}
@@ -42,8 +90,15 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("read openclaw config: %w", err)
 	}
-	configureManagedOpenClawBrowser(config)
+	configureManagedOpenClawBrowser(config, port)
+	mergeOpenClawLiteDefaults(config)
+	if err := mergeOpenClawChannelsFromRequest(config, req); err != nil {
+		return err
+	}
 
+	mergePlatformDefaults(config, port)
+	agentDefaults := ensureObject(ensureObject(config, "agents"), "defaults")
+	agentDefaults["workspace"] = filepath.ToSlash(instancePaths.OpenClawWorkspace)
 	if teamEnabledFromRequest(req) {
 		if err := configureOpenClawRedisTeam(config, req, workspacePath); err != nil {
 			return err
@@ -61,6 +116,9 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	} else {
 		auth["mode"] = "trusted-proxy"
 		delete(auth, "token")
+		if strings.TrimSpace(configStringValue(auth["password"])) == "" {
+			auth["password"] = openClawTrustedProxyDefaultPassword
+		}
 		trustedProxy := ensureObject(auth, "trustedProxy")
 		trustedProxy["userHeader"] = openClawTrustedProxyUserHeader
 		trustedProxy["requiredHeaders"] = []string{openClawTrustedProxyRequiredHeader}
@@ -110,14 +168,20 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 
 // configureManagedOpenClawBrowser supplies the safe Lite runtime defaults that
 // are present in the image template without replacing an instance's explicit
-// browser choices. New pooled workspaces start from an empty config, so relying
-// on the image template alone leaves Browser unavailable for those instances.
-func configureManagedOpenClawBrowser(config map[string]any) {
+// browser choices. The managed local openclaw profile always receives the CDP
+// port allocated inside this gateway's 3-port block.
+func configureManagedOpenClawBrowser(config map[string]any, gatewayPort int) {
 	browser := ensureObject(config, "browser")
 	setDefaultObjectValue(browser, "enabled", true)
 	setDefaultObjectValue(browser, "executablePath", openClawBrowserExecutablePath)
 	setDefaultObjectValue(browser, "headless", true)
 	setDefaultObjectValue(browser, "noSandbox", true)
+
+	profiles := ensureObject(browser, "profiles")
+	profile := ensureObject(profiles, openClawManagedBrowserProfile)
+	profile["driver"] = "openclaw"
+	profile["cdpPort"] = gatewayPort + 1
+	setDefaultObjectValue(profile, "color", openClawManagedBrowserColor)
 }
 
 func setDefaultObjectValue(object map[string]any, key string, value any) {
@@ -125,6 +189,164 @@ func setDefaultObjectValue(object map[string]any, key string, value any) {
 		return
 	}
 	object[key] = value
+}
+
+// mergeOpenClawLiteDefaults supplies the instance defaults that Pro receives
+// from /defaults/.openclaw/openclaw.json. Lite workspaces start with an empty
+// config, so these defaults must be added when the instance is created.
+//
+// Values are only filled when absent so recreating an existing Lite instance
+// does not discard explicit user choices. Environment-managed model, channel,
+// Team, gateway port, and authentication settings are applied afterwards.
+func mergeOpenClawLiteDefaults(config map[string]any) {
+	models := ensureObject(config, "models")
+	setDefaultObjectValue(models, "mode", "merge")
+
+	agentDefaults := ensureObject(ensureObject(config, "agents"), "defaults")
+	memorySearch := ensureObject(agentDefaults, "memorySearch")
+	setDefaultObjectValue(memorySearch, "enabled", true)
+	setDefaultObjectValue(memorySearch, "provider", "none")
+
+	compaction := ensureObject(agentDefaults, "compaction")
+	setDefaultObjectValue(compaction, "mode", "default")
+	setDefaultObjectValue(compaction, "reserveTokens", 32768)
+	setDefaultObjectValue(compaction, "reserveTokensFloor", 20000)
+	setDefaultObjectValue(compaction, "keepRecentTokens", 30000)
+	setDefaultObjectValue(compaction, "maxHistoryShare", 0.65)
+	setDefaultObjectValue(compaction, "notifyUser", true)
+	memoryFlush := ensureObject(compaction, "memoryFlush")
+	setDefaultObjectValue(memoryFlush, "enabled", true)
+
+	setDefaultObjectValue(agentDefaults, "maxConcurrent", 4)
+	subagents := ensureObject(agentDefaults, "subagents")
+	setDefaultObjectValue(subagents, "maxConcurrent", 8)
+
+	tools := ensureObject(config, "tools")
+	setDefaultObjectValue(tools, "profile", "full")
+
+	commands := ensureObject(config, "commands")
+	setDefaultObjectValue(commands, "native", "auto")
+	setDefaultObjectValue(commands, "nativeSkills", "auto")
+	setDefaultObjectValue(commands, "restart", true)
+	setDefaultObjectValue(commands, "ownerDisplay", "raw")
+
+	messages := ensureObject(config, "messages")
+	groupChat := ensureObject(messages, "groupChat")
+	setDefaultObjectValue(groupChat, "visibleReplies", "automatic")
+
+	gatewayConfig := ensureObject(config, "gateway")
+	setDefaultObjectValue(gatewayConfig, "mode", "local")
+	tailscale := ensureObject(gatewayConfig, "tailscale")
+	setDefaultObjectValue(tailscale, "mode", "off")
+	setDefaultObjectValue(tailscale, "resetOnExit", false)
+	nodes := ensureObject(gatewayConfig, "nodes")
+	nodes["denyCommands"] = appendUniqueStringArray(nodes["denyCommands"], openClawDefaultDeniedNodeCommands...)
+
+	entries := ensureObject(ensureObject(config, "plugins"), "entries")
+	for _, pluginID := range openClawDefaultDisabledPlugins {
+		entry := ensureObject(entries, pluginID)
+		setDefaultObjectValue(entry, "enabled", false)
+	}
+	memoryCore := ensureObject(entries, "memory-core")
+	dreaming := ensureObject(ensureObject(memoryCore, "config"), "dreaming")
+	setDefaultObjectValue(dreaming, "enabled", true)
+	setDefaultObjectValue(dreaming, "frequency", "0 3 * * *")
+	setDefaultObjectValue(dreaming, "timezone", "Asia/Shanghai")
+}
+
+func mergeOpenClawChannelsFromRequest(config map[string]any, req gateway.CreateGatewayRequest) error {
+	raw, ok := requestEnvValue(req, openClawChannelsEnv)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	var payload any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return fmt.Errorf("parse %s: %w", openClawChannelsEnv, err)
+	}
+	channelsPayload, ok := payload.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s must be a JSON object", openClawChannelsEnv)
+	}
+
+	channels := ensureObject(config, "channels")
+	for name, channel := range channelsPayload {
+		channels[name] = channel
+	}
+	reconcileOpenClawChannelPlugins(config, channelsPayload)
+	applyOpenClawChannelDefaults(config, channelsPayload)
+	return nil
+}
+
+func applyOpenClawChannelDefaults(config map[string]any, channelsPayload map[string]any) {
+	if _, ok := channelsPayload["dingtalk"]; !ok {
+		if _, ok := channelsPayload["dingtalk-connector"]; !ok {
+			return
+		}
+	}
+
+	messages := ensureObject(config, "messages")
+	groupChat := ensureObject(messages, "groupChat")
+	if value, ok := groupChat["visibleReplies"].(string); ok && strings.TrimSpace(value) != "" {
+		return
+	}
+	groupChat["visibleReplies"] = "automatic"
+}
+
+func reconcileOpenClawChannelPlugins(config map[string]any, channelsPayload map[string]any) {
+	plugins := ensureObject(config, "plugins")
+	entries := ensureObject(plugins, "entries")
+	enabledPlugins := map[string]struct{}{}
+	for channelID := range channelsPayload {
+		for _, pluginID := range openClawEnvManagedChannelPlugins[channelID] {
+			enabledPlugins[pluginID] = struct{}{}
+		}
+	}
+	managedPlugins := map[string]struct{}{}
+	for _, pluginIDs := range openClawEnvManagedChannelPlugins {
+		for _, pluginID := range pluginIDs {
+			managedPlugins[pluginID] = struct{}{}
+		}
+	}
+	for pluginID := range managedPlugins {
+		entry := ensureObject(entries, pluginID)
+		_, enabled := enabledPlugins[pluginID]
+		entry["enabled"] = enabled
+	}
+}
+
+func mergePlatformDefaults(config map[string]any, port int) {
+	gatewayConfig := ensureObject(config, "gateway")
+	gatewayConfig["port"] = port
+
+	cron := ensureObject(config, "cron")
+	cron["enabled"] = true
+	cron["maxConcurrentRuns"] = 2
+	runLog := ensureObject(cron, "runLog")
+	runLog["keepLines"] = 2000
+	runLog["maxBytes"] = "2mb"
+	cron["sessionRetention"] = "24h"
+
+	update := ensureObject(config, "update")
+	update["checkOnStart"] = false
+	auto := ensureObject(update, "auto")
+	auto["enabled"] = false
+
+	hooks := ensureObject(config, "hooks")
+	internal := ensureObject(hooks, "internal")
+	internal["enabled"] = true
+	entries := ensureObject(internal, "entries")
+	sessionMemory := ensureObject(entries, "session-memory")
+	sessionMemory["enabled"] = true
+	sessionMemory["messages"] = 50
+
+	session := ensureObject(config, "session")
+	reset := ensureObject(session, "reset")
+	reset["idleMinutes"] = 10080
+	reset["mode"] = "idle"
+	maintenance := ensureObject(session, "maintenance")
+	maintenance["maxEntries"] = 2000
+	maintenance["pruneAfter"] = "180d"
 }
 
 func configureOpenClawRedisTeam(config map[string]any, req gateway.CreateGatewayRequest, workspacePath string) error {
@@ -219,6 +441,14 @@ func seedOpenClawRedisTeamPlugin(req gateway.CreateGatewayRequest, workspacePath
 	}
 	extensionsDir := filepath.Join(workspacePath, "home", ".openclaw", "extensions")
 	target := filepath.Join(extensionsDir, openClawRedisTeamPluginID)
+	if _, err := os.Stat(filepath.Join(target, "openclaw.plugin.json")); err == nil {
+		if err := chownTree(target, req.UID, req.GID); err != nil {
+			return fmt.Errorf("chown redis-team plugin: %w", err)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat redis-team plugin target: %w", err)
+	}
 	if err := copyDir(source, target); err != nil {
 		return fmt.Errorf("seed redis-team plugin: %w", err)
 	}
@@ -276,9 +506,19 @@ func copyDir(source, target string) error {
 	for _, entry := range entries {
 		srcPath := filepath.Join(source, entry.Name())
 		dstPath := filepath.Join(target, entry.Name())
-		entryInfo, err := entry.Info()
+		entryInfo, err := os.Lstat(srcPath)
 		if err != nil {
 			return err
+		}
+		if entryInfo.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(srcPath)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(linkTarget, dstPath); err != nil {
+				return err
+			}
+			continue
 		}
 		if entryInfo.IsDir() {
 			if err := copyDir(srcPath, dstPath); err != nil {
@@ -320,9 +560,12 @@ func copyRegularFile(source, target string, mode os.FileMode) error {
 }
 
 func chownTree(root string, uid, gid int) error {
-	return filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
 		}
 		return gateway.ChownWorkspace(path, uid, gid)
 	})

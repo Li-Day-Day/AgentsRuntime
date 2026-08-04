@@ -166,11 +166,14 @@ func (a *Agent) metricsLoop(ctx context.Context) {
 func (a *Agent) gatewayReportLoop(ctx context.Context) {
 	ticker := time.NewTicker(a.cfg.GatewayReportInterval)
 	defer ticker.Stop()
+	changes := a.manager.GatewayStateChanges()
 	a.reportGateways(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-changes:
+			a.reportGateways(ctx)
 		case <-ticker.C:
 			a.reportGateways(ctx)
 		}

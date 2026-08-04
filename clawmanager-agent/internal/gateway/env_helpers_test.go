@@ -150,3 +150,45 @@ func TestPrepareLiteTeamSharedWorkspaceRejectsOtherTeamPath(t *testing.T) {
 		t.Fatal("expected cross-Team shared path to be rejected")
 	}
 }
+
+func TestOpenClawGatewayEnvIsolatesInstancePaths(t *testing.T) {
+	base := []string{
+		"HOME=/shared/home",
+		"CLAWMANAGER_WORKSPACE_PATH=/shared/workspace",
+		"CLAWMANAGER_AGENT_PERSISTENT_DIR=/shared/persistent",
+	}
+	tests := []struct {
+		name          string
+		userID        int
+		instanceID    int
+		workspacePath string
+	}{
+		{name: "gateway 123", userID: 45, instanceID: 123, workspacePath: filepath.Join("/workspaces", "openclaw", "user-45", "instance-123")},
+		{name: "gateway 456", userID: 98, instanceID: 456, workspacePath: filepath.Join("/workspaces", "openclaw", "user-98", "instance-456")},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := CreateGatewayRequest{
+				AgentType:  "openclaw",
+				UserID:     tc.userID,
+				InstanceID: tc.instanceID,
+				Environment: map[string]string{
+					"HOME":                             "/request/home",
+					"CLAWMANAGER_WORKSPACE_PATH":       "/request/workspace",
+					"CLAWMANAGER_AGENT_PERSISTENT_DIR": "/request/persistent",
+				},
+			}
+			env := OpenClawGatewayEnv(base, Config{RuntimeType: "openclaw", GatewayAuthMode: "trusted-proxy"}, req, tc.workspacePath, 20000+tc.instanceID%100)
+			if got := envValue(env, "CLAWMANAGER_WORKSPACE_PATH"); got != tc.workspacePath {
+				t.Fatalf("CLAWMANAGER_WORKSPACE_PATH = %q, want %q", got, tc.workspacePath)
+			}
+			if got, want := envValue(env, "HOME"), filepath.Join(tc.workspacePath, "home"); got != want {
+				t.Fatalf("HOME = %q, want %q", got, want)
+			}
+			if got, want := envValue(env, "CLAWMANAGER_AGENT_PERSISTENT_DIR"), filepath.Join(tc.workspacePath, "home", ".openclaw"); got != want {
+				t.Fatalf("CLAWMANAGER_AGENT_PERSISTENT_DIR = %q, want %q", got, want)
+			}
+		})
+	}
+}

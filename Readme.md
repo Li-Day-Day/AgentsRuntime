@@ -19,6 +19,9 @@ The repository currently documents these runtime images:
 - `openclaw-shell/`: Alpine-based OpenClaw shell runtime image, built from the repository root so it can reuse the OpenClaw agent implementation under `openclaw/`
 - `clawmanager-agent/`: shared managed-runtime agent used by runtime images that need ClawManager runtime gateway control
 
+Before adding or upgrading a channel plugin in OpenClaw Lite, read the
+[OpenClaw Lite Channel Adapter Guide](clawmanager-agent/docs/openclaw-lite-channel-adaptation.md).
+
 ## Manual builds
 
 You can build each runtime image directly with Docker from the repository root.

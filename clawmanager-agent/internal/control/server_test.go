@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	hermesruntime "github.com/iamlovingit/clawmanager-agent/internal/runtime/hermes"
 	"github.com/iamlovingit/clawmanager-agent/internal/runtime/openclaw"
 )
 
@@ -80,6 +81,34 @@ func TestControlHandlerCreatesIdempotentGatewayAndRejectsNoFreePort(t *testing.T
 	eventually(t, func() bool {
 		states := mgr.GatewayStates()
 		return len(states) == 1 && states[0].State == "running" && states[0].PID == 4242
+	})
+}
+
+func TestGatewayManagerSignalsStartingAndRunningStateChanges(t *testing.T) {
+	cfg := testConfig(t)
+	health := newBlockingHealthChecker()
+	mgr := NewGatewayManager(cfg, &fakeStarter{nextPID: 4242}, NewPortAllocator(func(int) bool { return false }))
+	mgr.SetHealthChecker(health)
+
+	req := testGatewayRequest(cfg.WorkspaceRoot, 125, 45, 7)
+	if _, err := mgr.CreateGateway(context.Background(), req); err != nil {
+		t.Fatalf("CreateGateway() error = %v", err)
+	}
+	select {
+	case <-mgr.GatewayStateChanges():
+	case <-time.After(time.Second):
+		t.Fatal("starting state change was not signaled")
+	}
+
+	health.succeed()
+	select {
+	case <-mgr.GatewayStateChanges():
+	case <-time.After(time.Second):
+		t.Fatal("running state change was not signaled")
+	}
+	eventually(t, func() bool {
+		states := mgr.GatewayStates()
+		return len(states) == 1 && states[0].State == "running"
 	})
 }
 
@@ -165,6 +194,60 @@ func TestManagerReportsCapacityFromAvailablePortBlocks(t *testing.T) {
 	heartbeat := mgr.HeartbeatPayload(11)
 	if heartbeat.MaxGateways != 3 || heartbeat.AvailableSlots != 3 {
 		t.Fatalf("HeartbeatPayload capacity = %+v, want max/available 3 from port blocks", heartbeat)
+	}
+}
+
+func TestHermesManagerUsesAdjacentRequestedSinglePorts(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.RuntimeType = "hermes"
+	cfg.Runtime = hermesruntime.NewProfile("hermes")
+	cfg.GatewayPortStart = 20000
+	cfg.GatewayPortEnd = 20003
+	cfg.GatewayPortBlockSize = 1
+	cfg.GatewayCommand = []string{"start-hermes-dashboard-gateway"}
+	starter := &fakeStarter{nextPID: 4242}
+	mgr := NewGatewayManager(cfg, starter, NewPortAllocator(func(int) bool { return false }))
+
+	for offset := 0; offset < 2; offset++ {
+		instanceID := 70 + offset
+		requestedPort := 20000 + offset
+		req := CreateGatewayRequest{
+			InstanceID:    instanceID,
+			UserID:        45,
+			AgentType:     "hermes",
+			WorkspacePath: filepath.Join(cfg.WorkspaceRoot, "hermes", "user-45", "instance-"+itoa(instanceID)),
+			GatewayPort:   requestedPort,
+			PortRange:     PortRange{Start: 20000, End: 20003},
+			UID:           200000 + instanceID,
+			GID:           200000 + instanceID,
+			Generation:    1,
+		}
+		resp, err := mgr.CreateGateway(context.Background(), req)
+		if err != nil {
+			t.Fatalf("CreateGateway(%d) error = %v", instanceID, err)
+		}
+		if resp.Port != requestedPort {
+			t.Fatalf("CreateGateway(%d).Port = %d, want %d", instanceID, resp.Port, requestedPort)
+		}
+	}
+
+	eventually(t, func() bool { return starter.startCount() == 2 })
+	startedPorts := map[int]struct{}{}
+	for index := 0; index < 2; index++ {
+		spec := starter.startedSpec(index)
+		if spec.Port != 20000 && spec.Port != 20001 {
+			t.Fatalf("Hermes GatewayStartSpec[%d].Port = %d, want 20000 or 20001", index, spec.Port)
+		}
+		if _, exists := startedPorts[spec.Port]; exists {
+			t.Fatalf("Hermes requested port %d started more than once", spec.Port)
+		}
+		startedPorts[spec.Port] = struct{}{}
+		if got := envValue(spec.Env, "CLAWMANAGER_GATEWAY_PORT"); got != strconv.Itoa(spec.Port) {
+			t.Fatalf("Hermes CLAWMANAGER_GATEWAY_PORT = %q, want %d", got, spec.Port)
+		}
+		if got := envValue(spec.Env, "PORT"); got != strconv.Itoa(spec.Port) {
+			t.Fatalf("Hermes PORT = %q, want %d", got, spec.Port)
+		}
 	}
 }
 
@@ -306,17 +389,25 @@ func TestCreateGatewayWritesConfigPassesTokenAndDoesNotReportRunningWhenOriginPr
 	mgr := NewGatewayManager(cfg, starter, NewPortAllocator(func(int) bool { return false }))
 	mgr.SetHealthChecker(health)
 
-	resp, err := mgr.CreateGateway(context.Background(), testGatewayRequest(cfg.WorkspaceRoot, 63, 45, 7))
+	req := testGatewayRequest(cfg.WorkspaceRoot, 63, 45, 7)
+	req.GatewayPort = 20003
+	resp, err := mgr.CreateGateway(context.Background(), req)
 	if err != nil {
 		t.Fatalf("CreateGateway() error = %v, want async starting response", err)
 	}
 	if resp.Status != "starting" {
 		t.Fatalf("CreateGateway().Status = %q, want starting", resp.Status)
 	}
+	if resp.Port != 20003 {
+		t.Fatalf("CreateGateway().Port = %d, want requested 20003", resp.Port)
+	}
 	eventually(t, func() bool { return starter.startCount() == 1 })
 	spec := starter.startedSpec(0)
 	if !stringSlicesEqual(spec.Command, cfg.GatewayCommand) {
 		t.Fatalf("gateway command = %#v, want %#v", spec.Command, cfg.GatewayCommand)
+	}
+	if spec.Port != 20003 {
+		t.Fatalf("GatewayStartSpec.Port = %d, want requested 20003", spec.Port)
 	}
 	if got := envValue(spec.Env, "OPENCLAW_GATEWAY_TOKEN"); got != "" {
 		t.Fatalf("OPENCLAW_GATEWAY_TOKEN = %q, want removed for trusted-proxy auth", got)
@@ -335,6 +426,9 @@ func TestCreateGatewayWritesConfigPassesTokenAndDoesNotReportRunningWhenOriginPr
 	if !bytes.Contains(data, []byte(`"basePath": "/api/v1/instances/63/proxy"`)) {
 		t.Fatalf("OpenClaw config missing instance proxy basePath: %s", string(data))
 	}
+	if !bytes.Contains(data, []byte(`"port": 20003`)) {
+		t.Fatalf("OpenClaw config missing requested gateway port: %s", string(data))
+	}
 
 	eventually(t, func() bool {
 		states := mgr.GatewayStates()
@@ -343,6 +437,40 @@ func TestCreateGatewayWritesConfigPassesTokenAndDoesNotReportRunningWhenOriginPr
 	eventually(t, func() bool { return starter.stopCount() == 1 })
 	if mgr.UsedSlots() != 0 {
 		t.Fatalf("UsedSlots = %d, want failed gateway excluded from capacity", mgr.UsedSlots())
+	}
+}
+
+func TestCreateGatewayReleasesFullPortBlockAfterStartupFailure(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.GatewayPortStart = 20003
+	cfg.GatewayPortEnd = 20005
+	cfg.GatewayPortBlockSize = 3
+	health := &fakeHealthChecker{err: ErrGatewayStartFailed}
+	starter := &fakeStarter{nextPID: 4242}
+	alloc := NewPortAllocator(func(int) bool { return false })
+	mgr := NewGatewayManager(cfg, starter, alloc)
+	mgr.SetHealthChecker(health)
+
+	req := testGatewayRequest(cfg.WorkspaceRoot, 415, 45, 7)
+	req.PortRange = PortRange{Start: 20003, End: 20005}
+	req.GatewayPort = 20003
+	resp, err := mgr.CreateGateway(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateGateway() error = %v, want async starting response", err)
+	}
+	if resp.Port != 20003 || resp.Status != "starting" {
+		t.Fatalf("CreateGateway() = %+v, want starting on requested port 20003", resp)
+	}
+
+	eventually(t, func() bool {
+		states := mgr.GatewayStates()
+		return len(states) == 1 && states[0].State == "error"
+	})
+	if used := alloc.ListUsed(); len(used) != 0 {
+		t.Fatalf("reserved ports after startup failure = %#v, want all block members released", used)
+	}
+	if _, err := alloc.ReserveExact(416, 7, 20003); err != nil {
+		t.Fatalf("ReserveExact() after startup failure error = %v, want released 20003-20005 block", err)
 	}
 }
 

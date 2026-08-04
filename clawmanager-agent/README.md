@@ -40,7 +40,25 @@ Runtime images should install the binary at:
 - `RUNTIME_GATEWAY_COMMAND`: required for unknown or generic runtime types
 - `RUNTIME_WORKSPACE_ROOT`: workspace root, defaults to the selected profile
 - `RUNTIME_AGENT_DATA_DIR`: local agent data directory
+- `CLAWMANAGER_OPENCLAW_NPM_RUNTIME_MODE`: OpenClaw npm bootstrap mode. The
+  default `shared` mode creates instance-owned package directories with
+  read-only links to image-provided packages, avoiding a full `node_modules`
+  copy for every gateway. Set it to `copy` to restore the legacy behavior.
+
+The shared npm mode applies only when a new instance npm directory is seeded.
+Existing instance npm directories are preserved. Image-provided packages are
+read-only through their links; installing or replacing a package writes an
+instance-owned override without changing the image defaults.
+
+Gateway state changes trigger an immediate report to ClawManager. An OpenClaw
+instance becomes `running` only after its existing gateway health check passes;
+required config and plugin registry preparation still finish before launch.
 
 ## Extending
 
 Read [Runtime Profile Extension Guide](docs/runtime-profile-extension.md) before adding a new runtime profile.
+
+Read [OpenClaw Lite Channel Adapter Guide](docs/openclaw-lite-channel-adaptation.md)
+before adding or upgrading a channel plugin in the Lite image. It documents the
+shared npm layout, cross-UID permissions, Node peer resolution, readiness
+boundary, rollout checks, and known failure modes.
