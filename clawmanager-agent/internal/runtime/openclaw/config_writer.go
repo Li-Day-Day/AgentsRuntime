@@ -14,6 +14,7 @@ import (
 
 const openClawTrustedProxyUserHeader = "x-forwarded-prefix"
 const openClawTrustedProxyRequiredHeader = "x-forwarded-proto"
+const openClawTrustedProxyDefaultPassword = "9fb3edf4bf38bb834227d41fe9cc1196"
 const openClawAutoProviderName = "auto"
 const openClawRedisTeamPluginID = "redis-team"
 const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR"
@@ -115,6 +116,9 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	} else {
 		auth["mode"] = "trusted-proxy"
 		delete(auth, "token")
+		if strings.TrimSpace(configStringValue(auth["password"])) == "" {
+			auth["password"] = openClawTrustedProxyDefaultPassword
+		}
 		trustedProxy := ensureObject(auth, "trustedProxy")
 		trustedProxy["userHeader"] = openClawTrustedProxyUserHeader
 		trustedProxy["requiredHeaders"] = []string{openClawTrustedProxyRequiredHeader}
