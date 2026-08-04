@@ -5,6 +5,7 @@ package gateway
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -20,6 +21,15 @@ func TestPrepareLiteTeamSharedWorkspaceRepairsPermissionsAndCreatesInstanceAlias
 	if err := os.WriteFile(file, []byte("ok"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	ownerBeforeInfo, err := os.Stat(nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerBefore, ok := ownerBeforeInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("nested stat type before preparation = %T", ownerBeforeInfo.Sys())
+	}
+	ownerUIDBefore := ownerBefore.Uid
 	req := CreateGatewayRequest{
 		AgentType: "openclaw",
 		UserID:    1,
@@ -41,6 +51,13 @@ func TestPrepareLiteTeamSharedWorkspaceRepairsPermissionsAndCreatesInstanceAlias
 	}
 	if dirInfo.Mode().Perm()&0o020 == 0 || dirInfo.Mode()&os.ModeSetgid == 0 {
 		t.Fatalf("nested directory mode = %v, want group-write and setgid", dirInfo.Mode())
+	}
+	dirStat, ok := dirInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("nested stat type after preparation = %T", dirInfo.Sys())
+	}
+	if dirStat.Uid != ownerUIDBefore {
+		t.Fatalf("nested directory uid changed from %d to %d", ownerUIDBefore, dirStat.Uid)
 	}
 	fileInfo, err := os.Stat(file)
 	if err != nil {
@@ -91,5 +108,47 @@ func TestPrepareLiteTeamSharedWorkspacePreservesNonEmptyPrivateDirectory(t *test
 	}
 	if target, err := os.Readlink(privateDir); err != nil || filepath.Clean(target) != filepath.Clean(shared) {
 		t.Fatalf("Team alias target=%q err=%v", target, err)
+	}
+}
+
+func TestPrepareLiteTeamSharedWorkspaceRepairsHermesWorkerParentOwnership(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "hermes", "user-1", "instance-117")
+	shared := filepath.Join(root, "teams", "user-1", "team-117-shared")
+	workerRoot := filepath.Join(workspace, "home", ".clawmanager-team-worker")
+	if err := os.MkdirAll(filepath.Join(workerRoot, ".hermes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(workerRoot, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	req := CreateGatewayRequest{
+		AgentType: "hermes",
+		UserID:    1,
+		UID:       os.Getuid(),
+		GID:       os.Getgid(),
+		Environment: map[string]string{
+			"CLAWMANAGER_TEAM_ENABLED":    "true",
+			"CLAWMANAGER_TEAM_ID":         "117",
+			"CLAWMANAGER_TEAM_MEMBER_ID":  "developer",
+			"CLAWMANAGER_TEAM_SHARED_DIR": shared,
+		},
+	}
+	if err := PrepareLiteTeamSharedWorkspace(root, req, workspace); err != nil {
+		t.Fatalf("PrepareLiteTeamSharedWorkspace() error = %v", err)
+	}
+	info, err := os.Stat(workerRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("worker root stat type = %T", info.Sys())
+	}
+	if int(stat.Uid) != req.UID || int(stat.Gid) != req.GID {
+		t.Fatalf("worker root owner = %d:%d, want %d:%d", stat.Uid, stat.Gid, req.UID, req.GID)
+	}
+	if info.Mode().Perm() != 0o750 {
+		t.Fatalf("worker root mode = %v, want 0750", info.Mode())
 	}
 }

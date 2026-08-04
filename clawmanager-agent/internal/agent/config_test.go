@@ -136,6 +136,31 @@ func TestLoadConfigFromEnvUsesHermesProfile(t *testing.T) {
 	}
 }
 
+func TestLoadConfigFromEnvUsesWindowsVMProfile(t *testing.T) {
+	t.Setenv("CLAWMANAGER_RUNTIME_TYPE", "windows-vm")
+	t.Setenv("RUNTIME_AGENT_CONTROL_TOKEN", "control-token")
+	t.Setenv("RUNTIME_AGENT_REPORT_TOKEN", "report-token")
+	t.Setenv("CLAWMANAGER_RUNTIME_IMAGE_REF", "local/windows-vm:dev")
+
+	cfg, err := LoadConfigFromEnv()
+	if err != nil {
+		t.Fatalf("LoadConfigFromEnv() error = %v", err)
+	}
+	if cfg.Runtime == nil || cfg.Runtime.Type() != "windows-vm" {
+		t.Fatalf("Runtime profile = %#v, want windows-vm profile", cfg.Runtime)
+	}
+	if cfg.Capacity != 1 {
+		t.Fatalf("Capacity = %d, want 1", cfg.Capacity)
+	}
+	if cfg.GatewayPortStart != 8006 || cfg.GatewayPortEnd != 8006 {
+		t.Fatalf("gateway port range = %d-%d, want 8006-8006", cfg.GatewayPortStart, cfg.GatewayPortEnd)
+	}
+	wantCommand := []string{"/usr/local/bin/windows-vm-gateway"}
+	if !stringSlicesEqual(cfg.GatewayCommand, wantCommand) {
+		t.Fatalf("GatewayCommand = %#v, want %#v", cfg.GatewayCommand, wantCommand)
+	}
+}
+
 func TestLoadConfigFromEnvAllowsUnknownRuntimeWithExplicitCommand(t *testing.T) {
 	t.Setenv("CLAWMANAGER_RUNTIME_TYPE", "custom-runtime")
 	t.Setenv("RUNTIME_AGENT_CONTROL_TOKEN", "control-token")

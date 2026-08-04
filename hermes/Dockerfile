@@ -104,9 +104,9 @@ RUN set -eux; \
     rm -rf /root/.cache /root/.npm /tmp/*
 
 COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
-# Canonical source lives at plugins/hermes-redis-team. This vendor copy keeps
-# the Hermes image build independent from plugin workspace layout changes.
-COPY hermes/vendor-plugins/redis_team/ /tmp/hermes-vendor-plugins/redis_team/
+# Package the canonical adapter directly so the image and its contract tests
+# cannot drift through a second copied source tree.
+COPY plugins/hermes-redis-team/ /tmp/hermes-vendor-plugins/redis_team/
 COPY hermes/rootfs/ /
 
 ENV SHELL=/bin/bash

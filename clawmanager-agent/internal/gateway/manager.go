@@ -216,11 +216,47 @@ func (m *GatewayManager) startGatewayInBackground(gatewayID string, req CreateGa
 	}
 
 	phaseStartedAt = time.Now()
-	if err := m.health.WaitReady(context.Background(), spec); err != nil {
-		log.Printf("runtime-agent gateway startup failed: gateway_id=%s instance_id=%d phase=wait_ready phase_ms=%d total_ms=%d error=%v", gatewayID, req.InstanceID, time.Since(phaseStartedAt).Milliseconds(), time.Since(startedAt).Milliseconds(), err)
-		m.stopProcessAsync(process)
-		m.markGatewayError(gatewayID, process.PID, fmt.Errorf("%w: %v", ErrGatewayStartFailed, err))
-		return
+	healthCtx, cancelHealth := context.WithCancel(context.Background())
+	healthResult := make(chan error, 1)
+	go func() {
+		healthResult <- m.health.WaitReady(healthCtx, spec)
+	}()
+	if process.Done != nil {
+		select {
+		case processErr := <-process.Done:
+			cancelHealth()
+			if processErr == nil {
+				processErr = fmt.Errorf("gateway process exited before readiness")
+			}
+			m.markGatewayError(gatewayID, process.PID, fmt.Errorf("%w: %v", ErrGatewayStartFailed, processErr))
+			return
+		case healthErr := <-healthResult:
+			cancelHealth()
+			if healthErr != nil {
+				log.Printf("runtime-agent gateway startup failed: gateway_id=%s instance_id=%d phase=wait_ready phase_ms=%d total_ms=%d error=%v", gatewayID, req.InstanceID, time.Since(phaseStartedAt).Milliseconds(), time.Since(startedAt).Milliseconds(), healthErr)
+				m.stopProcessAsync(process)
+				m.markGatewayError(gatewayID, process.PID, fmt.Errorf("%w: %v", ErrGatewayStartFailed, healthErr))
+				return
+			}
+		}
+		select {
+		case processErr := <-process.Done:
+			if processErr == nil {
+				processErr = fmt.Errorf("gateway process exited at readiness boundary")
+			}
+			m.markGatewayError(gatewayID, process.PID, fmt.Errorf("%w: %v", ErrGatewayStartFailed, processErr))
+			return
+		default:
+		}
+	} else {
+		healthErr := <-healthResult
+		cancelHealth()
+		if healthErr != nil {
+			log.Printf("runtime-agent gateway startup failed: gateway_id=%s instance_id=%d phase=wait_ready phase_ms=%d total_ms=%d error=%v", gatewayID, req.InstanceID, time.Since(phaseStartedAt).Milliseconds(), time.Since(startedAt).Milliseconds(), healthErr)
+			m.stopProcessAsync(process)
+			m.markGatewayError(gatewayID, process.PID, fmt.Errorf("%w: %v", ErrGatewayStartFailed, healthErr))
+			return
+		}
 	}
 	healthDuration := time.Since(phaseStartedAt)
 	m.markGatewayRunning(gatewayID, req, process.PID)

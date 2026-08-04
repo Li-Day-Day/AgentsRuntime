@@ -8,8 +8,9 @@ This plugin connects an OpenClaw runtime managed by ClawManager to a Redis Strea
 - Exposes `team_send` for assigning work to another team member.
 - Exposes `team_status` for reading member status snapshots from the shared Team directory.
 - Exposes `team_update_progress` and `team_complete_task` for structured progress/result reporting.
-- Exposes `team_artifact_write`, `team_artifact_read`, `team_artifact_list`, and
-  `team_artifact_mkdir` for current-Team scoped artifact operations.
+- Exposes `team_artifact_write`, `team_artifact_read`, `team_artifact_preview`,
+  `team_artifact_list`, and `team_artifact_mkdir` for current-Team scoped
+  artifact operations.
 - Writes small events to Redis and writes durable task/status/result files under the shared Team directory.
 - Attempts to run inbound tasks through OpenClaw embedded agent runtime helper when available.
 - Persists one member-scoped active assignment lease under the private runtime
@@ -63,12 +64,17 @@ camelCase and snake_case id fields.
 
 ## Completion protocol
 
-Redis Team protocol v3 keeps the original wire schema (`v: 1`) for older
-ClawManager releases and adds a backend acknowledgement handshake. A normal
-assistant reply or successful agent turn is progress, not task completion. An
-explicit `team_complete_task` call emits `completion_proposed`; the runtime
-marks the task terminal and locks the stable `completionId` only after
-ClawManager returns an `accepted` acknowledgement. Deferred and rejected
+Redis Team protocol v4 keeps the original wire schema (`v: 1`), event names,
+and strict completion fields for older ClawManager releases. It publishes
+runtime capabilities in events and status snapshots. An explicit
+`team_complete_task` call emits `completion_proposed`. If an ordinary successful
+Agent turn returns one usable final answer without calling that tool, the
+Runtime submits the same strict proposal automatically; it does not emit a
+trusted `task_completed` reply. ClawManager still validates the current
+assignment, review, phase, artifact, and root ledger before accepting it.
+Interim, monitor, recovery, or outbound-assignment turns are never promoted.
+The runtime marks the task terminal and locks the stable `completionId` only
+after ClawManager returns an `accepted` acknowledgement. Deferred and rejected
 attempts keep the assignment retryable. Runtime errors still emit a structured
 `task_failed` event.
 
