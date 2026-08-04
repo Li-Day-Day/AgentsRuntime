@@ -57,6 +57,7 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 	env = setEnv(env, "HOST", "0.0.0.0")
 	env = setEnv(env, "PORT", strconv.Itoa(port))
 	env = setEnv(env, "HERMES_ACCEPT_HOOKS", "1")
+	env = applyDashboardBasicAuthEnv(env, cfg, req)
 	env = unsetEnv(
 		env,
 		"RUNTIME_AGENT_CONTROL_TOKEN",
@@ -70,6 +71,51 @@ func (p Profile) GatewayEnv(base []string, cfg gateway.Config, req gateway.Creat
 	} else if cfg.GatewayToken != "" {
 		env = setEnv(env, "RUNTIME_GATEWAY_TOKEN", cfg.GatewayToken)
 	}
+	return env
+}
+
+// applyDashboardBasicAuthEnv ensures Hermes can bind HOST=0.0.0.0 without the
+// deprecated --insecure flag. Password priority:
+//  1. existing HERMES_DASHBOARD_BASIC_AUTH_PASSWORD / PASSWORD_HASH from request env
+//  2. cfg.GatewayToken
+//  3. create-request access token aliases (CLAWMANAGER_DASHBOARD_BASIC_AUTH_PASSWORD,
+//     CLAWMANAGER_INSTANCE_ACCESS_TOKEN, CLAWMANAGER_INSTANCE_TOKEN, CLAWMANAGER_LLM_API_KEY,
+//     OPENAI_API_KEY, CLAWMANAGER_GATEWAY_TOKEN)
+// Username defaults to "clawmanager" unless already set.
+func applyDashboardBasicAuthEnv(env []string, cfg gateway.Config, req gateway.CreateGatewayRequest) []string {
+	username, hasUsername := requestEnvValue(req, "HERMES_DASHBOARD_BASIC_AUTH_USERNAME")
+	password, hasPassword := requestEnvValue(req, "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD")
+	_, hasPasswordHash := requestEnvValue(req, "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH")
+	if hasPassword || hasPasswordHash {
+		if !hasUsername || strings.TrimSpace(username) == "" {
+			env = setEnv(env, "HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "clawmanager")
+		}
+		return env
+	}
+
+	password = strings.TrimSpace(cfg.GatewayToken)
+	if password == "" {
+		if value, ok := requestEnvValue(
+			req,
+			"CLAWMANAGER_DASHBOARD_BASIC_AUTH_PASSWORD",
+			"CLAWMANAGER_INSTANCE_ACCESS_TOKEN",
+			"CLAWMANAGER_INSTANCE_TOKEN",
+			"CLAWMANAGER_LLM_API_KEY",
+			"OPENAI_API_KEY",
+			"CLAWMANAGER_GATEWAY_TOKEN",
+		); ok {
+			password = strings.TrimSpace(value)
+		}
+	}
+	if password == "" {
+		return env
+	}
+
+	if !hasUsername || strings.TrimSpace(username) == "" {
+		username = "clawmanager"
+	}
+	env = setEnv(env, "HERMES_DASHBOARD_BASIC_AUTH_USERNAME", username)
+	env = setEnv(env, "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", password)
 	return env
 }
 
