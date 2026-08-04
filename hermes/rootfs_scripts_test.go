@@ -19,11 +19,75 @@ func TestDashboardGatewayScriptStartsRedisTeamConsumerWhenAutorunEnabled(t *test
 		"CLAWMANAGER_TEAM_REDIS_URL",
 		"CLAWMANAGER_TEAM_ID",
 		"CLAWMANAGER_TEAM_MEMBER_ID",
+		"HERMES_TEAM_WORKER_PORT",
+		"HERMES_TEAM_WORKER_HOME",
+		`.clawmanager-team-worker`,
+		`export HERMES_HOME="${team_worker_home}/.hermes"`,
+		`export CLAWMANAGER_GATEWAY_PORT="${team_worker_port}"`,
+		`CLAWMANAGER_TEAM_READY_FILE`,
+		`[ "${team_worker_port}" -eq "${port}" ]`,
+		`[ "${team_worker_port}" -gt 65535 ]`,
+		`/usr/local/bin/hermes-apply-runtime-config`,
+		`for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md`,
+		`HERMES_GATEWAY_BUSY_INPUT_MODE="${HERMES_TEAM_BUSY_INPUT_MODE:-queue}"`,
+		`HERMES_GATEWAY_BUSY_TEXT_MODE="${HERMES_TEAM_BUSY_TEXT_MODE:-queue}"`,
+		`HERMES_GATEWAY_BUSY_ACK_ENABLED="${HERMES_TEAM_BUSY_ACK_ENABLED:-false}"`,
 		"hermes gateway run --accept-hooks --no-supervise",
+		`wait -n "${wait_pids[@]}"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("start-hermes-dashboard-gateway missing %q", want)
 		}
+	}
+	if strings.Count(script, "HERMES_GATEWAY_BUSY_TEXT_MODE") != 1 {
+		t.Fatal("Team busy-text mode must be scoped to the isolated Team gateway only")
+	}
+	teamStart := strings.LastIndex(script, "start_team_gateway")
+	dashboardStart := strings.LastIndex(script, `echo "Starting Hermes dashboard gateway`)
+	startupStateClear := strings.LastIndex(script, "prepare_team_startup_state")
+	waitStart := strings.LastIndex(script, `wait -n "${wait_pids[@]}"`)
+	if startupStateClear < 0 || dashboardStart < 0 || teamStart < 0 || waitStart < 0 ||
+		startupStateClear > dashboardStart || dashboardStart > teamStart || teamStart > waitStart {
+		t.Fatalf("dashboard and isolated Team consumer must both start before lifecycle supervision")
+	}
+	if strings.Contains(script, `while true; do`) &&
+		strings.Contains(script, `Hermes Redis Team consumer did not become ready`) {
+		t.Fatal("dashboard startup is still serialized behind the Team consumer readiness loop")
+	}
+}
+
+func TestDashboardGatewayScriptReusesValidatedManagedBundledSkills(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("rootfs", "usr", "local", "bin", "start-hermes-dashboard-gateway"))
+	if err != nil {
+		t.Fatalf("read start-hermes-dashboard-gateway: %v", err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		`prepare_managed_bundled_skills`,
+		`/config/.hermes/skills`,
+		`.no-bundled-skills`,
+		`.clawmanager-managed-bundled-skills`,
+		`find "${bundled_root}"`,
+		`[ -f "${opt_out_marker}" ] && [ ! -f "${managed_marker}" ]`,
+		`rm -f "${opt_out_marker}" "${managed_marker}"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("start-hermes-dashboard-gateway missing managed skill fallback %q", want)
+		}
+	}
+}
+
+func TestDockerfilePackagesCanonicalRedisTeamAdapter(t *testing.T) {
+	data, err := os.ReadFile("Dockerfile")
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	dockerfile := string(data)
+	if !strings.Contains(dockerfile, "COPY plugins/hermes-redis-team/ /tmp/hermes-vendor-plugins/redis_team/") {
+		t.Fatal("Dockerfile does not package the canonical Hermes Redis Team adapter")
+	}
+	if strings.Contains(dockerfile, "COPY hermes/vendor-plugins/redis_team/") {
+		t.Fatal("Dockerfile still packages the stale vendor mirror")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,6 +22,7 @@ const openClawAutoProviderName = "auto"
 const openClawRedisTeamPluginID = "redis-team"
 const openClawRedisTeamPluginDirEnv = "CLAWMANAGER_OPENCLAW_REDIS_TEAM_PLUGIN_DIR"
 const openClawBrowserExecutablePath = "/usr/bin/chromium"
+const openClawBrowserProxyEnv = "CLAWMANAGER_BROWSER_PROXY_URL"
 const openClawManagedBrowserProfile = "openclaw"
 const openClawManagedBrowserColor = "#FF4500"
 const openClawChannelsEnv = "CLAWMANAGER_OPENCLAW_CHANNELS_JSON"
@@ -92,7 +94,7 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("read openclaw config: %w", err)
 	}
-	configureManagedOpenClawBrowser(config, port)
+	configureManagedOpenClawBrowser(config, req, port)
 	mergeOpenClawLiteDefaults(config)
 	if err := mergeOpenClawChannelsFromRequest(config, req); err != nil {
 		return err
@@ -198,8 +200,9 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 // configureManagedOpenClawBrowser supplies the safe Lite runtime defaults that
 // are present in the image template without replacing an instance's explicit
 // browser choices. The managed local openclaw profile always receives the CDP
-// port allocated inside this gateway's 3-port block.
-func configureManagedOpenClawBrowser(config map[string]any, gatewayPort int) {
+// port allocated inside this gateway's 3-port block. Team workers can also be
+// forced through ClawManager's managed egress proxy when that proxy is present.
+func configureManagedOpenClawBrowser(config map[string]any, req gateway.CreateGatewayRequest, gatewayPort int) {
 	browser := ensureObject(config, "browser")
 	setDefaultObjectValue(browser, "enabled", true)
 	setDefaultObjectValue(browser, "executablePath", openClawBrowserExecutablePath)
@@ -211,6 +214,66 @@ func configureManagedOpenClawBrowser(config map[string]any, gatewayPort int) {
 	profile["driver"] = "openclaw"
 	profile["cdpPort"] = gatewayPort + 1
 	setDefaultObjectValue(profile, "color", openClawManagedBrowserColor)
+
+	proxyURL, managed := managedOpenClawBrowserProxy(req)
+	if !managed {
+		return
+	}
+
+	// Team workers must all have a functioning Browser. Chromium is forced
+	// through ClawManager's DNS-pinning egress proxy, so OpenClaw may permit
+	// the proxy's internal service address without exposing arbitrary pod or
+	// cluster addresses to the page being reviewed.
+	browser["enabled"] = true
+	browser["executablePath"] = openClawBrowserExecutablePath
+	browser["headless"] = true
+	browser["noSandbox"] = true
+	browser["extraArgs"] = managedOpenClawBrowserArgs(browser["extraArgs"], proxyURL)
+	ssrfPolicy := ensureObject(browser, "ssrfPolicy")
+	ssrfPolicy["dangerouslyAllowPrivateNetwork"] = true
+}
+
+func managedOpenClawBrowserProxy(req gateway.CreateGatewayRequest) (string, bool) {
+	if !teamEnabledFromRequest(req) {
+		return "", false
+	}
+	raw, explicitlyManaged := requestEnvValue(req, openClawBrowserProxyEnv)
+	if !explicitlyManaged {
+		raw, _ = requestEnvValue(req, "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+	}
+	raw = strings.TrimSpace(raw)
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || strings.TrimSpace(parsed.Host) == "" {
+		return "", false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host != "clawmanager-egress-proxy" && !strings.HasPrefix(host, "clawmanager-egress-proxy.") {
+		return "", false
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return strings.TrimRight(parsed.String(), "/"), true
+}
+
+func managedOpenClawBrowserArgs(existing any, proxyURL string) []string {
+	current := appendUniqueStringArray(existing)
+	filtered := make([]string, 0, len(current)+4)
+	for _, argument := range current {
+		normalized := strings.ToLower(strings.TrimSpace(argument))
+		if normalized == "--no-proxy-server" ||
+			strings.HasPrefix(normalized, "--proxy-") {
+			continue
+		}
+		filtered = append(filtered, argument)
+	}
+	return append(filtered,
+		"--proxy-server="+proxyURL,
+		"--proxy-bypass-list=<-loopback>",
+		"--disable-quic",
+		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+	)
 }
 
 func setDefaultObjectValue(object map[string]any, key string, value any) {

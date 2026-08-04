@@ -61,7 +61,10 @@ for (const token of [
   "completionSource",
   "explicitCompletion",
   "WIRE_SCHEMA_VERSION = 1",
-  "PROTOCOL_VERSION = 3",
+  "PROTOCOL_VERSION = 4",
+  "automatic_turn_completion_v1",
+  "automaticTurnResult",
+  "CONTROL_PLANE_REPLY_TARGETS",
   "completion_proposed",
   "waitForCompletionAcknowledgement",
   "waitForTerminalCompletionState",
@@ -69,6 +72,8 @@ for (const token of [
   "artifact_changed",
   "waivers",
   "skippedAssignments",
+  "phaseDispositions",
+  "explicit-disposition-v1",
   "completion_pending",
   "waiting_completion",
   "resultMarkdown",
@@ -78,6 +83,7 @@ for (const token of [
   "assignment-",
   "team_artifact_write",
   "team_artifact_read",
+  "team_artifact_preview",
   "team_artifact_list",
   "team_artifact_mkdir",
   "assertNoArtifactSymlinkTraversal",
@@ -86,7 +92,13 @@ for (const token of [
   "sharedWorkspaceForTarget",
   "artifactRootTaskId",
   "collectRootTaskArtifactRefs",
-  "kind=plan, kind=review, or kind=final",
+  "kind=plan, kind=context, kind=review, or kind=final",
+  "assignment_activity_v1",
+  "startAssignmentActivityObserver",
+  "Authoritative assignment artifact canonical root:",
+  "Shared research rule:",
+  "Current-root shared work physical root:",
+  "taskWorkPhysicalRoot",
   "canonicalTeamArtifactRefsFromText",
   "artifactMetadataForRefs",
   "teamResultContentHash",
@@ -100,20 +112,32 @@ for (const token of [
   "nextOffset:",
   "eventKind: \"agent_narrative\"",
   "assistant_session",
+  "readAssistantNarrativesFromDispatch",
+  "sourceOccurredAt",
+  "lateProjection",
+  "semanticEventKind",
+  "leader-final-synthesis",
+  "Available Team artifact references:",
   "already_terminal",
   "suppressed duplicate reply after submitted completion",
   "resolveRedisTeamVerificationRole",
   "Evidence verification policy:",
   "Code review policy:",
   "API verification policy:",
-  "attempt Browser startup at most twice",
-  "at most 45 seconds total on Browser setup",
-  "Never install or download browsers",
+  "reviewerBrowserToolDecision",
+  "browserToolCallFailed",
+  "Team artifact Browser preview",
+  "single brief Browser verification budget is exhausted",
+  "ignored late assignment for terminal root before Agent dispatch",
+  "reviewVerdict",
 ]) {
   if (!dist.includes(token)) throw new Error(`dist/index.js missing Redis Team completion token: ${token}`);
 }
 if (dist.includes("params.taskId === activeEnvelope.taskId")) {
   throw new Error("dist/index.js must match active Redis Team task ids through aliases");
+}
+if (dist.includes("browserVerification=unavailable")) {
+  throw new Error("Reviewer guidance must not expose browserVerification=unavailable as a user-facing verdict");
 }
 const verificationRoleResolverStart = dist.indexOf("function resolveRedisTeamVerificationRole");
 const verificationRoleResolverEnd = dist.indexOf("function redisTeamVerificationGuidance", verificationRoleResolverStart);
@@ -136,10 +160,17 @@ if (dist.includes('path.join(cfg.sharedDir, ".openclaw-redis-team", "tasks"')) {
 if (dist.includes('|| "unscoped"')) {
   throw new Error("member Team artifacts must reject missing root task context instead of writing an unscoped path");
 }
-const reviewerGuard = dist.indexOf('kind === "review" && reviewer');
-const genericTeamScopeRejection = dist.indexOf("Only the Team Leader may write team-scoped artifacts");
-if (reviewerGuard < 0 || genericTeamScopeRejection < 0 || reviewerGuard > genericTeamScopeRejection) {
-  throw new Error("Reviewer/QA review publishing must be handled by the team-scope guard");
+const validationWriterHelper = dist.indexOf("function isAssignedValidationWriter");
+const validationWriterGuard = dist.indexOf('kind === "review" && isAssignedValidationWriter(cfg, activeEnvelope)');
+const genericTeamScopeRejection = dist.indexOf("Only the Team Leader or assigned validator may write this team-scoped artifact");
+if (
+  validationWriterHelper < 0 ||
+  validationWriterGuard < 0 ||
+  genericTeamScopeRejection < 0 ||
+  validationWriterHelper > validationWriterGuard ||
+  validationWriterGuard > genericTeamScopeRejection
+) {
+  throw new Error("Assigned validation publishing must be handled by the team-scope guard");
 }
 const deliverStart = dist.indexOf("deliver: async (payload) => {");
 const deliverEnd = dist.indexOf("onRecordError:", deliverStart);
@@ -151,7 +182,7 @@ if (deliverBody.includes("completeActiveTask") || deliverBody.includes('"task_co
 if (!deliverBody.includes("runtime.isActiveTaskCompleted")) {
   throw new Error("normal Redis Team replies must be suppressed after explicit completion");
 }
-for (const tool of ["team_artifact_write", "team_artifact_read", "team_artifact_list", "team_artifact_mkdir"]) {
+for (const tool of ["team_artifact_write", "team_artifact_read", "team_artifact_preview", "team_artifact_list", "team_artifact_mkdir"]) {
   if (!manifest.contracts?.tools?.includes(tool)) {
     throw new Error(`openclaw.plugin.json missing tool contract: ${tool}`);
   }

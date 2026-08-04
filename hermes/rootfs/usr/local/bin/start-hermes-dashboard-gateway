@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+umask "${CLAWMANAGER_TEAM_UMASK:-0002}"
+
 export HOME="${HOME:-/config}"
 export HERMES_HOME="${HERMES_HOME:-${HOME}/.hermes}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
@@ -17,7 +19,7 @@ mkdir -p \
     "${XDG_CONFIG_HOME}" \
     "${XDG_DATA_HOME}"
 
-/usr/local/bin/hermes-apply-runtime-config
+/usr/local/bin/hermes-apply-runtime-config >/dev/null 2>&1 || true
 
 env_file="${HERMES_HOME}/.env"
 if [ -f "${env_file}" ]; then
@@ -47,6 +49,18 @@ case "${port}" in
         ;;
 esac
 
+team_worker_port="${HERMES_TEAM_WORKER_PORT:-${CLAWMANAGER_TEAM_WORKER_PORT:-$((port + 10000))}}"
+case "${team_worker_port}" in
+    ''|*[!0-9]*)
+        echo "invalid Hermes Redis Team worker port: ${team_worker_port}" >&2
+        exit 64
+        ;;
+esac
+if [ "${team_worker_port}" -lt 1 ] || [ "${team_worker_port}" -gt 65535 ] || [ "${team_worker_port}" -eq "${port}" ]; then
+    echo "Hermes Redis Team worker port must be distinct and within 1..65535: ${team_worker_port}" >&2
+    exit 64
+fi
+
 truthy() {
     case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
         1|true|yes|y|on|enabled) return 0 ;;
@@ -59,6 +73,43 @@ falsey() {
         0|false|no|n|off|disabled) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+prepare_managed_bundled_skills() {
+    local profile_home="${1:-}"
+    local bundled_root="/config/.hermes/skills"
+    local managed_marker="${profile_home}/.clawmanager-managed-bundled-skills"
+    local opt_out_marker="${profile_home}/.no-bundled-skills"
+    local bundled_skill=""
+
+    if [ -z "${CLAWMANAGER_WORKSPACE_PATH:-}" ] || [ -z "${profile_home}" ]; then
+        return 0
+    fi
+
+    case ":${HERMES_SKILL_DIRS:-}:" in
+        *":${bundled_root}:"*)
+            bundled_skill="$(
+                find "${bundled_root}" -mindepth 2 -maxdepth 2 -type f -name SKILL.md -print -quit 2>/dev/null || true
+            )"
+            ;;
+    esac
+    if [ -n "${bundled_skill}" ]; then
+        if [ -f "${opt_out_marker}" ] && [ ! -f "${managed_marker}" ]; then
+            echo "Hermes profile already opted out of bundled skill seeding"
+            return 0
+        fi
+        if touch "${opt_out_marker}" "${managed_marker}" 2>/dev/null; then
+            echo "Hermes managed Lite profile will reuse bundled skills from ${bundled_root}"
+        else
+            echo "Hermes managed Lite profile could not enable bundled skill reuse; using native profile seeding" >&2
+        fi
+        return 0
+    fi
+
+    if [ -f "${managed_marker}" ]; then
+        rm -f "${opt_out_marker}" "${managed_marker}"
+        echo "Hermes global bundled skills are unavailable; restored native profile seeding"
+    fi
 }
 
 # Newer Hermes ignores --insecure for non-loopback binds; require a dashboard
@@ -112,6 +163,7 @@ should_start_team_gateway() {
 team_gateway_pid=""
 dashboard_pid=""
 agent_pid=""
+team_gateway_required="false"
 
 start_instance_agent() {
     if [ "${CLAWMANAGER_AGENT_ENABLED:-false}" != "true" ]; then
@@ -168,32 +220,96 @@ shutdown() {
 
 trap shutdown INT TERM
 
+prepare_team_startup_state() {
+    local team_ready_file="${CLAWMANAGER_TEAM_READY_FILE:-${HERMES_TEAM_WORKER_HOME:-${HOME}/.clawmanager-team-worker}/.hermes/runtime/redis-team.ready.json}"
+    mkdir -p "$(dirname "${team_ready_file}")"
+    rm -f "${team_ready_file}" "${team_ready_file}.failed"
+}
+
+start_team_gateway() {
+    echo "Preparing Hermes Redis Team consumer: member=${CLAWMANAGER_TEAM_MEMBER_ID} dashboard_port=${port} team_worker_port=${team_worker_port}"
+    (
+        dashboard_hermes_home="${HERMES_HOME}"
+        team_worker_home="${HERMES_TEAM_WORKER_HOME:-${HOME}/.clawmanager-team-worker}"
+        export HOME="${team_worker_home}"
+        export HERMES_HOME="${team_worker_home}/.hermes"
+        export XDG_CACHE_HOME="${team_worker_home}/.cache"
+        export XDG_CONFIG_HOME="${team_worker_home}/.config"
+        export XDG_DATA_HOME="${team_worker_home}/.local/share"
+        export NPM_CONFIG_CACHE="${XDG_CACHE_HOME}/npm"
+        export UV_CACHE_DIR="${XDG_CACHE_HOME}/uv"
+        export CLAWMANAGER_GATEWAY_PORT="${team_worker_port}"
+        export PORT="${team_worker_port}"
+        # Team control-plane packets must never interrupt an active Worker turn.
+        # Approval commands retain Hermes' native bypass path; ordinary follow-ups
+        # are queued and busy acknowledgements stay out of Team chat.
+        export HERMES_GATEWAY_BUSY_INPUT_MODE="${HERMES_TEAM_BUSY_INPUT_MODE:-queue}"
+        export HERMES_GATEWAY_BUSY_TEXT_MODE="${HERMES_TEAM_BUSY_TEXT_MODE:-queue}"
+        export HERMES_GATEWAY_BUSY_ACK_ENABLED="${HERMES_TEAM_BUSY_ACK_ENABLED:-false}"
+        export CLAWMANAGER_TEAM_READY_FILE="${CLAWMANAGER_TEAM_READY_FILE:-${HERMES_HOME}/runtime/redis-team.ready.json}"
+        mkdir -p \
+            "${HERMES_HOME}" \
+            "${NPM_CONFIG_CACHE}" \
+            "${UV_CACHE_DIR}" \
+            "${XDG_CONFIG_HOME}" \
+            "${XDG_DATA_HOME}" \
+            "$(dirname "${CLAWMANAGER_TEAM_READY_FILE}")"
+        for managed_identity in SOUL.md AGENTS.md team.json team-introduction.md; do
+            if [ -f "${dashboard_hermes_home}/${managed_identity}" ] && [ ! -e "${HERMES_HOME}/${managed_identity}" ]; then
+                cp "${dashboard_hermes_home}/${managed_identity}" "${HERMES_HOME}/${managed_identity}"
+            fi
+        done
+        prepare_managed_bundled_skills "${HERMES_HOME}"
+        /usr/local/bin/hermes-apply-runtime-config
+        cd "${team_worker_home}"
+        exec hermes gateway run --accept-hooks --no-supervise
+    ) &
+    team_gateway_pid="$!"
+    echo "Hermes Redis Team consumer started: team_gateway_pid=${team_gateway_pid} team_worker_port=${team_worker_port}"
+    return 0
+}
 
 start_instance_agent
 
 if should_start_team_gateway; then
-    echo "Starting Hermes Redis Team consumer for member ${CLAWMANAGER_TEAM_MEMBER_ID}"
-    (
-        cd "${HOME}"
-        exec hermes gateway run --accept-hooks --no-supervise
-    ) &
-    team_gateway_pid="$!"
+    team_gateway_required="true"
+    prepare_team_startup_state
 fi
 
+prepare_managed_bundled_skills "${HERMES_HOME}"
 ensure_dashboard_basic_auth
-
+echo "Starting Hermes dashboard gateway: dashboard_port=${port} host=${host}"
 hermes dashboard \
     --host "${host}" \
     --port "${port}" \
     --no-open \
     --skip-build &
 dashboard_pid="$!"
+echo "Hermes dashboard gateway started: dashboard_pid=${dashboard_pid} dashboard_port=${port}"
+
+if truthy "${team_gateway_required}"; then
+    start_team_gateway
+fi
+
+wait_pids=("${dashboard_pid}")
+if [ -n "${team_gateway_pid}" ]; then
+    wait_pids+=("${team_gateway_pid}")
+fi
+if [ -n "${team_gateway_pid}" ] && [ -n "${agent_pid}" ]; then
+    wait_pids+=("${agent_pid}")
+fi
 
 set +e
-wait "${dashboard_pid}"
+wait -n "${wait_pids[@]}"
 status="$?"
 set -e
-dashboard_pid=""
+
+if [ "${#wait_pids[@]}" -gt 1 ]; then
+    echo "A required Hermes Team gateway component stopped: status=${status}" >&2
+    if [ "${status}" -eq 0 ]; then
+        status=1
+    fi
+fi
 
 if [ -n "${agent_pid}" ]; then
     kill "${agent_pid}" 2>/dev/null || true
@@ -202,7 +318,13 @@ fi
 
 if [ -n "${team_gateway_pid}" ]; then
     kill "${team_gateway_pid}" 2>/dev/null || true
-    wait "${team_gateway_pid}" 2>/dev/null || true
+    team_status=0
+    wait "${team_gateway_pid}" 2>/dev/null || team_status="$?"
+    echo "Hermes Redis Team consumer stopped: team_gateway_pid=${team_gateway_pid} status=${team_status}"
+fi
+if [ -n "${dashboard_pid}" ]; then
+    kill "${dashboard_pid}" 2>/dev/null || true
+    wait "${dashboard_pid}" 2>/dev/null || true
 fi
 
 exit "${status}"

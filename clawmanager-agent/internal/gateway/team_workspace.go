@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -35,7 +36,76 @@ func PrepareLiteTeamSharedWorkspace(workspaceRoot string, req CreateGatewayReque
 	if err := repairLiteTeamSharedTree(sharedDir, sharedGID); err != nil {
 		return err
 	}
-	return ensureLiteTeamWorkspaceAlias(workspacePath, sharedDir, req)
+	if strings.EqualFold(strings.TrimSpace(req.AgentType), "hermes") {
+		if err := prepareHermesLiteTeamWorkerHome(workspacePath, req); err != nil {
+			return err
+		}
+	}
+	return ensureLiteTeamWorkspaceAliases(workspacePath, sharedDir, req)
+}
+
+func prepareHermesLiteTeamWorkerHome(workspacePath string, req CreateGatewayRequest) error {
+	realWorkspace, err := filepath.EvalSymlinks(workspacePath)
+	if err != nil {
+		return fmt.Errorf("resolve Hermes Team instance workspace: %w", err)
+	}
+	workerHome := filepath.Join(workspacePath, "home", ".clawmanager-team-worker")
+	managedDirectories := []string{
+		workerHome,
+		filepath.Join(workerHome, ".hermes"),
+		filepath.Join(workerHome, ".hermes", "runtime"),
+		filepath.Join(workerHome, ".cache"),
+		filepath.Join(workerHome, ".cache", "npm"),
+		filepath.Join(workerHome, ".cache", "uv"),
+		filepath.Join(workerHome, ".config"),
+		filepath.Join(workerHome, ".local"),
+		filepath.Join(workerHome, ".local", "share"),
+	}
+	for _, directory := range managedDirectories {
+		if !pathWithin(workspacePath, directory) {
+			return fmt.Errorf("Hermes Team worker directory escaped the instance workspace: %s", directory)
+		}
+		if err := os.MkdirAll(directory, 0o750); err != nil {
+			return fmt.Errorf("create Hermes Team worker directory %s: %w", directory, err)
+		}
+		info, err := os.Lstat(directory)
+		if err != nil {
+			return fmt.Errorf("inspect Hermes Team worker directory %s: %w", directory, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("Hermes Team worker path must be a real directory: %s", directory)
+		}
+		realDirectory, err := filepath.EvalSymlinks(directory)
+		if err != nil {
+			return fmt.Errorf("resolve Hermes Team worker directory %s: %w", directory, err)
+		}
+		if !pathWithin(realWorkspace, realDirectory) {
+			return fmt.Errorf("Hermes Team worker directory real path escaped the instance workspace: %s", directory)
+		}
+		if err := ChownWorkspace(directory, req.UID, req.GID); err != nil {
+			return fmt.Errorf("chown Hermes Team worker directory %s: %w", directory, err)
+		}
+		if err := os.Chmod(directory, 0o750); err != nil {
+			return fmt.Errorf("chmod Hermes Team worker directory %s: %w", directory, err)
+		}
+	}
+	readyFile := filepath.Join(workerHome, ".hermes", "runtime", "redis-team.ready.json")
+	for _, startupState := range []string{readyFile, readyFile + ".failed"} {
+		info, err := os.Lstat(startupState)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect stale Hermes Team startup state %s: %w", startupState, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("Hermes Team startup state must be a regular file: %s", startupState)
+		}
+		if err := os.Remove(startupState); err != nil {
+			return fmt.Errorf("remove stale Hermes Team startup state %s: %w", startupState, err)
+		}
+	}
+	return nil
 }
 
 func validateLiteTeamSharedPath(workspaceRoot string, req CreateGatewayRequest, workspacePath, sharedDir string) error {
@@ -89,8 +159,31 @@ func repairLiteTeamSharedTree(root string, gid int) error {
 	})
 }
 
-func ensureLiteTeamWorkspaceAlias(workspacePath, sharedDir string, req CreateGatewayRequest) error {
-	aliasParent := filepath.Join(workspacePath, "home", ".openclaw", "workspace")
+func ensureLiteTeamWorkspaceAliases(workspacePath, sharedDir string, req CreateGatewayRequest) error {
+	parents := liteTeamWorkspaceAliasParents(workspacePath, req.AgentType)
+	for _, aliasParent := range parents {
+		if err := ensureLiteTeamWorkspaceAlias(aliasParent, sharedDir, req); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func liteTeamWorkspaceAliasParents(workspacePath, runtimeType string) []string {
+	switch strings.ToLower(strings.TrimSpace(runtimeType)) {
+	case "openclaw":
+		return []string{filepath.Join(workspacePath, "home", ".openclaw", "workspace")}
+	case "hermes":
+		return []string{
+			filepath.Join(workspacePath, "home", ".hermes"),
+			filepath.Join(workspacePath, "home", ".clawmanager-team-worker", ".hermes"),
+		}
+	default:
+		return nil
+	}
+}
+
+func ensureLiteTeamWorkspaceAlias(aliasParent, sharedDir string, req CreateGatewayRequest) error {
 	if err := os.MkdirAll(aliasParent, 0o750); err != nil {
 		return fmt.Errorf("create Team workspace alias parent: %w", err)
 	}
