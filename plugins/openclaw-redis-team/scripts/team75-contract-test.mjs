@@ -570,6 +570,23 @@ try {
   assert.equal(review.ok, true);
   assert.equal(review.artifact.path, "/team/results/team-75-task-150/reviews/review-01/review-report.md");
   await fs.access(path.join(shared, "results", "team-75-task-150", "reviews", "review-01", "review-report.md"));
+  const inferredCanonicalReview = toolResult(await reviewerTools.get("team_artifact_write").execute("review-canonical", {
+    path: "/team/results/team-75-task-150/reviews/review-01/canonical-review-report.md",
+    content: "# Canonical review report\n\nPASS\n",
+  }));
+  assert.equal(
+    inferredCanonicalReview.artifact.path,
+    "/team/results/team-75-task-150/reviews/review-01/canonical-review-report.md",
+    "the active Reviewer canonical path must infer the non-blocking review contract",
+  );
+  await assert.rejects(
+    () => reviewerTools.get("team_artifact_write").execute("review-wrong-assignment", {
+      path: "/team/results/team-75-task-150/reviews/review-02/wrong-review-report.md",
+      content: "must not be written",
+    }),
+    /outside the active artifact scope/,
+    "canonical inference must not widen a Reviewer to another assignment",
+  );
   const legacyPrefixedReview = toolResult(await reviewerTools.get("team_artifact_write").execute("review-prefixed", {
     scope: "team",
     kind: "review",
@@ -597,6 +614,25 @@ try {
     genericValidationReport.artifact.path,
     "/team/results/team-75-task-150/reviews/audit-01/validation-report.md",
     "an explicitly assigned validator must not depend on a Reviewer role name",
+  );
+  const inferredGenericValidationReport = toolResult(await auditorTools.get("team_artifact_write").execute("audit-canonical", {
+    path: "/team/results/team-75-task-150/reviews/audit-01/canonical-validation-report.md",
+    content: "# Canonical validation report\n\nPASS\n",
+  }));
+  assert.equal(
+    inferredGenericValidationReport.artifact.path,
+    "/team/results/team-75-task-150/reviews/audit-01/canonical-validation-report.md",
+    "an assigned validator canonical path must infer review scope without relying on its role name",
+  );
+  await seedActive("developer", "developer", "dev-02");
+  const scopedDeveloperTools = createHarness("developer", "developer");
+  await assert.rejects(
+    () => scopedDeveloperTools.get("team_artifact_write").execute("developer-review-path", {
+      path: "/team/results/team-75-task-150/reviews/audit-01/developer-review.md",
+      content: "must not be written",
+    }),
+    /outside the active artifact scope/,
+    "a normal member must not inherit the validation writer path contract",
   );
 
   await seedActive("leader", "leader", "review-01");

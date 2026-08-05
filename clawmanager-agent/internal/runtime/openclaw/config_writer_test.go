@@ -130,6 +130,10 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	if model["primary"] != "auto/gpt-5.5" {
 		t.Fatalf("agents.defaults.model.primary = %#v, want injected primary model", model["primary"])
 	}
+	imageModel := objectAt(t, defaults, "imageModel")
+	if imageModel["primary"] != "auto/gpt-5.5" {
+		t.Fatalf("agents.defaults.imageModel.primary = %#v, want managed primary model", imageModel["primary"])
+	}
 	agentModels := objectAt(t, defaults, "models")
 	if _, ok := agentModels["auto/gpt-5.5"]; !ok {
 		t.Fatalf("agents.defaults.models missing auto/gpt-5.5: %#v", agentModels)
@@ -158,6 +162,10 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	}
 	if browser["executablePath"] != openClawBrowserExecutablePath {
 		t.Fatalf("browser.executablePath = %#v, want %s", browser["executablePath"], openClawBrowserExecutablePath)
+	}
+	browserPlugin := objectAt(t, objectAt(t, objectAt(t, merged, "plugins"), "entries"), "browser")
+	if browserPlugin["enabled"] != true {
+		t.Fatalf("plugins.entries.browser.enabled = %#v, want true with enabled browser", browserPlugin["enabled"])
 	}
 	openclawProfile := objectAt(t, objectAt(t, browser, "profiles"), "openclaw")
 	if openclawProfile["driver"] != "openclaw" {
@@ -191,6 +199,27 @@ func TestWriteOpenClawGatewayConfigMergesControlUIWithoutOverwritingExistingConf
 	}
 }
 
+func TestMergeOpenClawLLMConfigPreservesExplicitImageModel(t *testing.T) {
+	config := map[string]any{
+		"agents": map[string]any{
+			"defaults": map[string]any{
+				"imageModel": map[string]any{"primary": "custom/vision-model"},
+			},
+		},
+	}
+	mergeOpenClawLLMConfig(config, Config{
+		LLMBaseURL:   "http://clawmanager.test/api/v1/gateway/llm",
+		LLMAPIKey:    "managed-token",
+		LLMAPIKeySet: true,
+		LLMModelIDs:  []string{"auto"},
+	})
+	defaults := objectAt(t, objectAt(t, config, "agents"), "defaults")
+	imageModel := objectAt(t, defaults, "imageModel")
+	if imageModel["primary"] != "custom/vision-model" {
+		t.Fatalf("agents.defaults.imageModel.primary = %#v, want explicit custom image model preserved", imageModel["primary"])
+	}
+}
+
 func TestWriteOpenClawGatewayConfigCompletesPartialBrowserConfig(t *testing.T) {
 	workspace := filepath.Join(t.TempDir(), "openclaw", "user-45", "instance-64")
 	configPath := filepath.Join(workspace, "home", ".openclaw", "openclaw.json")
@@ -210,6 +239,10 @@ func TestWriteOpenClawGatewayConfigCompletesPartialBrowserConfig(t *testing.T) {
 	browser := objectAt(t, merged, "browser")
 	if browser["enabled"] != false {
 		t.Fatalf("browser.enabled = %#v, want explicit false preserved", browser["enabled"])
+	}
+	browserPlugin := objectAt(t, objectAt(t, objectAt(t, merged, "plugins"), "entries"), "browser")
+	if browserPlugin["enabled"] != false {
+		t.Fatalf("plugins.entries.browser.enabled = %#v, want false with disabled browser", browserPlugin["enabled"])
 	}
 	if browser["profile"] != "team-review" {
 		t.Fatalf("browser.profile = %#v, want preserved custom profile", browser["profile"])
@@ -239,9 +272,14 @@ func TestWriteOpenClawGatewayConfigPreservesExplicitBrowserConfig(t *testing.T) 
 		t.Fatalf("WriteGatewayConfig() error = %v", err)
 	}
 
-	browser := objectAt(t, readOpenClawConfigForTest(t, configPath), "browser")
+	merged := readOpenClawConfigForTest(t, configPath)
+	browser := objectAt(t, merged, "browser")
 	if browser["enabled"] != false || browser["executablePath"] != "/opt/custom-browser" || browser["headless"] != false || browser["noSandbox"] != false {
 		t.Fatalf("explicit browser config was overwritten: %#v", browser)
+	}
+	browserPlugin := objectAt(t, objectAt(t, objectAt(t, merged, "plugins"), "entries"), "browser")
+	if browserPlugin["enabled"] != false {
+		t.Fatalf("plugins.entries.browser.enabled = %#v, want false with explicit browser disable", browserPlugin["enabled"])
 	}
 }
 

@@ -634,6 +634,33 @@ function assertTeamArtifactWriteScope(cfg, params, activeEnvelope) {
   }
 }
 
+function inferCanonicalArtifactWriteContract(cfg, params, activeEnvelope) {
+  const current = params || {};
+  const explicitScope = trim(current.scope);
+  const explicitKind = trim(current.kind || current.artifactKind || current.artifact_kind);
+  if (explicitScope || explicitKind || !activeEnvelope || !isAssignedValidationWriter(cfg, activeEnvelope)) {
+    return current;
+  }
+
+  const rawPath = trim(current.path).replaceAll("\\", "/");
+  let relative = rawPath;
+  if (relative.startsWith("/team/")) relative = relative.slice("/team/".length);
+  if (!relative.startsWith("results/") || relative.split("/").includes("..")) return current;
+
+  // Review instructions publish an exact canonical /team/results path, while
+  // the tool historically defaulted omitted scope/kind to a member artifact.
+  // Infer only the active root and active validation assignment. This makes a
+  // valid path tolerant without widening access to another task or reviewer.
+  const reviewPrefix =
+    "results/" +
+    safeName(artifactRootTaskId(current, activeEnvelope)) +
+    "/reviews/" +
+    artifactAssignmentId(current, activeEnvelope) +
+    "/";
+  if (!relative.startsWith(reviewPrefix) || relative.length === reviewPrefix.length) return current;
+  return { ...current, scope: "team", kind: "review" };
+}
+
 function isLeaderMember(cfg) {
   const role = trim(cfg?.role).toLowerCase();
   const memberId = trim(cfg?.memberId).toLowerCase();
@@ -3938,13 +3965,14 @@ function createRuntime(api) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
       const currentEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
-      assertTeamArtifactWriteScope(cfg, params, currentEnvelope);
-      const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "member", true);
+      const effectiveParams = inferCanonicalArtifactWriteContract(cfg, params || {}, currentEnvelope);
+      assertTeamArtifactWriteScope(cfg, effectiveParams, currentEnvelope);
+      const resolved = await resolveTeamArtifactPath(cfg, effectiveParams, currentEnvelope, "member", true);
       await mkdirBestEffort(path.dirname(resolved.candidate), TEAM_SHARED_DIR_MODE, "Team artifact parent");
       await writeText(resolved.candidate, String(params?.content ?? ""));
       if (currentEnvelope && !activeArtifactRefs.includes(resolved.canonical)) activeArtifactRefs.push(resolved.canonical);
-      const artifactScope = trim(params?.scope).toLowerCase() || "member";
-      const artifactKind = trim(params?.kind || params?.artifactKind || params?.artifact_kind).toLowerCase();
+      const artifactScope = trim(effectiveParams?.scope).toLowerCase() || "member";
+      const artifactKind = trim(effectiveParams?.kind || effectiveParams?.artifactKind || effectiveParams?.artifact_kind).toLowerCase();
       if (
         currentEnvelope &&
         isLeaderMember(cfg) &&
@@ -4077,8 +4105,9 @@ function createRuntime(api) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
       const currentEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
-      assertTeamArtifactWriteScope(cfg, params, currentEnvelope);
-      const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "member", true);
+      const effectiveParams = inferCanonicalArtifactWriteContract(cfg, params || {}, currentEnvelope);
+      assertTeamArtifactWriteScope(cfg, effectiveParams, currentEnvelope);
+      const resolved = await resolveTeamArtifactPath(cfg, effectiveParams, currentEnvelope, "member", true);
       if (!(await mkdirBestEffort(resolved.candidate, TEAM_SHARED_DIR_MODE, "Team artifact directory"))) {
         throw new Error("Unable to create Team artifact directory: " + resolved.canonical);
       }

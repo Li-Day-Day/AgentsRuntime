@@ -37,7 +37,6 @@ var openClawDefaultDeniedNodeCommands = []string{
 var openClawDefaultDisabledPlugins = []string{
 	"bonjour",
 	"acpx",
-	"browser",
 	"phone-control",
 	"talk-voice",
 	"device-pair",
@@ -93,6 +92,7 @@ func WriteGatewayConfig(cfg gateway.Config, req gateway.CreateGatewayRequest, wo
 	}
 	configureManagedOpenClawBrowser(config, req, port)
 	mergeOpenClawLiteDefaults(config)
+	reconcileOpenClawBrowserPlugin(config)
 	if err := mergeOpenClawChannelsFromRequest(config, req); err != nil {
 		return err
 	}
@@ -198,6 +198,22 @@ func configureManagedOpenClawBrowser(config map[string]any, req gateway.CreateGa
 	browser["extraArgs"] = managedOpenClawBrowserArgs(browser["extraArgs"], proxyURL)
 	ssrfPolicy := ensureObject(browser, "ssrfPolicy")
 	ssrfPolicy["dangerouslyAllowPrivateNetwork"] = true
+}
+
+// reconcileOpenClawBrowserPlugin keeps the 2026.7.1 pluginized Browser tool
+// aligned with the long-standing browser.enabled runtime setting. Without
+// this, an upgraded instance can launch Chromium but silently lose the Browser
+// tool because older managed defaults explicitly disabled the plugin entry.
+func reconcileOpenClawBrowserPlugin(config map[string]any) {
+	browser := ensureObject(config, "browser")
+	enabled, ok := browser["enabled"].(bool)
+	if !ok {
+		return
+	}
+	plugins := ensureObject(config, "plugins")
+	entries := ensureObject(plugins, "entries")
+	entry := ensureObject(entries, "browser")
+	entry["enabled"] = enabled
 }
 
 func managedOpenClawBrowserProxy(req gateway.CreateGatewayRequest) (string, bool) {
@@ -692,8 +708,17 @@ func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) {
 		agents := ensureObject(config, "agents")
 		defaults := ensureObject(agents, "defaults")
 		model := ensureObject(defaults, "model")
-		model["primary"] = qualifiedOpenClawModelID(openClawAutoProviderName, cfg.LLMModelIDs[0])
+		primaryModel := qualifiedOpenClawModelID(openClawAutoProviderName, cfg.LLMModelIDs[0])
+		model["primary"] = primaryModel
 		defaults["models"] = buildOpenClawAgentModels(defaults["models"], openClawAutoProviderName, cfg.LLMModelIDs)
+		// OpenClaw 2026.7.1 auto-discovers a built-in OpenAI image fallback when
+		// imageModel is unset. ClawManager also exports OPENAI_* compatibility
+		// aliases, so that fallback can look configured even though the user did
+		// not enable it. Keep image calls on the managed provider while preserving
+		// an explicit custom image model.
+		if rawImageModel, exists := defaults["imageModel"]; !exists || rawImageModel == nil {
+			defaults["imageModel"] = map[string]any{"primary": primaryModel}
+		}
 	}
 	normalizeOpenClawProviderAuthContracts(config)
 }
