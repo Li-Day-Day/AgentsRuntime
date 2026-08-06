@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, browserVerificationForCompletion, browserToolCallFailed, teamProcessToolDecision, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
+const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, browserToolCallFailed, teamProcessToolDecision, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -163,9 +163,38 @@ try {
 		browserEnvelope,
 		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" } },
 		browserState,
-		1001,
-	);
-	assert.equal(browserState.startedAt, undefined, "the budget starts only after a successful open");
+    1001,
+  );
+  assert.equal(browserState.startedAt, undefined, "the budget starts only after a successful open");
+  assert.deepEqual(
+    pluginModule.lateNarrativeProjectionMeta(true),
+    { lateProjection: true, suppressedAfterTerminal: true, terminalDelivery: false },
+    "ordinary session reconciliation prose must be hidden after terminal delivery",
+  );
+  assert.deepEqual(
+    pluginModule.lateNarrativeProjectionMeta(false),
+    { lateProjection: true, suppressedAfterTerminal: false, terminalDelivery: false },
+    "pre-terminal recovery may retain real narrative without affecting workflow state",
+  );
+  const guardEnvelope = {
+    rootTaskId: "team-75-task-150",
+    assignmentId: "review-150",
+  };
+  const openGuardKey = pluginModule.reviewerBrowserGuardKey(
+    guardEnvelope,
+    { toolName: "browser", params: { action: "open", url: "http://managed.example/preview" } },
+    { runId: "run-150" },
+  );
+  const snapshotGuardKey = pluginModule.reviewerBrowserGuardKey(
+    guardEnvelope,
+    { toolName: "browser", params: { action: "snapshot", targetId: "target-150" } },
+    { runId: "run-150" },
+  );
+  assert.equal(
+    openGuardKey,
+    snapshotGuardKey,
+    "Browser guard state must survive actions that omit the navigation URL",
+  );
 	pluginModule.reviewerBrowserToolResultDecision(
 		browserEnvelope,
 		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" }, result: { status: "ok" } },

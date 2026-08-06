@@ -55,6 +55,12 @@ COPY --from=node-runtime /usr/local /usr/local
 
 RUN npm install -g openclaw@2026.7.1-2
 
+COPY openclaw/patches/patch_browser_proxy_navigation.mjs /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs
+COPY openclaw/patches/test_browser_proxy_navigation.mjs /usr/local/share/openclaw/patches/test_browser_proxy_navigation.mjs
+RUN node /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs --patch \
+  && node /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs --verify \
+  && node /usr/local/share/openclaw/patches/test_browser_proxy_navigation.mjs
+
 COPY plugins/openclaw-redis-team/ /tmp/openclaw-redis-team/
 COPY openclaw/defaults-template/.config /defaults/.config
 # Seed the runtime template under /defaults so the first /config sync gets the

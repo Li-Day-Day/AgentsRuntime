@@ -356,6 +356,14 @@ func TestWriteOpenClawGatewayConfigForcesTeamBrowserThroughManagedProxy(t *testi
 	if !ok || !stringSet(allowedHostnames)["example.com"] {
 		t.Fatalf("browser.ssrfPolicy.allowedHostnames was not preserved: %#v", ssrfPolicy)
 	}
+	hostnameAllowlist, ok := ssrfPolicy["hostnameAllowlist"].([]string)
+	foundTeamPreviewHost := false
+	for _, hostname := range hostnameAllowlist {
+		foundTeamPreviewHost = foundTeamPreviewHost || hostname == openClawTeamPreviewHostname
+	}
+	if !ok || !foundTeamPreviewHost {
+		t.Fatalf("browser.ssrfPolicy.hostnameAllowlist missing managed Team preview suffix: %#v", ssrfPolicy)
+	}
 }
 
 func TestWriteOpenClawGatewayConfigDoesNotRelaxSSRFWithoutManagedTeamProxy(t *testing.T) {

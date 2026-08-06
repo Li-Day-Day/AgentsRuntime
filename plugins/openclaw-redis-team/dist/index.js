@@ -1888,6 +1888,16 @@ function browserVerificationForCompletion(envelope, state) {
   };
 }
 
+function reviewerBrowserGuardKey(envelope, event, ctx) {
+  const run = trim(event?.runId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId || "active-review");
+  const root = trim(envelope?.rootTaskId || envelope?.taskId);
+  const assignment = trim(envelope?.assignmentId || envelope?.workId || envelope?.reviewedAssignmentId);
+  // The URL is mutable call data: open carries it, while snapshot/screenshot
+  // commonly do not. Keep the review budget and successful-open evidence bound
+  // to the execution/assignment, and store the target inside that state.
+  return [run, root, assignment].join("|");
+}
+
 function browserToolCallFailed(event) {
   if (
     trim(event?.error) ||
@@ -2009,7 +2019,7 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
     "Verification truth rule: an environment or Browser limitation is not a product defect. Continue with available static checks and say Browser verification passed only when it actually ran.",
     "Risk waiver rule: a failed or stale required assignment blocks root success unless the Leader records assignmentId, reason, and accepted risk in team_complete_task. Never waive work that is still running or pending.",
     "Optional-work rule: optional work may be omitted, but every omitted optional assignment must be listed in skippedAssignments with assignmentId and a concrete reason.",
-    "Phase finality rule: a required phase declared in leader_plan never disappears implicitly. If a planned phase is intentionally not started, the Leader must list it in team_complete_task phaseDispositions with phaseId, decision (cancelled, skipped, or superseded), and a concrete reason. Never use a disposition for running or unfinished assigned work.",
+    "Phase finality rule: a required phase declared in leader_plan never disappears implicitly. If a planned phase is intentionally not started, the Leader must list it in team_complete_task phaseDispositions with phaseId, decision (cancelled, skipped, or superseded), and a concrete reason. Omit phases whose assigned work already succeeded; the control plane closes those automatically. Never use a disposition for running or unfinished assigned work.",
     "Never list, search, resolve, or scan the parent of the current Team shared directory, and never inspect sibling Team directories.",
   ];
   const verificationGuidance = redisTeamVerificationGuidance(envelope);
@@ -2561,6 +2571,14 @@ async function readAssistantNarrativesFromDispatch(dispatchResult, sinceMs = 0) 
 
 async function readAssistantTextsFromDispatch(dispatchResult, sinceMs = 0) {
   return (await readAssistantNarrativesFromDispatch(dispatchResult, sinceMs)).map((entry) => entry.text);
+}
+
+function lateNarrativeProjectionMeta(terminal) {
+	return {
+		lateProjection: true,
+		suppressedAfterTerminal: terminal === true,
+		terminalDelivery: false,
+	};
 }
 
 function fieldsToObject(fields) {
@@ -4064,11 +4082,7 @@ function createRuntime(api) {
 		},
 
 		browserGuardKey(event, ctx) {
-			const run = trim(event?.runId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId || "active-review");
-			const root = trim(activeEnvelope?.rootTaskId || activeEnvelope?.taskId);
-			const assignment = trim(activeEnvelope?.assignmentId || activeEnvelope?.workId || activeEnvelope?.reviewedAssignmentId);
-			const target = directHttpVerificationUrl(event?.params?.url) || verificationTargetUrl(activeEnvelope);
-			return [run, root, assignment, target].join("|");
+			return reviewerBrowserGuardKey(activeEnvelope, event, ctx);
 		},
 
 		currentActiveEnvelope() {
@@ -5723,6 +5737,8 @@ export default definePluginEntry({
                         sourceSequence: sourceMeta.sourceSequence,
                         sourceRecordId: sourceMeta.sourceRecordId,
                         lateProjection: sourceMeta.lateProjection === true,
+                        suppressedAfterTerminal: sourceMeta.suppressedAfterTerminal === true,
+                        terminalDelivery: sourceMeta.terminalDelivery === true,
                         text: narrativeText,
                         content: narrativeText,
                         summary: narrativeText.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Team narrative",
@@ -5914,13 +5930,18 @@ export default definePluginEntry({
                   const narrativeLimit = (fallbackCompleted || fallbackPending || terminalAfterDispatch)
                     ? Math.max(0, assistantNarratives.length - 1)
                     : assistantNarratives.length;
+                  const suppressLateProcessNarratives =
+                    fallbackCompleted || fallbackPending || terminalAfterDispatch;
                   for (const narrative of assistantNarratives.slice(0, narrativeLimit)) {
                     try {
                       await emitAgentNarrative(
                         narrative.text,
                         "assistant_session",
                         {},
-                        { ...narrative, lateProjection: true },
+                        {
+                          ...narrative,
+                          ...lateNarrativeProjectionMeta(suppressLateProcessNarratives),
+                        },
                       );
                     } catch (err) {
                       ctx.log?.warn?.(
