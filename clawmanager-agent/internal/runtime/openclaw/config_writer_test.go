@@ -294,7 +294,10 @@ func TestWriteOpenClawGatewayConfigForcesTeamBrowserThroughManagedProxy(t *testi
 	      "--proxy-bypass-list=*",
 	      "--proxy-pac-url=http://untrusted.example/proxy.pac"
 	    ],
-	    "ssrfPolicy": {"allowedHostnames": ["example.com"]}
+	    "ssrfPolicy": {
+	      "allowedHostnames": ["example.com"],
+	      "hostnameAllowlist": ["*.customer.example"]
+	    }
 	  }
 	}`)
 	var config map[string]any
@@ -356,13 +359,25 @@ func TestWriteOpenClawGatewayConfigForcesTeamBrowserThroughManagedProxy(t *testi
 	if !ok || !stringSet(allowedHostnames)["example.com"] {
 		t.Fatalf("browser.ssrfPolicy.allowedHostnames was not preserved: %#v", ssrfPolicy)
 	}
-	hostnameAllowlist, ok := ssrfPolicy["hostnameAllowlist"].([]string)
-	foundTeamPreviewHost := false
-	for _, hostname := range hostnameAllowlist {
-		foundTeamPreviewHost = foundTeamPreviewHost || hostname == openClawTeamPreviewHostname
+	hostnameAllowlist, ok := ssrfPolicy["hostnameAllowlist"].([]any)
+	if !ok || len(hostnameAllowlist) != 1 || hostnameAllowlist[0] != "*.customer.example" {
+		t.Fatalf("browser.ssrfPolicy.hostnameAllowlist was widened or replaced: %#v", ssrfPolicy)
 	}
-	if !ok || !foundTeamPreviewHost {
-		t.Fatalf("browser.ssrfPolicy.hostnameAllowlist missing managed Team preview suffix: %#v", ssrfPolicy)
+}
+
+func TestManagedTeamBrowserDoesNotCreateExclusiveHostnameAllowlist(t *testing.T) {
+	proxyURL := "http://clawmanager-egress-proxy.clawmanager-system.svc.cluster.local:3128"
+	req := CreateGatewayRequest{
+		Environment: map[string]string{
+			"CLAWMANAGER_TEAM_ENABLED":      "true",
+			"CLAWMANAGER_BROWSER_PROXY_URL": proxyURL,
+		},
+	}
+	config := map[string]any{}
+	configureManagedOpenClawBrowser(config, req, 20003)
+	ssrfPolicy := objectAt(t, objectAt(t, config, "browser"), "ssrfPolicy")
+	if _, exists := ssrfPolicy["hostnameAllowlist"]; exists {
+		t.Fatalf("managed Browser introduced an exclusive hostname allowlist: %#v", ssrfPolicy)
 	}
 }
 

@@ -24,11 +24,12 @@ let source = fs.readFileSync(target, "utf8");
 const insertionPoint = "\tawait resolvePinnedHostnameWithPolicy(parsed.hostname, {";
 const patchBody = [
   `\t// ${marker}: Chromium is already forced through the operator-managed`,
-  "\t// forward proxy. Delegate DNS only for an explicitly allowlisted host;",
-  "\t// direct profiles and arbitrary destinations retain upstream DNS pinning.",
+  "\t// forward proxy. Interactive Team previews use a signature-derived,",
+  "\t// non-resolving origin. Delegate only that exact reserved host shape;",
+  "\t// direct profiles and every ordinary destination retain upstream checks.",
   "\tif (opts.browserProxyMode === \"explicit-browser-proxy\" &&",
   "\t\tisPrivateNetworkAllowedByPolicy(opts.ssrfPolicy) &&",
-  "\t\tisExplicitlyAllowedBrowserHostname(parsed.hostname, opts.ssrfPolicy)) return;",
+  "\t\t/^p-[a-z0-9_-]{16}\\.clawmanager-team-preview\\.invalid$/.test(normalizeHostname(parsed.hostname))) return;",
   insertionPoint,
 ].join("\n");
 
@@ -46,7 +47,7 @@ for (const required of [
   marker,
   'opts.browserProxyMode === "explicit-browser-proxy"',
   "isPrivateNetworkAllowedByPolicy(opts.ssrfPolicy)",
-  "isExplicitlyAllowedBrowserHostname(parsed.hostname, opts.ssrfPolicy)",
+  "/^p-[a-z0-9_-]{16}\\.clawmanager-team-preview\\.invalid$/",
   insertionPoint,
 ]) {
   if (!source.includes(required)) {

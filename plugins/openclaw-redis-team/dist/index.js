@@ -1980,7 +1980,8 @@ function redisTeamVerificationGuidance(envelope) {
     case "api-test":
       return "API verification policy: use existing HTTP tools, available endpoints, artifacts, and static contract review. Browser verification is not required. Never install or download Postman, Newman, browsers, test frameworks, package dependencies, or system packages. If the service or network target is unavailable, record the limit and continue with static contract checks; report only directly observed reproducible failures.";
     default:
-      return "";
+      if (isLeaderMember({ role: envelope?.role, memberId: envelope?.to })) return "";
+      return "Execution verification policy: keep self-checks proportional to the assigned output by preferring syntax checks, existing project tests, existing tools, and a small smoke test. When the Team plan assigns independent review or QA downstream, deliver the verified implementation or artifact to that owner instead of building a second Browser or test harness solely to duplicate acceptance. If no independent verifier is planned, or this assignment explicitly requires Browser, visual, interaction, or end-to-end evidence, perform the proportionate validation needed for that requirement. Product dependencies required by the implementation remain allowed. Optional validation setup and environment limitations are not completion gates: report completed checks and remaining verification scope, then continue the handoff.";
   }
 }
 
@@ -2194,8 +2195,21 @@ function assistantTextFromRecord(record) {
   return "";
 }
 
-function usableFallbackAssistantText(text) {
+// OpenClaw normalizes its delivery callback before it reaches the channel, but
+// the durable assistant session keeps the raw model text. A model can append
+// the silent-reply control token after otherwise visible prose, so normalize
+// recovered session text before hashing, completion fallback, or projection.
+// Only a token-only payload or a token on its own final line is removed; normal
+// prose that discusses NO_REPLY remains intact.
+function normalizeAssistantSessionText(text) {
   const value = trim(text);
+  if (!value) return "";
+  if (/^NO_REPLY$/i.test(value)) return "";
+  return value.replace(/(?:^|\r?\n[\t ]*|\*+)NO_REPLY[\t ]*$/i, "").trim();
+}
+
+function usableFallbackAssistantText(text) {
+  const value = normalizeAssistantSessionText(text);
   if (!value) return "";
   const compact = value.toLowerCase().replace(/\s+/g, "");
   if (
@@ -2549,7 +2563,7 @@ async function readAssistantNarrativesFromDispatch(dispatchResult, sinceMs = 0) 
           const recordMs = sessionRecordTimestampMs(record);
           if (recordMs > 0 && recordMs + 1000 < sinceMs) continue;
         }
-        const candidate = usableFallbackAssistantText(assistantTextFromRecord(record));
+        const candidate = normalizeAssistantSessionText(assistantTextFromRecord(record));
         if (!candidate) continue;
         const hash = createHash("sha256").update(candidate).digest("hex");
         if (seen.has(hash)) continue;
@@ -2579,6 +2593,16 @@ function lateNarrativeProjectionMeta(terminal) {
 		suppressedAfterTerminal: terminal === true,
 		terminalDelivery: false,
 	};
+}
+
+function assistantSessionNarrativesForProjection(narratives, deliveredViaCallback, terminalResult) {
+  if (deliveredViaCallback || terminalResult || !Array.isArray(narratives) || narratives.length === 0) return [];
+  // Session replay is a compatibility recovery path, not a second live chat
+  // source. Progress belongs in team_update_progress, so recover only the
+  // latest otherwise-unprojected assistant message while the turn is live.
+  // Once terminal, the structured completion owns the final delivery and old
+  // process prose must not be replayed after it.
+  return narratives.slice(-1);
 }
 
 function fieldsToObject(fields) {
@@ -5697,7 +5721,7 @@ export default definePluginEntry({
                   const dispatchStartedAt = Date.now();
                   const emittedNarrativeHashes = new Set();
                   const emitAgentNarrative = async (narrativeText, source, media = {}, sourceMeta = {}) => {
-                    narrativeText = trim(narrativeText);
+                    narrativeText = normalizeAssistantSessionText(narrativeText);
                     if (!narrativeText) return false;
                     const localeAnalysis = assertResponseLocale(envelope.responseLocale || "zh-CN", narrativeText, "Team reply");
                     const contentHash = trim(sourceMeta.contentHash) || createHash("sha256").update(narrativeText).digest("hex");
@@ -5806,11 +5830,10 @@ export default definePluginEntry({
                         ctx.log?.info?.("redis-team: suppressed duplicate reply after submitted completion for " + envelope.messageId);
                         return;
                       }
-                      deliveredViaCallback = true;
                       if (isIncompleteTurnDelivery(payload)) incompleteTurnDetected = true;
                       ctx.log?.info?.("redis-team: delivering reply for " + envelope.messageId);
                       try {
-                        await emitAgentNarrative(
+                        const projected = await emitAgentNarrative(
                           payload?.text || "",
                           "deliver_callback",
                           payload || {},
@@ -5820,6 +5843,7 @@ export default definePluginEntry({
                             lateProjection: false,
                           },
                         );
+                        if (projected) deliveredViaCallback = true;
                       } catch (err) {
                         // Chat projection is auxiliary. Keep the assignment turn
                         // alive and let the session replay retry this stable hash.
@@ -5927,12 +5951,14 @@ export default definePluginEntry({
                   // user-visible assistant prose from the current dispatch only.
                   // If the final text became a completion, omit that last copy;
                   // the structured completion event is the canonical delivery.
-                  const narrativeLimit = (fallbackCompleted || fallbackPending || terminalAfterDispatch)
-                    ? Math.max(0, assistantNarratives.length - 1)
-                    : assistantNarratives.length;
                   const suppressLateProcessNarratives =
                     fallbackCompleted || fallbackPending || terminalAfterDispatch;
-                  for (const narrative of assistantNarratives.slice(0, narrativeLimit)) {
+                  const recoveryNarratives = assistantSessionNarrativesForProjection(
+                    assistantNarratives,
+                    deliveredViaCallback,
+                    suppressLateProcessNarratives,
+                  );
+                  for (const narrative of recoveryNarratives) {
                     try {
                       await emitAgentNarrative(
                         narrative.text,

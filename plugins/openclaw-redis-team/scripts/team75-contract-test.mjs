@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, browserToolCallFailed, teamProcessToolDecision, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
+const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, browserToolCallFailed, teamProcessToolDecision, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -175,6 +175,37 @@ try {
     pluginModule.lateNarrativeProjectionMeta(false),
     { lateProjection: true, suppressedAfterTerminal: false, terminalDelivery: false },
     "pre-terminal recovery may retain real narrative without affecting workflow state",
+  );
+  const visibleLeaderReply = "Development dispatched; waiting for the worker result.";
+  assert.equal(pluginModule.normalizeAssistantSessionText("NO_REPLY"), "");
+  assert.equal(
+    pluginModule.normalizeAssistantSessionText(`${visibleLeaderReply}\n\nNO_REPLY`),
+    visibleLeaderReply,
+    "the raw session copy must hash like OpenClaw's normalized callback",
+  );
+  assert.equal(
+    pluginModule.normalizeAssistantSessionText("OpenClaw uses NO_REPLY as its silent token."),
+    "OpenClaw uses NO_REPLY as its silent token.",
+    "ordinary prose discussing the token must remain visible",
+  );
+  const sessionNarratives = [
+    { text: "internal setup" },
+    { text: visibleLeaderReply },
+  ];
+  assert.deepEqual(
+    pluginModule.assistantSessionNarrativesForProjection(sessionNarratives, true, false),
+    [],
+    "a successful delivery callback owns visible projection",
+  );
+  assert.deepEqual(
+    pluginModule.assistantSessionNarrativesForProjection(sessionNarratives, false, false),
+    [sessionNarratives[1]],
+    "callback-free compatibility recovery must project only the latest narrative",
+  );
+  assert.deepEqual(
+    pluginModule.assistantSessionNarrativesForProjection(sessionNarratives, false, true),
+    [],
+    "terminal completion owns final delivery and old process prose must not replay afterward",
   );
   const guardEnvelope = {
     rootTaskId: "team-75-task-150",
@@ -585,6 +616,10 @@ try {
   const guidedPrompt = pluginModule.appendRedisTeamCompletionGuidance("Implement the page.", normalizedEnvelope);
   assert.match(guidedPrompt, /read these exact canonical paths/);
   assert.match(guidedPrompt, /\/team\/results\/team-75-task-150\/plan\/collaboration-plan\.md/);
+  assert.match(guidedPrompt, /keep self-checks proportional/i);
+  assert.match(guidedPrompt, /independent review or QA downstream/i);
+  assert.match(guidedPrompt, /Product dependencies required by the implementation remain allowed/i);
+  assert.match(guidedPrompt, /not completion gates/i);
   assert.deepEqual(
     pluginModule.canonicalTeamArtifactRefsFromText(
       { sharedDir: shared },
@@ -837,5 +872,8 @@ try {
 
   console.log("Team75 Redis Team contract test passed");
 } finally {
-  await fs.rm(root, { recursive: true, force: true });
+  // Windows may release handles created by the contract harness a moment after
+  // the final assertion. Retry transient ENOTEMPTY/EPERM cleanup failures so
+  // test status continues to reflect contract behavior rather than OS timing.
+  await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }

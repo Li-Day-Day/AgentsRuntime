@@ -22,7 +22,6 @@ const openClawBrowserExecutablePath = "/usr/bin/chromium"
 const openClawBrowserProxyEnv = "CLAWMANAGER_BROWSER_PROXY_URL"
 const openClawManagedBrowserProfile = "openclaw"
 const openClawManagedBrowserColor = "#FF4500"
-const openClawTeamPreviewHostname = "clawmanager-team-preview.invalid"
 const openClawChannelsEnv = "CLAWMANAGER_OPENCLAW_CHANNELS_JSON"
 
 var openClawDefaultDeniedNodeCommands = []string{
@@ -199,16 +198,10 @@ func configureManagedOpenClawBrowser(config map[string]any, req gateway.CreateGa
 	browser["extraArgs"] = managedOpenClawBrowserArgs(browser["extraArgs"], proxyURL)
 	ssrfPolicy := ensureObject(browser, "ssrfPolicy")
 	ssrfPolicy["dangerouslyAllowPrivateNetwork"] = true
-	// OpenClaw 2026.7.1-2 revalidates the current page URL before every
-	// snapshot, screenshot, and interaction. Interactive Team previews use a
-	// signature-derived subdomain of this reserved suffix so each task keeps an
-	// isolated browser origin. The image's narrow proxy-DNS patch only delegates
-	// lookup for an explicitly allowlisted hostname while the managed Browser
-	// proxy is active; ordinary Browser destinations retain the upstream guard.
-	ssrfPolicy["hostnameAllowlist"] = appendUniqueStringArray(
-		ssrfPolicy["hostnameAllowlist"],
-		openClawTeamPreviewHostname,
-	)
+	// Do not add a hostnameAllowlist here. In OpenClaw it is an exclusive
+	// navigation allowlist, not an additive DNS exception. The version-locked
+	// image patch recognizes only ClawManager's signature-derived interactive
+	// Preview host while keeping ordinary destinations on the upstream path.
 }
 
 // reconcileOpenClawBrowserPlugin keeps the 2026.7.1 pluginized Browser tool

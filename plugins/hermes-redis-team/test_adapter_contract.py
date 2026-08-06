@@ -85,6 +85,15 @@ spec.loader.exec_module(adapter)
 
 
 class HermesRedisTeamContractTests(unittest.TestCase):
+    def test_platform_hint_keeps_execution_validation_proportional_and_non_blocking(self):
+        source = Path(adapter.__file__).read_text(encoding="utf-8")
+        self.assertIn("implementation self-check should stay proportional", source)
+        self.assertIn("When independent", source)
+        self.assertIn("review or QA is planned downstream", source)
+        self.assertIn("Product dependencies remain allowed", source)
+        self.assertIn("optional validation", source)
+        self.assertIn("not completion gates", source)
+
     def settings(self, root):
         return adapter.RedisTeamSettings(
             enabled=True,
