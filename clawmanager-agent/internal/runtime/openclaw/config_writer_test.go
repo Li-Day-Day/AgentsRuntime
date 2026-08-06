@@ -650,9 +650,10 @@ func TestWriteOpenClawGatewayConfigUsesRequestEnvironmentLLMOverrides(t *testing
 		UID:        200068,
 		GID:        200068,
 		Environment: map[string]string{
-			"CLAWMANAGER_LLM_BASE_URL": "http://clawmanager-gateway.clawmanager-system.svc.cluster.local:9001/api/v1/gateway/llm",
-			"CLAWMANAGER_LLM_API_KEY":  "instance-token",
-			"CLAWMANAGER_LLM_MODEL":    `["auto","gpt-5.5"]`,
+			"CLAWMANAGER_LLM_BASE_URL":  "http://clawmanager-gateway.clawmanager-system.svc.cluster.local:9001/api/v1/gateway/llm",
+			"CLAWMANAGER_LLM_API_KEY":   "instance-token",
+			"CLAWMANAGER_LLM_MODEL":     `["auto","gpt-5.5"]`,
+			"CLAWMANAGER_LLM_REASONING": `{"auto":false,"gpt-5.5":true}`,
 		},
 	}
 	cfg := Config{GatewayAuthMode: "trusted-proxy"}
@@ -672,6 +673,13 @@ func TestWriteOpenClawGatewayConfigUsesRequestEnvironmentLLMOverrides(t *testing
 	autoProvider := objectAt(t, objectAt(t, objectAt(t, merged, "models"), "providers"), "auto")
 	if autoProvider["apiKey"] != "instance-token" {
 		t.Fatalf("models.providers.auto.apiKey = %#v, want request token", autoProvider["apiKey"])
+	}
+	providerModels, ok := autoProvider["models"].([]any)
+	if !ok || len(providerModels) != 2 {
+		t.Fatalf("models.providers.auto.models = %#v, want two managed models", autoProvider["models"])
+	}
+	if providerModels[0].(map[string]any)["reasoning"] != false || providerModels[1].(map[string]any)["reasoning"] != true {
+		t.Fatalf("managed reasoning settings were not applied: %#v", providerModels)
 	}
 	defaults := objectAt(t, objectAt(t, merged, "agents"), "defaults")
 	model := objectAt(t, defaults, "model")

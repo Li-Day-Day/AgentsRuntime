@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, browserToolCallFailed, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
+const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, browserToolCallFailed, teamProcessToolDecision, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -149,12 +149,36 @@ try {
   assert.equal(browserEnvelope.reviewedAssignmentId, "dev-01");
   assert.equal(browserEnvelope.reviewedRevision, 2);
   assert.equal(browserEnvelope.verificationUrl, "https://example.com/review");
+	for (const action of ["status", "start"]) {
+		const preparation = pluginModule.reviewerBrowserToolDecision(
+			browserEnvelope,
+			{ toolName: "browser", params: { action } },
+			browserState,
+			1000,
+		);
+		assert.notEqual(preparation.block, true);
+		assert.equal(browserState.startedAt, undefined, `${action} must not start the review budget`);
+	}
+	pluginModule.reviewerBrowserToolDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" } },
+		browserState,
+		1001,
+	);
+	assert.equal(browserState.startedAt, undefined, "the budget starts only after a successful open");
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" }, result: { status: "ok" } },
+		browserState,
+		1002,
+	);
+	assert.equal(browserState.startedAt, 1002);
   for (let index = 0; index < 4; index += 1) {
     const decision = pluginModule.reviewerBrowserToolDecision(
       browserEnvelope,
-      { toolName: "browser", params: { action: index === 1 ? "open" : "snapshot", url: index === 1 ? "https://example.com/review" : undefined } },
+			{ toolName: "browser", params: { action: "snapshot" } },
       browserState,
-      1000 + index,
+			1003 + index,
     );
     assert.notEqual(decision.block, true);
   }
@@ -162,7 +186,7 @@ try {
     browserEnvelope,
     { toolName: "browser", params: { action: "snapshot" } },
     browserState,
-    1005,
+		1008,
   );
   assert.equal(exhaustedBrowser.block, true);
   assert.equal(pluginModule.browserToolCallFailed({
@@ -173,6 +197,25 @@ try {
   assert.equal(pluginModule.browserToolCallFailed({
     result: { content: [{ type: "text", text: JSON.stringify({ status: "ok", title: "Rendered" }) }] },
   }), false);
+	for (const command of [
+		"python3 -m http.server 8765",
+		"pkill -f remote-debugging-port=9222",
+		"chromium --headless --remote-debugging-port=9222",
+		"fuser 8765/tcp -k",
+	]) {
+		assert.equal(
+			pluginModule.teamProcessToolDecision({ toolName: "exec", params: { command } }).block,
+			true,
+			`dangerous over-testing command must be blocked: ${command}`,
+		);
+	}
+	for (const command of ["npm test", "npm run dev", "ps -ef", "kill 12345", "python3 scripts/check.py"]) {
+		assert.notEqual(
+			pluginModule.teamProcessToolDecision({ toolName: "exec", params: { command } }).block,
+			true,
+			`normal project verification must remain available: ${command}`,
+		);
+	}
   assert.deepEqual(
     pluginModule.normalizePhaseDispositions([
       { phaseId: "phase-2", decision: "skipped", reason: "Phase 1 fully satisfied the goal." },
@@ -192,31 +235,39 @@ try {
     assert.notEqual(developerBrowser.block, true, "Developer Browser must not inherit the Reviewer budget");
   }
   const genericValidatorState = {};
+	const genericValidatorEnvelope = {
+		role: "domain-specialist",
+		validationAssignment: true,
+		validationTargetAssignmentId: "dev-01",
+		taskId: "team-75-task-149",
+	};
+	pluginModule.reviewerBrowserToolDecision(
+		genericValidatorEnvelope,
+		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" } },
+		genericValidatorState,
+		3000,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		genericValidatorEnvelope,
+		{ toolName: "browser", params: { action: "open" }, result: { status: "ok" } },
+		genericValidatorState,
+		3001,
+	);
   for (let index = 0; index < 4; index += 1) {
     const genericValidatorBrowser = pluginModule.reviewerBrowserToolDecision(
-      {
-        role: "domain-specialist",
-        validationAssignment: true,
-        validationTargetAssignmentId: "dev-01",
-        taskId: "team-75-task-149",
-      },
+			genericValidatorEnvelope,
       { toolName: "browser", params: { action: "snapshot" } },
       genericValidatorState,
-      3000 + index,
+			3002 + index,
     );
     assert.notEqual(genericValidatorBrowser.block, true);
   }
   assert.equal(
     pluginModule.reviewerBrowserToolDecision(
-      {
-        role: "domain-specialist",
-        validationAssignment: true,
-        validationTargetAssignmentId: "dev-01",
-        taskId: "team-75-task-149",
-      },
+		genericValidatorEnvelope,
       { toolName: "browser", params: { action: "snapshot" } },
       genericValidatorState,
-      3005,
+		3007,
     ).block,
     true,
     "any assigned validator gets the brief Browser budget without reducing ordinary Worker Browser access",
@@ -470,13 +521,14 @@ try {
   assert.equal(preview.artifact.path, "/team/index.html");
   assert.match(
     preview.artifact.previewUrl,
-    /^http:\/\/clawmanager-egress-proxy\.clawmanager-hxc-peer-system\.svc\.cluster\.local:3128\/v1\/75\/_\/[A-Za-z0-9_-]+\/index\.html$/,
+    /^http:\/\/p-[a-z0-9_-]{16}\.clawmanager-team-preview\.invalid\/v2\/interactive\/75\/_\/[A-Za-z0-9_-]+\/index\.html$/,
   );
+	assert.equal(new URL(preview.artifact.previewUrl).port, "", "interactive previews use the isolated proxy origin without a target port");
   assert.equal(new URL(preview.artifact.previewUrl).search, "", "preview links must not carry an expiry");
   process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://clawmanager-team-preview.invalid";
   const legacyPreviewUrl = pluginModule.previewUrlForTeamArtifact(
     { teamId: "75", sharedDir: shared },
-    path.join(shared, "index.html"),
+    path.join(shared, "notes.txt"),
   );
   assert.equal(
     new URL(legacyPreviewUrl.url).hostname,
@@ -598,6 +650,26 @@ try {
     "/team/results/team-75-task-150/reviews/review-01/legacy-review-report.md",
     "kind=review must strip exactly one duplicated active assignment prefix",
   );
+	const legacyMemberReport = toolResult(await reviewerTools.get("team_artifact_write").execute("review-member-report", {
+		scope: "member",
+		path: "QA-REPORT.md",
+		content: "# QA Report\n\nPASS\n",
+	}));
+	assert.equal(
+		legacyMemberReport.artifact.path,
+		"/team/artifacts/team-75-task-150/members/reviewer/review-01/QA-REPORT.md",
+	);
+	const normalizedReviewCompletion = toolResult(await reviewerTools.get("team_complete_task").execute("review-complete", {
+		status: "succeeded",
+		summary: "\u5ba1\u6838\u5b8c\u6210",
+		resultMarkdown: `\u5ba1\u6838\u62a5\u544a\uff1a${legacyMemberReport.artifact.path}`,
+		artifactRefs: [legacyMemberReport.artifact.path],
+	}));
+	assert.ok(
+		normalizedReviewCompletion.artifactRefs.includes("/team/results/team-75-task-150/reviews/review-01/QA-REPORT.md"),
+		"an explicitly referenced legacy member report must be copied to the canonical review root",
+	);
+	await fs.access(path.join(shared, "results", "team-75-task-150", "reviews", "review-01", "QA-REPORT.md"));
   await seedActive("auditor", "domain-specialist", "audit-01", {
     validationAssignment: true,
     validationTargetAssignmentId: "dev-01",

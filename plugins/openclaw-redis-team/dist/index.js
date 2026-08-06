@@ -23,6 +23,7 @@ const RUNTIME_CAPABILITIES = Object.freeze([
   "assignment_heartbeat_v1",
   "durable_turn_facts_v1",
   "team_artifact_preview_v1",
+  "team_artifact_preview_v2",
   "review_contract_v1",
   "validation_contract_v2",
 ]);
@@ -958,10 +959,22 @@ function previewUrlForTeamArtifact(cfg, file) {
   const encodedPrefix = signedPrefix
     ? Buffer.from(signedPrefix, "utf8").toString("base64url")
     : "_";
-  const payload = `team-preview-v1\n${teamId}\n${signedPrefix}`;
+  const interactive = path.extname(file).toLowerCase() === ".html";
+  const mode = interactive ? "interactive" : "";
+  const payload = interactive
+    ? `team-preview-v2\n${mode}\n${teamId}\n${signedPrefix}`
+    : `team-preview-v1\n${teamId}\n${signedPrefix}`;
   const signature = createHmac("sha256", token).update(payload).digest("base64url");
+  if (interactive) {
+    // A unique origin per signed directory isolates localStorage and any
+    // same-origin state between Team tasks. The Browser reaches this reserved
+    // .invalid host through the managed forward proxy; no public DNS is used.
+    origin.hostname = `p-${signature.slice(0, 16).toLowerCase()}.${LEGACY_TEAM_PREVIEW_HOST}`;
+    origin.port = "";
+  }
   origin.pathname = [
-    "v1",
+    interactive ? "v2" : "v1",
+    ...(interactive ? [mode] : []),
     encodeURIComponent(teamId),
     encodedPrefix,
     signature,
@@ -969,7 +982,42 @@ function previewUrlForTeamArtifact(cfg, file) {
   ].join("/");
   origin.search = "";
   origin.hash = "";
-  return { url: origin.toString() };
+  return { url: origin.toString(), mode: interactive ? mode : "static" };
+}
+
+async function canonicalizeReviewerCompletionReport(cfg, envelope, rootTaskId, assignmentId, explicitRefs) {
+	if (!isAssignedValidationWriter(cfg, envelope) || !rootTaskId || !assignmentId) return [];
+	const memberPrefix =
+		`/team/artifacts/${safeName(rootTaskId)}/members/${safeName(cfg.memberId)}/${safeName(assignmentId)}/`;
+	const candidates = [];
+	for (const value of explicitRefs || []) {
+		const canonical = canonicalArtifactAlias(cfg, value, rootTaskId);
+		if (!canonical.startsWith(memberPrefix)) continue;
+		const extension = path.posix.extname(canonical).toLowerCase();
+		if (![".md", ".txt", ".json"].includes(extension)) continue;
+		if (!candidates.includes(canonical)) candidates.push(canonical);
+	}
+	// An explicit single member report is unambiguous. Multiple candidates are
+	// accepted as-is so normalization never adds a retry or completion gate.
+	if (candidates.length !== 1) return [];
+	try {
+		const source = path.join(cfg.sharedDir, ...candidates[0].slice("/team/".length).split("/"));
+		const stat = await fs.stat(source);
+		if (!stat.isFile()) return [];
+		const destinationDir = path.join(
+			cfg.sharedDir,
+			"results",
+			safeName(rootTaskId),
+			"reviews",
+			safeName(assignmentId),
+		);
+		await mkdirBestEffort(destinationDir, TEAM_SHARED_DIR_MODE, "canonical review result directory");
+		const destination = path.join(destinationDir, path.basename(source));
+		await writeText(destination, await fs.readFile(source, "utf8"));
+		return [canonicalArtifactRef(cfg, destination)];
+	} catch {
+		return [];
+	}
 }
 
 function optionalPreviewFields(cfg, file) {
@@ -1723,8 +1771,13 @@ function resolveRedisTeamVerificationRole(envelope) {
   return "";
 }
 
-const REVIEW_BROWSER_MAX_CALLS = 4;
+const REVIEW_BROWSER_MAX_CALLS = 5;
 const REVIEW_BROWSER_WINDOW_MS = 20_000;
+const REVIEW_BROWSER_PREPARATION_ACTIONS = new Set(["status", "start"]);
+
+function browserToolAction(event) {
+  return trim(event?.params?.action || event?.arguments?.action || event?.input?.action).toLowerCase();
+}
 
 function directHttpVerificationUrl(value) {
   const raw = trim(value);
@@ -1756,7 +1809,21 @@ function reviewerBrowserToolDecision(envelope, event, state, now = Date.now()) {
     return {};
   }
   const guard = state || {};
-  if (!guard.startedAt) guard.startedAt = now;
+	const action = browserToolAction(event);
+	if (REVIEW_BROWSER_PREPARATION_ACTIONS.has(action)) {
+		return { state: guard };
+	}
+	if (!guard.startedAt && action === "open") {
+		guard.pendingOpen = true;
+		guard.pendingTarget = directHttpVerificationUrl(event?.params?.url || event?.arguments?.url || event?.input?.url);
+		return { state: guard };
+	}
+	if (!guard.startedAt) {
+		return {
+			block: true,
+			blockReason: "Open the verification target before inspecting it, or continue immediately with static review.",
+		};
+	}
   if (now - guard.startedAt >= REVIEW_BROWSER_WINDOW_MS || Number(guard.calls || 0) >= REVIEW_BROWSER_MAX_CALLS) {
     return {
       block: true,
@@ -1765,6 +1832,29 @@ function reviewerBrowserToolDecision(envelope, event, state, now = Date.now()) {
   }
   guard.calls = Number(guard.calls || 0) + 1;
   return { state: guard };
+}
+
+function reviewerBrowserToolResultDecision(envelope, event, state, now = Date.now()) {
+	if (trim(event?.toolName).toLowerCase() !== "browser" || !["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(envelope))) {
+		return state || {};
+	}
+	const guard = state || {};
+	const action = browserToolAction(event);
+	if (REVIEW_BROWSER_PREPARATION_ACTIONS.has(action)) return guard;
+	if (browserToolCallFailed(event) || Number(event?.durationMs || event?.result?.durationMs || 0) >= REVIEW_BROWSER_WINDOW_MS) {
+		guard.pendingOpen = false;
+		guard.calls = REVIEW_BROWSER_MAX_CALLS;
+		guard.startedAt = guard.startedAt || now;
+		return guard;
+	}
+	if (action === "open" && guard.pendingOpen) {
+		guard.pendingOpen = false;
+		guard.startedAt = now;
+		guard.calls = 1;
+		guard.targetUrl = guard.pendingTarget || verificationTargetUrl(envelope);
+		delete guard.pendingTarget;
+	}
+	return guard;
 }
 
 function browserToolCallFailed(event) {
@@ -1794,6 +1884,30 @@ function browserToolCallFailed(event) {
     return Object.values(value).some((item) => inspect(item, depth + 1));
   };
   return inspect(event?.result) || inspect(event?.output);
+}
+
+function teamProcessToolDecision(event) {
+	const toolName = trim(event?.toolName).toLowerCase();
+	if (!["exec", "shell", "bash", "terminal"].includes(toolName)) return {};
+	const command = trim(
+		event?.params?.command || event?.params?.cmd || event?.arguments?.command || event?.input?.command,
+	);
+	if (!command) return {};
+	const rules = [
+		{ pattern: /(^|[;&|\s])(?:sudo\s+)?(?:pkill|killall)(?:\s|$)/i, reason: "broad process-name termination" },
+		{ pattern: /(^|[;&|\s])(?:sudo\s+)?fuser\b[^\r\n;&|]*\s-k(?:\s|$)/i, reason: "port-wide process termination" },
+		{ pattern: /\b(?:chromium|chromium-browser|google-chrome|chrome)\b[^\r\n;&|]*--remote-debugging-port(?:=|\s)/i, reason: "an unmanaged Browser/CDP process" },
+		{ pattern: /\bpython(?:3)?\s+-m\s+(?:http\.server|SimpleHTTPServer)\b/i, reason: "a temporary file server" },
+		{ pattern: /\b(?:npx\s+)?(?:http-server|serve)\b[^\r\n;&|]*(?:\s\.?(?:\s|$)|--listen|-l\s)/i, reason: "a temporary file server" },
+		{ pattern: /\bbusybox\s+httpd\b/i, reason: "a temporary file server" },
+	];
+	const matched = rules.find((rule) => rule.pattern.test(command));
+	if (!matched) return {};
+	return {
+		block: true,
+		blockReason:
+			`Redis Team blocked ${matched.reason}. Use team_artifact_preview for HTML, existing project tests for applications, and an exact owned PID for targeted cleanup.`,
+	};
 }
 
 function redisTeamVerificationGuidance(envelope) {
@@ -3855,6 +3969,18 @@ function createRuntime(api) {
       return reviewerBrowserToolDecision(activeEnvelope, event, state, now);
     },
 
+		afterBrowserToolCall(event, state, now) {
+			return reviewerBrowserToolResultDecision(activeEnvelope, event, state, now);
+		},
+
+		browserGuardKey(event, ctx) {
+			const run = trim(event?.runId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId || "active-review");
+			const root = trim(activeEnvelope?.rootTaskId || activeEnvelope?.taskId);
+			const assignment = trim(activeEnvelope?.assignmentId || activeEnvelope?.workId || activeEnvelope?.reviewedAssignmentId);
+			const target = directHttpVerificationUrl(event?.params?.url) || verificationTargetUrl(activeEnvelope);
+			return [run, root, assignment, target].join("|");
+		},
+
     async isRootTaskTerminal(cfg, envelope) {
       return rootEnvelopeIsTerminal(cfg, envelope);
     },
@@ -4353,13 +4479,22 @@ function createRuntime(api) {
       const discoveredArtifactRefs = isLeaderMember(cfg)
         ? await collectRootTaskArtifactRefs(cfg, resultTaskId)
         : await collectMemberAssignmentArtifactRefs(cfg, resultTaskId, cfg.memberId, normalizedCompletionAssignmentId);
+			const explicitCompletionRefs = [
+				...(Array.isArray(params.artifactRefs) ? params.artifactRefs : []),
+				...canonicalTeamArtifactRefsFromText(cfg, resultMarkdown, resultTaskId),
+			];
+			const canonicalReviewRefs = await canonicalizeReviewerCompletionReport(
+				cfg,
+				completionEnvelope,
+				resultTaskId,
+				normalizedCompletionAssignmentId,
+				explicitCompletionRefs,
+			);
       const artifactRefs = await validateArtifactRefs(cfg, [
-        ...(Array.isArray(params.artifactRefs)
-          ? params.artifactRefs.map((ref) => canonicalArtifactAlias(cfg, ref, resultTaskId))
-          : []),
+			...explicitCompletionRefs.map((ref) => canonicalArtifactAlias(cfg, ref, resultTaskId)),
         ...activeArtifactRefs,
         ...discoveredArtifactRefs,
-        ...canonicalTeamArtifactRefsFromText(cfg, resultMarkdown, resultTaskId),
+			...canonicalReviewRefs,
       ]);
       const resultContentHash = teamResultContentHash(resultMarkdown, artifactRefs);
       if (completionEnvelope && await isTaskTerminal(cfg, completionEnvelope)) {
@@ -4928,8 +5063,10 @@ export default definePluginEntry({
     api.on(
       "before_tool_call",
       async (event, ctx) => {
+				const processDecision = teamProcessToolDecision(event);
+				if (processDecision.block) return processDecision;
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
-        const guardKey = trim(event?.runId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId || "active-review");
+				const guardKey = runtime.browserGuardKey(event, ctx);
         const current = reviewerBrowserGuards.get(guardKey) || { calls: 0, startedAt: 0 };
         const decision = runtime.beforeBrowserToolCall(event, current, Date.now());
         if (decision?.state) reviewerBrowserGuards.set(guardKey, decision.state);
@@ -4949,13 +5086,10 @@ export default definePluginEntry({
       "after_tool_call",
       async (event, ctx) => {
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
-        const guardKey = trim(event?.runId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId || "active-review");
+				const guardKey = runtime.browserGuardKey(event, ctx);
         const current = reviewerBrowserGuards.get(guardKey);
         if (!current) return;
-        if (browserToolCallFailed(event) || Number(event?.durationMs || event?.result?.durationMs || 0) >= REVIEW_BROWSER_WINDOW_MS) {
-          current.calls = REVIEW_BROWSER_MAX_CALLS;
-          reviewerBrowserGuards.set(guardKey, current);
-        }
+				reviewerBrowserGuards.set(guardKey, runtime.afterBrowserToolCall(event, current, Date.now()));
       },
       { priority: 100, timeoutMs: 1000 },
     );

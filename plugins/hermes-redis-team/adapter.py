@@ -41,6 +41,7 @@ PROTOCOL_CAPABILITIES = [
     "assignment_heartbeat_v1",
     "durable_turn_facts_v1",
     "team_artifact_preview_v1",
+    "team_artifact_preview_v2",
     "review_contract_v1",
     "validation_contract_v2",
 ]
@@ -452,6 +453,69 @@ def validate_artifact_refs(settings: RedisTeamSettings, refs: Optional[list[str]
     return validated
 
 
+def _assigned_validation_writer(settings: RedisTeamSettings, envelope: dict[str, Any]) -> bool:
+    role = settings.role.lower()
+    member = settings.member_id.lower()
+    return bool(
+        "review" in role
+        or "qa" in role
+        or "review" in member
+        or member == "qa"
+        or envelope.get("validationAssignment")
+        or envelope.get("validation_assignment")
+        or _trim(
+            envelope.get("validationTargetAssignmentId")
+            or envelope.get("validation_target_assignment_id")
+            or envelope.get("reviewedAssignmentId")
+            or envelope.get("reviewed_assignment_id")
+        )
+    )
+
+
+def _canonicalize_reviewer_completion_report(
+    settings: RedisTeamSettings,
+    envelope: dict[str, Any],
+    result_markdown: str,
+    explicit_refs: Optional[list[str]],
+) -> list[str]:
+    root_task_id = _trim(envelope.get("rootTaskId") or envelope.get("taskId"))
+    assignment_id = _trim(envelope.get("assignmentId") or envelope.get("workId"))
+    if not root_task_id or not assignment_id or not _assigned_validation_writer(settings, envelope):
+        return []
+    text_refs = re.findall(r"/team/[^\s`'\"<>()[\]{}]+", result_markdown or "")
+    member_prefix = (
+        f"/team/artifacts/{_safe_name(root_task_id)}/members/"
+        f"{_safe_name(settings.member_id)}/{_safe_name(assignment_id)}/"
+    )
+    candidates: list[str] = []
+    for raw in [*(explicit_refs or []), *text_refs]:
+        ref = _trim(raw).rstrip(".,;:!?锛岋紱锛氥€傦紒")
+        if not ref.startswith(member_prefix) or Path(ref).suffix.lower() not in {".md", ".txt", ".json"}:
+            continue
+        if ref not in candidates:
+            candidates.append(ref)
+    if len(candidates) != 1:
+        return []
+    try:
+        source = settings.shared_path / _artifact_relative_path(candidates[0])
+        if not source.is_file():
+            return []
+        destination = (
+            settings.shared_path
+            / "results"
+            / _safe_name(root_task_id)
+            / "reviews"
+            / _safe_name(assignment_id)
+            / source.name
+        )
+        _assert_no_symlink_traversal(settings.shared_path, source)
+        _assert_no_symlink_traversal(settings.shared_path, destination)
+        _atomic_write_text(destination, source.read_text(encoding="utf-8"))
+        return [canonical_artifact_ref(settings, destination)]
+    except Exception:
+        return []
+
+
 def artifact_metadata(settings: RedisTeamSettings, refs: Optional[list[str]]) -> list[dict[str, Any]]:
     metadata: list[dict[str, Any]] = []
     for canonical in validate_artifact_refs(settings, refs):
@@ -570,7 +634,13 @@ def _preview_url(settings: RedisTeamSettings, target: Path) -> str:
         if signed_prefix
         else "_"
     )
-    payload = f"team-preview-v1\n{settings.team_id}\n{signed_prefix}"
+    interactive = target.suffix.lower() == ".html"
+    mode = "interactive" if interactive else ""
+    payload = (
+        f"team-preview-v2\n{mode}\n{settings.team_id}\n{signed_prefix}"
+        if interactive
+        else f"team-preview-v1\n{settings.team_id}\n{signed_prefix}"
+    )
     signature = (
         base64.urlsafe_b64encode(
             hmac.new(settings.team_token.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
@@ -578,6 +648,12 @@ def _preview_url(settings: RedisTeamSettings, target: Path) -> str:
         .decode("ascii")
         .rstrip("=")
     )
+    if interactive:
+        isolated_host = f"p-{signature[:16].lower()}.clawmanager-team-preview.invalid"
+        return (
+            f"http://{isolated_host}/v2/interactive/"
+            f"{quote(settings.team_id, safe='')}/{encoded_prefix}/{signature}/{quote(parts[-1], safe='')}"
+        )
     return (
         f"{parsed.scheme}://{parsed.netloc}/v1/"
         f"{quote(settings.team_id, safe='')}/{encoded_prefix}/{signature}/{quote(parts[-1], safe='')}"
@@ -1301,6 +1377,13 @@ async def _propose_completion(
     task_id = _trim(envelope.get("taskId") or envelope.get("rootTaskId"))
     if not task_id:
         raise ValueError("active task identity is unavailable")
+    canonical_review_refs = _canonicalize_reviewer_completion_report(
+        settings,
+        envelope,
+        result_markdown,
+        artifact_refs,
+    )
+    normalized_artifact_refs = [*(artifact_refs or []), *canonical_review_refs]
     result = write_task_result(
         settings,
         task_id,
@@ -1308,7 +1391,7 @@ async def _propose_completion(
         status=status,
         summary=summary,
         result_markdown=result_markdown,
-        artifact_refs=artifact_refs,
+        artifact_refs=normalized_artifact_refs,
     )
     completion_id = _completion_id(settings, envelope)
     attempt_id = f"attempt_{uuid.uuid4().hex}"

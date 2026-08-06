@@ -662,6 +662,13 @@ func configWithRequestLLMEnv(cfg gateway.Config, req gateway.CreateGatewayReques
 		}
 		resolved.LLMModelIDs = modelIDs
 	}
+	if raw, ok := requestEnvValue(req, "CLAWMANAGER_LLM_REASONING"); ok && strings.TrimSpace(raw) != "" {
+		reasoning, err := parseLLMReasoning(raw)
+		if err != nil {
+			return gateway.Config{}, err
+		}
+		resolved.LLMReasoning = reasoning
+	}
 	return resolved, nil
 }
 
@@ -703,7 +710,7 @@ func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) {
 		provider["auth"] = "api-key"
 	}
 	if len(cfg.LLMModelIDs) > 0 {
-		provider["models"] = buildOpenClawProviderModels(provider["models"], cfg.LLMModelIDs)
+		provider["models"] = buildOpenClawProviderModels(provider["models"], cfg.LLMModelIDs, cfg.LLMReasoning)
 
 		agents := ensureObject(config, "agents")
 		defaults := ensureObject(agents, "defaults")
@@ -747,20 +754,23 @@ func normalizeOpenClawProviderAuthContracts(config map[string]any) {
 	}
 }
 
-func buildOpenClawProviderModels(existing any, modelIDs []string) []any {
+func buildOpenClawProviderModels(existing any, modelIDs []string, reasoningByID map[string]bool) []any {
 	byID := indexOpenClawModelsByID(existing)
 	models := make([]any, 0, len(modelIDs))
 	for _, id := range modelIDs {
 		if current, ok := byID[id]; ok {
 			cloned := cloneOpenClawMap(current)
 			cloned["id"] = id
+			if reasoning, managed := reasoningByID[id]; managed {
+				cloned["reasoning"] = reasoning
+			}
 			if strings.EqualFold(id, "auto") || strings.TrimSpace(configStringValue(cloned["name"])) == "" {
 				cloned["name"] = displayOpenClawModelName(id)
 			}
 			models = append(models, cloned)
 			continue
 		}
-		models = append(models, defaultOpenClawProviderModel(id))
+		models = append(models, defaultOpenClawProviderModel(id, reasoningByID[id]))
 	}
 	return models
 }
@@ -800,11 +810,11 @@ func buildOpenClawAgentModels(existing any, providerName string, modelIDs []stri
 	return models
 }
 
-func defaultOpenClawProviderModel(id string) map[string]any {
+func defaultOpenClawProviderModel(id string, reasoning bool) map[string]any {
 	return map[string]any{
 		"id":        id,
 		"name":      displayOpenClawModelName(id),
-		"reasoning": false,
+		"reasoning": reasoning,
 		"input": []any{
 			"text",
 		},

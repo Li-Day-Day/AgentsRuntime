@@ -122,6 +122,13 @@ func LoadConfigFromEnv() (Config, error) {
 		}
 		cfg.LLMModelIDs = modelIDs
 	}
+	if raw := strings.TrimSpace(os.Getenv("CLAWMANAGER_LLM_REASONING")); raw != "" {
+		var reasoning map[string]bool
+		if err := json.Unmarshal([]byte(raw), &reasoning); err != nil {
+			return Config{}, fmt.Errorf("parse CLAWMANAGER_LLM_REASONING: %w", err)
+		}
+		cfg.LLMReasoning = reasoning
+	}
 
 	if cfg.ControlToken == "" {
 		return Config{}, errors.New("RUNTIME_AGENT_CONTROL_TOKEN is required")
