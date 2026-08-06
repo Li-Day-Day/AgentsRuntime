@@ -341,7 +341,7 @@ class HermesRedisTeamContractTests(unittest.TestCase):
             url = adapter._preview_url(settings, target)
             self.assertRegex(
                 url,
-                r"^http://p-[a-z0-9_-]{16}\.clawmanager-team-preview\.invalid/v2/interactive/42/",
+                r"^http://clawmanager-egress-proxy\.system\.svc\.cluster\.local:3128/v2/interactive/42/",
             )
             self.assertNotIn("expires", url)
             self.assertNotIn("token", url)

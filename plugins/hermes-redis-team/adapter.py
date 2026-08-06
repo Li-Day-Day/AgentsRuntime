@@ -649,9 +649,11 @@ def _preview_url(settings: RedisTeamSettings, target: Path) -> str:
         .rstrip("=")
     )
     if interactive:
-        isolated_host = f"p-{signature[:16].lower()}.clawmanager-team-preview.invalid"
+        # Start on the resolvable managed service. ClawManager validates this
+        # signed bootstrap URL before redirecting the Browser to the isolated
+        # per-directory origin used for interactive state.
         return (
-            f"http://{isolated_host}/v2/interactive/"
+            f"{parsed.scheme}://{parsed.netloc}/v2/interactive/"
             f"{quote(settings.team_id, safe='')}/{encoded_prefix}/{signature}/{quote(parts[-1], safe='')}"
         )
     return (

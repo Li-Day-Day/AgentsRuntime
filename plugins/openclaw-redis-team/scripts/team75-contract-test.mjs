@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, browserToolCallFailed, teamProcessToolDecision, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
+const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, browserVerificationForCompletion, browserToolCallFailed, teamProcessToolDecision, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -173,6 +173,46 @@ try {
 		1002,
 	);
 	assert.equal(browserState.startedAt, 1002);
+	const managedBrowserState = {};
+	const managedPreviewUrl = "http://clawmanager-egress-proxy.clawmanager-hxc-peer-system.svc.cluster.local:3128/v2/interactive/75/_/signature/index.html";
+	pluginModule.reviewerBrowserToolDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: managedPreviewUrl } },
+		managedBrowserState,
+		1010,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: managedPreviewUrl }, result: { status: "ok" } },
+		managedBrowserState,
+		1011,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "snapshot" }, result: { status: "ok" } },
+		managedBrowserState,
+		1012,
+	);
+	assert.deepEqual(
+		pluginModule.browserVerificationForCompletion(browserEnvelope, managedBrowserState),
+		{
+			verificationMode: "managed_browser",
+			browserVerification: {
+				status: "verified",
+				source: "runtime_tool_events",
+				managedPreview: true,
+				opened: true,
+				inspected: true,
+				targetHash: undefined,
+			},
+		},
+		"only successful managed Browser tool events may produce a managed-browser verification fact",
+	);
+	assert.equal(
+		pluginModule.browserVerificationForCompletion(browserEnvelope, {}).verificationMode,
+		"static_only",
+		"a Reviewer may still complete after static review without claiming Browser verification",
+	);
   for (let index = 0; index < 4; index += 1) {
     const decision = pluginModule.reviewerBrowserToolDecision(
       browserEnvelope,
@@ -204,18 +244,46 @@ try {
 		"fuser 8765/tcp -k",
 	]) {
 		assert.equal(
-			pluginModule.teamProcessToolDecision({ toolName: "exec", params: { command } }).block,
+			pluginModule.teamProcessToolDecision(null, { toolName: "exec", params: { command } }).block,
 			true,
 			`dangerous over-testing command must be blocked: ${command}`,
 		);
 	}
 	for (const command of ["npm test", "npm run dev", "ps -ef", "kill 12345", "python3 scripts/check.py"]) {
 		assert.notEqual(
-			pluginModule.teamProcessToolDecision({ toolName: "exec", params: { command } }).block,
+			pluginModule.teamProcessToolDecision(null, { toolName: "exec", params: { command } }).block,
 			true,
 			`normal project verification must remain available: ${command}`,
 		);
 	}
+	for (const command of [
+		"chromium --headless file:///team/results/index.html",
+		"npx playwright test verify.spec.js",
+		"node -e \"require('puppeteer').launch()\"",
+		"npm install puppeteer",
+		"pip install selenium",
+	]) {
+		assert.equal(
+			pluginModule.teamProcessToolDecision({ role: "reviewer" }, { toolName: "exec", params: { command } }).block,
+			true,
+			`Reviewer Browser bypass must be blocked: ${command}`,
+		);
+	}
+	for (const command of ["npm test", "npm run build", "python3 scripts/check.py", "rg puppeteer package.json"]) {
+		assert.notEqual(
+			pluginModule.teamProcessToolDecision({ role: "reviewer" }, { toolName: "exec", params: { command } }).block,
+			true,
+			`Reviewer source review and existing project checks must remain available: ${command}`,
+		);
+	}
+	assert.notEqual(
+		pluginModule.teamProcessToolDecision({ role: "developer" }, {
+			toolName: "exec",
+			params: { command: "chromium --headless file:///workspace/index.html" },
+		}).block,
+		true,
+		"ordinary Developers must not inherit the Reviewer-only Browser bypass guard",
+	);
   assert.deepEqual(
     pluginModule.normalizePhaseDispositions([
       { phaseId: "phase-2", decision: "skipped", reason: "Phase 1 fully satisfied the goal." },
@@ -299,6 +367,16 @@ try {
   assert.equal(turnFinished.completionRecoveryAttempt, 1);
   assert.equal(turnFinished.visibleToChat, false);
   assert.equal(turnFinished.chatPolicy, "hidden");
+  const incompleteAttempt = pluginModule.assignmentAttemptFailedEvent({ taskId: "team-75-task-150" });
+  assert.equal(incompleteAttempt.eventKind, "assignment_attempt_failed");
+  assert.equal(incompleteAttempt.stateEffect, "none");
+  assert.equal(incompleteAttempt.retryable, true);
+  assert.equal(incompleteAttempt.rootTaskTerminal, false);
+  assert.equal(pluginModule.isIncompleteTurnDelivery({
+    isError: true,
+    text: "Agent couldn't generate a response. Please try again.",
+  }), true);
+  assert.equal(pluginModule.isIncompleteTurnDelivery({ isError: true, text: "Unauthorized" }), false);
   assert.deepEqual(
     pluginModule.mergeActiveTurnFacts(
       { outbound: null, completionPending: false, artifactRefs: ["/team/a.md"] },
@@ -521,9 +599,9 @@ try {
   assert.equal(preview.artifact.path, "/team/index.html");
   assert.match(
     preview.artifact.previewUrl,
-    /^http:\/\/p-[a-z0-9_-]{16}\.clawmanager-team-preview\.invalid\/v2\/interactive\/75\/_\/[A-Za-z0-9_-]+\/index\.html$/,
+    /^http:\/\/clawmanager-egress-proxy\.clawmanager-hxc-peer-system\.svc\.cluster\.local:3128\/v2\/interactive\/75\/_\/[A-Za-z0-9_-]+\/index\.html$/,
   );
-	assert.equal(new URL(preview.artifact.previewUrl).port, "", "interactive previews use the isolated proxy origin without a target port");
+	assert.equal(new URL(preview.artifact.previewUrl).port, "3128", "interactive previews bootstrap through the resolvable managed proxy");
   assert.equal(new URL(preview.artifact.previewUrl).search, "", "preview links must not carry an expiry");
   process.env.CLAWMANAGER_TEAM_PREVIEW_ORIGIN = "http://clawmanager-team-preview.invalid";
   const legacyPreviewUrl = pluginModule.previewUrlForTeamArtifact(
