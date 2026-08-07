@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readLastToolOutcomeFromDispatch, completionProposalProvenance };\n";
+const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, inferCanonicalArtifactWriteContract, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readLastToolOutcomeFromDispatch, completionProposalProvenance };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -1053,6 +1053,16 @@ try {
     "/team/results/team-75-task-150/reviews/review-01/wrong-review-report.md",
     "a stale target/retry directory must normalize into the active validation assignment",
   );
+  const normalizedReviewDirectory = toolResult(
+    await reviewerTools.get("team_artifact_mkdir").execute("review-mkdir-wrong-assignment", {
+      path: "/team/results/team-75-task-150/reviews/dev-01",
+    }),
+  );
+  assert.equal(
+    normalizedReviewDirectory.artifact.path,
+    "/team/results/team-75-task-150/reviews/review-01",
+    "review directory creation must use the same tolerant canonical lane as file writes",
+  );
   const legacyPrefixedReview = toolResult(await reviewerTools.get("team_artifact_write").execute("review-prefixed", {
     scope: "team",
     kind: "review",
@@ -1153,6 +1163,78 @@ try {
     "leader-final-synthesis",
     "Leader synthesis must not inherit the Reviewer's assignment identity",
   );
+
+  const staleWorkspaceEnvelope = pluginModule.normalizeEnvelope({
+    taskId: "team-28-task-64",
+    rootTaskId: "team-28-task-64",
+    to: "delivery-lead",
+    prompt: "Continue task 64; the conversation may still discuss team-28-task-63.",
+    workspaceContract: {
+      physicalSharedDir: "/workspaces/teams/user-1/team-28-shared",
+      taskRef: "team-28-task-63",
+      artifactRoot: "/team/artifacts/team-28-task-63",
+      extensionField: "preserved",
+    },
+    sharedWorkspace: {
+      physicalPath: "/workspaces/teams/user-1/team-28-shared",
+      taskWorkCanonicalRoot: "/team/work/team-28-task-63",
+    },
+  });
+  assert.equal(staleWorkspaceEnvelope.workspaceContract.taskRef, "team-28-task-64");
+  assert.equal(staleWorkspaceEnvelope.workspaceContract.artifactRoot, "/team/artifacts/team-28-task-64");
+  assert.equal(staleWorkspaceEnvelope.workspaceContract.extensionField, "preserved");
+  assert.equal(staleWorkspaceEnvelope.sharedWorkspace.taskWorkCanonicalRoot, "/team/work/team-28-task-64");
+  assert.match(staleWorkspaceEnvelope.text, /team-28-task-63/, "historical conversation text must remain intact");
+
+  const proseArtifactRefs = pluginModule.canonicalTeamArtifactRefsFromText(
+    { sharedDir: shared },
+    [
+      "/team/results/team-28-task-64/plan/collaboration-plan.md，随后派发任务",
+      "/team/artifacts/team-28-task-64/members/developer/dev-board/index.html（40786 字节）",
+      "/team/results/team-28-task-64/reviews/review-board/review-report.md（zh-CN），含结论",
+      "/team/results/team-28-task-64/reviews/review-board/，并继续",
+    ].join("\n"),
+    "team-28-task-64",
+  );
+  assert.deepEqual(proseArtifactRefs, [
+    "/team/results/team-28-task-64/plan/collaboration-plan.md",
+    "/team/artifacts/team-28-task-64/members/developer/dev-board/index.html",
+    "/team/results/team-28-task-64/reviews/review-board/review-report.md",
+  ]);
+
+  const inferredReviewDirectory = pluginModule.inferCanonicalArtifactWriteContract(
+    { memberId: "reviewer", role: "reviewer" },
+    { path: "/team/results/team-75-task-150/reviews/dev-01" },
+    {
+      rootTaskId: "team-75-task-150",
+      assignmentId: "review-01",
+      validationAssignment: true,
+      validationTargetAssignmentId: "dev-01",
+    },
+  );
+  assert.deepEqual(inferredReviewDirectory, {
+    path: "/team/results/team-75-task-150/reviews/review-01",
+    scope: "team",
+    kind: "review",
+  });
+
+  const monotonicPreviewUrl = "http://p-abcdefghijklmnop.clawmanager-team-preview.invalid/v2/interactive/test/index.html";
+  const openEvidence = pluginModule.reviewerBrowserToolResultDecision(
+    browserEnvelope,
+    { toolName: "browser", params: { action: "open", url: monotonicPreviewUrl }, result: { targetId: "target-1" } },
+    {},
+    1000,
+  );
+  assert.equal(openEvidence.managedPreviewOpened, true, "a successful open is evidence even if pending in-memory state was lost");
+  const laterSnapshotFailure = pluginModule.reviewerBrowserToolResultDecision(
+    browserEnvelope,
+    { toolName: "browser", params: { action: "snapshot" }, error: "ENOTFOUND" },
+    openEvidence,
+    1100,
+  );
+  const monotonicEvidence = pluginModule.mergeBrowserVerificationState(openEvidence, laterSnapshotFailure);
+  assert.equal(monotonicEvidence.managedPreviewOpened, true, "a later Browser error must not erase a successful open");
+  assert.equal(monotonicEvidence.managedPreviewInspected, undefined);
 
   assert.match(source, /function analyzeResponseLocale\(/);
   assert.doesNotMatch(source, /must use \$\{locale \|\| "zh-CN"\}/);

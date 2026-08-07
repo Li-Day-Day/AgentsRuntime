@@ -28,6 +28,12 @@ function replaceOnce(source, needle, replacement, label) {
   return source.replace(needle, replacement);
 }
 
+function replaceEvery(source, needle, replacement, label) {
+  const occurrences = source.split(needle).length - 1;
+  if (occurrences < 1) throw new Error(`expected at least one ${label}, found ${occurrences}`);
+  return source.split(needle).join(replacement);
+}
+
 function verify(source, requirements, label) {
   for (const required of requirements) {
     if (!source.includes(required)) throw new Error(`${label} patch is incomplete: ${required}`);
@@ -95,14 +101,35 @@ if (patching && !routeSource.includes(contextMarker)) {
     "\t\t\t\tconst ssrfPolicy = browserNavigationPolicyForProfile(ctx, profileCtx).ssrfPolicy;",
     "Playwright act SSRF policy binding",
   );
-  fs.writeFileSync(routeTarget, routeSource);
 }
+if (patching && routeSource.includes("ssrfPolicy: ctx.state().resolved.ssrfPolicy")) {
+  if (routeSource.includes("\t\t\trun: async ({ cdpUrl, tab, pw, resolveTabUrl }) => {")) {
+    routeSource = replaceEvery(
+      routeSource,
+      "\t\t\trun: async ({ cdpUrl, tab, pw, resolveTabUrl }) => {",
+      "\t\t\trun: async ({ profileCtx, cdpUrl, tab, pw, resolveTabUrl }) => {",
+      "Playwright route profile context binding",
+    );
+  }
+  routeSource = replaceEvery(
+    routeSource,
+    "ssrfPolicy: ctx.state().resolved.ssrfPolicy",
+    "ssrfPolicy: browserNavigationPolicyForProfile(ctx, profileCtx).ssrfPolicy",
+    "profile-scoped Browser SSRF policy binding",
+  );
+}
+if (patching) fs.writeFileSync(routeTarget, routeSource);
 routeSource = fs.readFileSync(routeTarget, "utf8");
 verify(routeSource, [
   contextMarker,
   "__clawmanagerBrowserProxyMode: policy.browserProxyMode",
   "const ssrfPolicy = browserNavigationPolicyForProfile(ctx, profileCtx).ssrfPolicy;",
+  "run: async ({ profileCtx, cdpUrl, tab, pw, resolveTabUrl }) => {",
+  "ssrfPolicy: browserNavigationPolicyForProfile(ctx, profileCtx).ssrfPolicy",
 ], "OpenClaw managed Preview Browser route context");
+if (routeSource.includes("ssrfPolicy: ctx.state().resolved.ssrfPolicy")) {
+  throw new Error("OpenClaw managed Preview Browser route context still contains an unscoped SSRF policy");
+}
 
 const playwrightMarker = "CLAWMANAGER_MANAGED_PREVIEW_PROXY_POLICY";
 const playwrightTarget = singleModule(/^pw-ai-.*\.js$/, "async function assertPageNavigationCompletedSafely(opts)", "Playwright bridge");

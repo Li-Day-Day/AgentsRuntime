@@ -653,9 +653,8 @@ function inferCanonicalArtifactWriteContract(cfg, params, activeEnvelope) {
   if (!relative.startsWith(prefix)) return current;
   const remainder = relative.slice(prefix.length);
   const separator = remainder.indexOf("/");
-  if (separator <= 0 || separator === remainder.length - 1) return current;
-  const reportRelative = remainder.slice(separator + 1);
-  if (!reportRelative || reportRelative.split("/").includes("..")) return current;
+  const reportRelative = separator >= 0 ? remainder.slice(separator + 1) : "";
+  if (reportRelative.split("/").includes("..")) return current;
 
   // The active assignment envelope, not Agent-authored directory text, owns
   // the validation report lane. A validator may accidentally use the target
@@ -663,7 +662,10 @@ function inferCanonicalArtifactWriteContract(cfg, params, activeEnvelope) {
   // lane instead of failing the tool call or widening access to another root.
   return {
     ...current,
-    path: `/team/results/${rootTaskId}/reviews/${activeAssignmentId}/${reportRelative}`,
+    path: [
+      `/team/results/${rootTaskId}/reviews/${activeAssignmentId}`,
+      reportRelative,
+    ].filter(Boolean).join("/"),
     scope: "team",
     kind: "review",
   };
@@ -1307,10 +1309,23 @@ function teamResultContentHash(resultMarkdown, artifactRefs = []) {
 function canonicalTeamArtifactRefsFromText(cfg, text, rootTaskId = "") {
   const refs = [];
   const seen = new Set();
-  const pattern = /(?:\/team\/|\$\{?CLAWMANAGER_TEAM_SHARED_DIR\}?\/|\/workspaces\/teams\/[^\s/]+\/team-[^\s/]+-shared\/)[^\s)\]}>`,"']+/gi;
-  for (const match of String(text || "").match(pattern) || []) {
-    const ref = match.replace(/[.,;:!?。；：，、！]+$/u, "");
-    const canonicalRef = canonicalArtifactAlias(cfg, ref.replace(/[，。；：、！？]+$/u, ""), rootTaskId);
+  const source = String(text || "");
+  const prefixes = "(?:\\/team\\/|\\$\\{?CLAWMANAGER_TEAM_SHARED_DIR\\}?\\/|\\/workspaces\\/teams\\/[^\\s/]+\\/team-[^\\s/]+-shared\\/)";
+  const candidates = [];
+  // Explicit Markdown/code delimiters establish an exact path boundary.
+  for (const pattern of [
+    new RegExp("`(" + prefixes + "[^`\\r\\n]+)`", "giu"),
+    new RegExp("\\]\\((" + prefixes + "[^)\\r\\n\\s]+)\\)", "giu"),
+  ]) {
+    for (const match of source.matchAll(pattern)) candidates.push(match[1]);
+  }
+  // Bare references use a filesystem-path grammar rather than \S+. Unicode
+  // letters and numbers remain valid filenames, while prose punctuation and
+  // explanatory parentheses cannot be swallowed into the reference.
+  const bare = new RegExp(prefixes + "[\\p{L}\\p{N}._~%+@=\\/-]+", "giu");
+  for (const match of source.matchAll(bare)) candidates.push(match[0]);
+  for (const ref of candidates) {
+    const canonicalRef = canonicalArtifactAlias(cfg, ref, rootTaskId);
     if (!canonicalRef || canonicalRef.endsWith("/") || !isCanonicalTeamArtifactRef(canonicalRef) || seen.has(canonicalRef)) continue;
     seen.add(canonicalRef);
     refs.push(canonicalRef);
@@ -1875,7 +1890,28 @@ const REVIEW_BROWSER_PREPARATION_ACTIONS = new Set(["status", "start"]);
 const REVIEW_BROWSER_EVIDENCE_ACTIONS = new Set(["snapshot", "screenshot", "act", "evaluate", "inspect"]);
 
 function browserToolAction(event) {
-  return trim(event?.params?.action || event?.arguments?.action || event?.input?.action).toLowerCase();
+  const explicit = trim(
+    event?.params?.action ||
+      event?.arguments?.action ||
+      event?.input?.action ||
+      event?.args?.action ||
+      event?.toolArgs?.action,
+  ).toLowerCase();
+  if (explicit) return explicit;
+  const suffix = trim(event?.toolName)
+    .toLowerCase()
+    .match(/^browser[.:/_-](status|start|open|snapshot|screenshot|act|evaluate|inspect)$/);
+  return suffix?.[1] || "";
+}
+
+function browserToolTargetUrl(event) {
+  return directHttpVerificationUrl(
+    event?.params?.url ||
+      event?.arguments?.url ||
+      event?.input?.url ||
+      event?.args?.url ||
+      event?.toolArgs?.url,
+  );
 }
 
 function directHttpVerificationUrl(value) {
@@ -1914,7 +1950,7 @@ function reviewerBrowserToolDecision(envelope, event, state, now = Date.now()) {
 	}
 	if (!guard.startedAt && action === "open") {
 		guard.pendingOpen = true;
-		guard.pendingTarget = directHttpVerificationUrl(event?.params?.url || event?.arguments?.url || event?.input?.url);
+		guard.pendingTarget = browserToolTargetUrl(event);
 		return { state: guard };
 	}
 	if (!guard.startedAt) {
@@ -1949,14 +1985,14 @@ function reviewerBrowserToolResultDecision(envelope, event, state, now = Date.no
 		guard.startedAt = guard.startedAt || now;
 		return guard;
 	}
-	if (action === "open" && guard.pendingOpen) {
+	if (action === "open") {
 		guard.pendingOpen = false;
 		guard.startedAt = now;
 		// Opening the managed target establishes the verification session; it is
 		// preparation, not evidence. Reserve the bounded evidence budget for the
 		// actual snapshot/evaluate/interaction sequence.
 		guard.calls = 0;
-		guard.targetUrl = guard.pendingTarget || verificationTargetUrl(envelope);
+		guard.targetUrl = browserToolTargetUrl(event) || guard.pendingTarget || verificationTargetUrl(envelope) || guard.targetUrl;
 		guard.managedPreviewOpened = isManagedInteractivePreviewUrl(guard.targetUrl);
 		guard.targetId = trim(event?.result?.targetId || event?.output?.targetId || event?.targetId) || guard.targetId;
 		guard.lastSuccessfulAction = "open";
@@ -2261,7 +2297,14 @@ function isWorkflowReminderEnvelope(envelope) {
     "leader_workflow_decision",
     "leader_decision_reminder",
     "leader_synthesis_reminder",
-  ].includes(intent) || ["leader_decision_reminder", "leader_synthesis_reminder"].includes(kind);
+    "root_coordination_recovery",
+    "root_assignment_recovery",
+  ].includes(intent) || [
+    "leader_decision_reminder",
+    "leader_synthesis_reminder",
+    "root_coordination_recovery_requested",
+    "root_assignment_recovery_requested",
+  ].includes(kind);
 }
 
 async function collectRootTaskArtifactRefs(cfg, rootTaskId) {
@@ -3230,6 +3273,45 @@ function taskEvent(cfg, event, envelope, extra = {}) {
 }
 
 // ============ Message Envelope ============
+function normalizeEnvelopeWorkspaceContext(envelope) {
+  const rootTaskId = preferredRootTaskId(envelope?.rootTaskId, envelope?.taskId);
+  if (!isClawManagerRootTaskRef(rootTaskId)) return envelope;
+
+  const workspaceContract = { ...(envelope.workspaceContract || {}) };
+  const sharedWorkspace = { ...(envelope.sharedWorkspace || {}) };
+  const physicalRoot = trim(workspaceContract.physicalSharedDir || sharedWorkspace.physicalPath);
+  const memberId = safeName(envelope.to || "member");
+
+  // These fields describe the active root task, not conversation memory. Old
+  // ClawManager payloads could carry a previous root's contract into a new
+  // envelope; derive the current paths from the signed envelope identity while
+  // preserving all historical chat and non-task contract extensions.
+  workspaceContract.taskRef = rootTaskId;
+  workspaceContract.artifactRoot = `/team/artifacts/${rootTaskId}`;
+  workspaceContract.memberArtifactRoot = `/team/artifacts/${rootTaskId}/members/\${memberId}/\${assignmentId}`;
+  workspaceContract.memberArtifactPhysicalRoot = physicalRoot
+    ? path.join(physicalRoot, "artifacts", rootTaskId, "members", "${memberId}", "${assignmentId}")
+    : workspaceContract.memberArtifactPhysicalRoot;
+  workspaceContract.leaderPlanRoot = `/team/results/${rootTaskId}/plan`;
+  workspaceContract.reviewResultRoot = `/team/results/${rootTaskId}/reviews/\${assignmentId}`;
+  workspaceContract.memberResultRoot = `/team/results/${rootTaskId}/members/\${memberId}`;
+  workspaceContract.leaderResultRoot = `/team/results/${rootTaskId}`;
+  workspaceContract.statusRoot = `/team/status/${rootTaskId}`;
+
+  sharedWorkspace.memberArtifactCanonicalRoot = `/team/artifacts/${rootTaskId}/members/${memberId}`;
+  sharedWorkspace.taskWorkCanonicalRoot = `/team/work/${rootTaskId}`;
+  sharedWorkspace.taskContextCanonicalRoot = `/team/results/${rootTaskId}/context`;
+  if (physicalRoot) {
+    sharedWorkspace.physicalPath = physicalRoot;
+    sharedWorkspace.memberArtifactPhysicalRoot = path.join(physicalRoot, "artifacts", rootTaskId, "members", memberId);
+    sharedWorkspace.taskWorkPhysicalRoot = path.join(physicalRoot, "work", rootTaskId);
+    sharedWorkspace.taskContextPhysicalRoot = path.join(physicalRoot, "results", rootTaskId, "context");
+  }
+  envelope.workspaceContract = workspaceContract;
+  envelope.sharedWorkspace = sharedWorkspace;
+  return envelope;
+}
+
 function normalizeEnvelope(raw) {
   if (!raw || typeof raw !== "object") return null;
   const text = raw.text || raw.prompt || raw.rawPayload || "";
@@ -3342,7 +3424,7 @@ function normalizeEnvelope(raw) {
     resultSink: raw.resultSink || {},
     idempotencyKey: raw.idempotencyKey || raw.messageId,
   };
-  return envelope;
+  return normalizeEnvelopeWorkspaceContext(envelope);
 }
 
 function processedMessageKey(cfg, key) {
