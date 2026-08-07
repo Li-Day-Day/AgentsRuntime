@@ -1,0 +1,22 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+export HOME=/config
+export CLAWMANAGER_AGENT_RUNTIME_TYPE="${CLAWMANAGER_AGENT_RUNTIME_TYPE:-workbuddy}"
+export CLAWMANAGER_AGENT_PERSISTENT_DIR="${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}"
+export CLAWMANAGER_AGENT_SKILL_DIRS="${CLAWMANAGER_AGENT_SKILL_DIRS:-/config/.workbuddy/skills}"
+export WORKBUDDY_MODEL_CONFIG_PATH="${WORKBUDDY_MODEL_CONFIG_PATH:-/config/.workbuddy/models.json}"
+
+mkdir -p /config/.workbuddy/agent /config/.workbuddy/skills
+chown -R abc:abc /config/.workbuddy
+
+# Model injection is useful even when the remote management agent is disabled.
+s6-setuidgid abc /usr/local/bin/clawmanager-agent apply-runtime-config
+
+if [[ "${CLAWMANAGER_AGENT_ENABLED:-false}" != "true" ]]; then
+    echo "[svc-workbuddy-agent] ClawManager instance agent disabled"
+    exec sleep infinity
+fi
+
+echo "[svc-workbuddy-agent] Starting ClawManager WorkBuddy instance agent..."
+exec s6-setuidgid abc /usr/local/bin/clawmanager-agent

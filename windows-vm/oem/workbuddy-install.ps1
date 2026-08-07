@@ -37,11 +37,21 @@ try {
 
     Write-InstallLog "Installing WorkBuddy"
     $workBuddyArgs = "/S"
-    $process = Start-Process -FilePath $workBuddyInstaller -ArgumentList $workBuddyArgs -Wait -PassThru
-    Write-InstallLog "WorkBuddy installer exited with code $($process.ExitCode)"
+    $process = Start-Process -FilePath $workBuddyInstaller -ArgumentList $workBuddyArgs -PassThru
+    $finished = $process.WaitForExit(600000)
+    if ($finished) {
+        Write-InstallLog "WorkBuddy installer exited with code $($process.ExitCode)"
+        if ($process.ExitCode -ne 0) {
+            throw "WorkBuddy installer failed with exit code $($process.ExitCode)"
+        }
+    } else {
+        Write-InstallLog "WorkBuddy installer wait timed out after 10 minutes; continuing with installation verification"
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    }
 
-    if ($process.ExitCode -ne 0) {
-        throw "WorkBuddy installer failed with exit code $($process.ExitCode)"
+    $installedWorkBuddy = Join-Path $env:LOCALAPPDATA "Programs\WorkBuddy\WorkBuddy.exe"
+    if (-not (Test-Path $installedWorkBuddy)) {
+        throw "WorkBuddy executable not found after installation: $installedWorkBuddy"
     }
 
     New-Item -ItemType File -Path $marker -Force | Out-Null

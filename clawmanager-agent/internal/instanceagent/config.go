@@ -11,45 +11,57 @@ import (
 )
 
 type Config struct {
-	Enabled          bool
-	BaseURL          string
-	BootstrapToken   string
-	InstanceID       string
-	AgentID          string
-	ProtocolVersion  string
-	PersistentDir    string
-	DiskLimitBytes   int64
-	AgentVersion     string
-	RuntimeCommand   string
-	HTTPAddr         string
-	SkillDirs        []string
-	HeartbeatEvery   time.Duration
-	CommandPollEvery time.Duration
-	StateReportEvery time.Duration
-	SkillScanEvery   time.Duration
+	Enabled            bool
+	RuntimeType        string
+	BaseURL            string
+	BootstrapToken     string
+	InstanceID         string
+	AgentID            string
+	ProtocolVersion    string
+	PersistentDir      string
+	DiskLimitBytes     int64
+	AgentVersion       string
+	RuntimeCommand     string
+	RuntimeVersionFile string
+	HTTPAddr           string
+	SkillDirs          []string
+	SkillInstallDir    string
+	ModelConfigPath    string
+	HeartbeatEvery     time.Duration
+	CommandPollEvery   time.Duration
+	StateReportEvery   time.Duration
+	SkillScanEvery     time.Duration
 }
 
 func LoadConfig(version string) (Config, error) {
 	persistentDir := getenv("CLAWMANAGER_AGENT_PERSISTENT_DIR", "/config")
 	instanceID := os.Getenv("CLAWMANAGER_AGENT_INSTANCE_ID")
+	runtimeType := instanceRuntimeType()
+	runtimeCommand, runtimeVersionFile, skillDirs, modelConfigPath := runtimeDefaults(runtimeType)
 
 	cfg := Config{
-		Enabled:          strings.EqualFold(os.Getenv("CLAWMANAGER_AGENT_ENABLED"), "true"),
-		BaseURL:          strings.TrimRight(os.Getenv("CLAWMANAGER_AGENT_BASE_URL"), "/"),
-		BootstrapToken:   os.Getenv("CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN"),
-		InstanceID:       instanceID,
-		AgentID:          getenv("CLAWMANAGER_AGENT_ID", fmt.Sprintf("hermes-%s-main", fallback(instanceID, "unknown"))),
-		ProtocolVersion:  getenv("CLAWMANAGER_AGENT_PROTOCOL_VERSION", "v1"),
-		PersistentDir:    persistentDir,
-		DiskLimitBytes:   getenvInt64("CLAWMANAGER_AGENT_DISK_LIMIT_BYTES", 0),
-		AgentVersion:     version,
-		RuntimeCommand:   getenv("HERMES_COMMAND", "hermes"),
-		HTTPAddr:         normalizeHTTPAddr(os.Getenv("HERMES_AGENT_HTTP_ADDR")),
-		SkillDirs:        parseSkillDirs(getenv("HERMES_SKILL_DIRS", "/config/hermes/skills:/config/.hermes/skills")),
-		HeartbeatEvery:   getenvDuration("HERMES_AGENT_HEARTBEAT_INTERVAL_SECONDS", 15*time.Second),
-		CommandPollEvery: getenvDuration("HERMES_AGENT_COMMAND_POLL_INTERVAL_SECONDS", 5*time.Second),
-		StateReportEvery: getenvDuration("HERMES_AGENT_STATE_INTERVAL_SECONDS", 5*time.Second),
-		SkillScanEvery:   getenvDuration("HERMES_AGENT_SKILL_SCAN_INTERVAL_SECONDS", 5*time.Minute),
+		Enabled:            strings.EqualFold(os.Getenv("CLAWMANAGER_AGENT_ENABLED"), "true"),
+		RuntimeType:        runtimeType,
+		BaseURL:            strings.TrimRight(os.Getenv("CLAWMANAGER_AGENT_BASE_URL"), "/"),
+		BootstrapToken:     os.Getenv("CLAWMANAGER_AGENT_BOOTSTRAP_TOKEN"),
+		InstanceID:         instanceID,
+		AgentID:            getenv("CLAWMANAGER_AGENT_ID", fmt.Sprintf("%s-%s-main", runtimeType, fallback(instanceID, "unknown"))),
+		ProtocolVersion:    getenv("CLAWMANAGER_AGENT_PROTOCOL_VERSION", "v1"),
+		PersistentDir:      persistentDir,
+		DiskLimitBytes:     getenvInt64("CLAWMANAGER_AGENT_DISK_LIMIT_BYTES", 0),
+		AgentVersion:       version,
+		RuntimeCommand:     getenv("CLAWMANAGER_AGENT_RUNTIME_COMMAND", getenv("HERMES_COMMAND", runtimeCommand)),
+		RuntimeVersionFile: getenv("CLAWMANAGER_AGENT_RUNTIME_VERSION_FILE", runtimeVersionFile),
+		HTTPAddr:           normalizeHTTPAddr(firstEnv("CLAWMANAGER_AGENT_HTTP_ADDR", "HERMES_AGENT_HTTP_ADDR")),
+		SkillDirs:          parseSkillDirs(getenv("CLAWMANAGER_AGENT_SKILL_DIRS", getenv("HERMES_SKILL_DIRS", skillDirs))),
+		ModelConfigPath:    getenv("WORKBUDDY_MODEL_CONFIG_PATH", modelConfigPath),
+		HeartbeatEvery:     getenvDuration("HERMES_AGENT_HEARTBEAT_INTERVAL_SECONDS", 15*time.Second),
+		CommandPollEvery:   getenvDuration("HERMES_AGENT_COMMAND_POLL_INTERVAL_SECONDS", 5*time.Second),
+		StateReportEvery:   getenvDuration("HERMES_AGENT_STATE_INTERVAL_SECONDS", 5*time.Second),
+		SkillScanEvery:     getenvDuration("HERMES_AGENT_SKILL_SCAN_INTERVAL_SECONDS", 5*time.Minute),
+	}
+	if len(cfg.SkillDirs) > 0 {
+		cfg.SkillInstallDir = cfg.SkillDirs[0]
 	}
 
 	if !cfg.Enabled {
@@ -71,7 +83,41 @@ func LoadConfig(version string) (Config, error) {
 }
 
 func (c Config) WorkDir() string {
+	if c.RuntimeType == "workbuddy" {
+		return filepath.Join(c.PersistentDir, ".workbuddy", "agent")
+	}
 	return filepath.Join(c.PersistentDir, "hermes-agent")
+}
+
+func instanceRuntimeType() string {
+	runtimeType := strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_AGENT_RUNTIME_TYPE")))
+	if runtimeType == "" {
+		runtimeType = strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_RUNTIME_TYPE")))
+	}
+	switch runtimeType {
+	case "workbuddy", "hermes":
+		return runtimeType
+	default:
+		// Desktop/gateway are backend placement markers used by existing Hermes
+		// deployments, not product runtime names.
+		return "hermes"
+	}
+}
+
+func runtimeDefaults(runtimeType string) (command, versionFile, skillDirs, modelConfigPath string) {
+	if runtimeType == "workbuddy" {
+		return "/opt/workbuddy/electron", "/opt/workbuddy/.workbuddy-linux/build-info.json", "/config/.workbuddy/skills", "/config/.workbuddy/models.json"
+	}
+	return "hermes", "", "/config/hermes/skills:/config/.hermes/skills", ""
+}
+
+func firstEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (c Config) AgentAPIURL(path string) string {

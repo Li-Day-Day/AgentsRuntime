@@ -5,6 +5,15 @@ export HOME=/config
 export DISPLAY=:1
 export XDG_RUNTIME_DIR=/config/.XDG
 export QT_QPA_PLATFORM=xcb
+export CLAWMANAGER_AGENT_RUNTIME_TYPE="${CLAWMANAGER_AGENT_RUNTIME_TYPE:-workbuddy}"
+export CLAWMANAGER_AGENT_PERSISTENT_DIR="${CLAWMANAGER_AGENT_PERSISTENT_DIR:-/config}"
+export CLAWMANAGER_AGENT_SKILL_DIRS="${CLAWMANAGER_AGENT_SKILL_DIRS:-/config/.workbuddy/skills}"
+export WORKBUDDY_MODEL_CONFIG_PATH="${WORKBUDDY_MODEL_CONFIG_PATH:-/config/.workbuddy/models.json}"
+
+mkdir -p /config/.workbuddy/skills
+chown -R abc:abc /config/.workbuddy
+# Complete configuration before the desktop application reads model.json.
+s6-setuidgid abc /usr/local/bin/clawmanager-agent apply-runtime-config
 
 if [[ "${PIXELFLUX_WAYLAND,,}" == "true" ]]; then
     export WAYLAND_DISPLAY=wayland-0

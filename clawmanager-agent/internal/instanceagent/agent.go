@@ -38,6 +38,13 @@ func New(cfg Config, logger *slog.Logger) *Agent {
 }
 
 func (a *Agent) Run(ctx context.Context) error {
+	configResult, err := ApplyManagedRuntimeConfig(a.cfg)
+	if err != nil {
+		return err
+	}
+	if configResult.ModelCount > 0 {
+		a.logger.Info("managed model config applied", "runtime", a.cfg.RuntimeType, "models", configResult.ModelCount, "changed", configResult.Changed)
+	}
 	if err := os.MkdirAll(filepath.Join(a.cfg.WorkDir(), "logs"), 0o755); err != nil {
 		return err
 	}
@@ -56,7 +63,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		}()
 	}
 
-	a.logger.Info("Hermes runtime agent started", "agent_id", a.cfg.AgentID, "instance_id", a.cfg.InstanceID)
+	a.logger.Info("instance runtime agent started", "runtime", a.cfg.RuntimeType, "agent_id", a.cfg.AgentID, "instance_id", a.cfg.InstanceID)
 
 	a.tryInitialReports(ctx)
 
@@ -242,6 +249,13 @@ func (a *Agent) syncSkillInventory(ctx context.Context, mode, trigger string) ([
 	if err != nil {
 		return nil, err
 	}
+	for index := range skills {
+		skills[index].Type = a.cfg.RuntimeType + "-skill"
+		if skills[index].Metadata == nil {
+			skills[index].Metadata = map[string]any{}
+		}
+		skills[index].Metadata["runtime"] = a.cfg.RuntimeType
+	}
 
 	body := SkillInventoryBody{
 		AgentID:    a.cfg.AgentID,
@@ -357,6 +371,47 @@ func (a *Agent) executeCommand(ctx context.Context, cmd *Command) (map[string]an
 			return nil, err
 		}
 		return map[string]any{"message": "skill inventory refreshed", "skill_count": len(skills)}, nil
+	case "install_skill", "update_skill":
+		skillVersion := firstPayloadString(cmd.Payload, "skill_version", "skill_version_id")
+		if skillVersion == "" {
+			return nil, errors.New("skill_version is required")
+		}
+		var archive []byte
+		if err := a.withSession(ctx, func(token string) error {
+			var downloadErr error
+			archive, downloadErr = a.client.downloadSkill(ctx, token, skillVersion)
+			return downloadErr
+		}); err != nil {
+			return nil, err
+		}
+		result, err := InstallSkillArchive(a.cfg.SkillInstallDir, cmd.Payload, archive)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := a.syncSkillInventory(ctx, "incremental", cmd.Type); err != nil {
+			return nil, err
+		}
+		return result, nil
+	case "uninstall_skill", "remove_skill":
+		result, err := UninstallSkill(a.cfg.SkillInstallDir, cmd.Payload)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := a.syncSkillInventory(ctx, "incremental", cmd.Type); err != nil {
+			return nil, err
+		}
+		return result, nil
+	case "apply_config_revision", "reload_config":
+		applied, err := ApplyManagedRuntimeConfig(a.cfg)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"message":     "managed runtime config applied",
+			"changed":     applied.Changed,
+			"model_count": applied.ModelCount,
+			"digest":      applied.Digest,
+		}, nil
 	case "collect_skill_package":
 		skill, err := a.findCommandSkill(ctx, cmd)
 		if err != nil {
@@ -381,7 +436,7 @@ func (a *Agent) executeCommand(ctx context.Context, cmd *Command) (map[string]an
 			"content_md5": skill.ContentMD5,
 		}, nil
 	case "start_openclaw", "stop_openclaw", "restart_openclaw":
-		return map[string]any{"message": "ignored compatibility command for Hermes runtime"}, nil
+		return map[string]any{"message": "ignored compatibility command for " + a.cfg.RuntimeType + " runtime"}, nil
 	default:
 		return nil, fmt.Errorf("unsupported command type: %s", cmd.Type)
 	}

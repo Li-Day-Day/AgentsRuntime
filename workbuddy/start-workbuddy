@@ -10,8 +10,23 @@ export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME"
 
-if pgrep -u "$(id -u)" -f '/opt/workbuddy/(electron|start\.sh)' >/dev/null 2>&1; then
-    exit 0
-fi
+while IFS= read -r pid; do
+    [[ -r "/proc/$pid/cmdline" ]] || continue
+    mapfile -d '' -t argv < "/proc/$pid/cmdline" || true
+    [[ "${argv[0]:-}" == "/opt/workbuddy/electron" ]] || continue
+
+    is_child=false
+    for arg in "${argv[@]:1}"; do
+        case "$arg" in
+            --version|--type=*|*app.asar/*|*app.asar.unpacked/*)
+                is_child=true
+                break
+                ;;
+        esac
+    done
+    if [[ "$is_child" == "false" ]]; then
+        exit 0
+    fi
+done < <(pgrep -u "$(id -u)" -x electron 2>/dev/null || true)
 
 exec /opt/workbuddy/start.sh "$@"

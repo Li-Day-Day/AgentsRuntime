@@ -1,0 +1,5 @@
+{
+  "runtime": "workbuddy",
+  "context": ".",
+  "dockerfile": "./workbuddy/Dockerfile"
+}

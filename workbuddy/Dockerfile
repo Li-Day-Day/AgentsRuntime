@@ -2,6 +2,17 @@
 
 ARG WEBTOP_IMAGE=lscr.io/linuxserver/webtop:ubuntu-kde
 
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS clawmanager-agent-builder
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+
+WORKDIR /src/clawmanager-agent
+COPY clawmanager-agent ./
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /out/clawmanager-agent ./cmd/clawmanager-agent
+
 FROM ${WEBTOP_IMAGE} AS workbuddy-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -50,6 +61,7 @@ USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 COPY --from=workbuddy-builder /src/workbuddy-linux/dist/workbuddy_*.deb /tmp/workbuddy.deb
+COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
 
 RUN set -eux; \
     apt-get update; \
@@ -62,18 +74,30 @@ RUN set -eux; \
 
 COPY workbuddy/start-workbuddy /usr/local/bin/start-workbuddy
 COPY workbuddy/s6-workbuddy-run /etc/s6-overlay/s6-rc.d/svc-workbuddy/run
+COPY workbuddy/s6-workbuddy-agent-run /etc/s6-overlay/s6-rc.d/svc-workbuddy-agent/run
 COPY workbuddy/startwm-x11.sh /defaults/startwm.sh
 
 RUN set -eux; \
+    sed -i 's/\r$//' \
+      /usr/local/bin/start-workbuddy \
+      /etc/s6-overlay/s6-rc.d/svc-workbuddy/run \
+      /etc/s6-overlay/s6-rc.d/svc-workbuddy-agent/run \
+      /defaults/startwm.sh; \
     chmod 0755 /usr/local/bin/start-workbuddy; \
+    chmod 0755 /usr/local/bin/clawmanager-agent; \
     chmod 0755 /etc/s6-overlay/s6-rc.d/svc-workbuddy/run; \
+    chmod 0755 /etc/s6-overlay/s6-rc.d/svc-workbuddy-agent/run; \
     chmod 0755 /defaults/startwm.sh; \
     mkdir -p \
       /etc/s6-overlay/s6-rc.d/svc-workbuddy/dependencies.d \
+      /etc/s6-overlay/s6-rc.d/svc-workbuddy-agent/dependencies.d \
       /etc/s6-overlay/s6-rc.d/user/contents.d; \
     printf 'longrun\n' > /etc/s6-overlay/s6-rc.d/svc-workbuddy/type; \
+    printf 'longrun\n' > /etc/s6-overlay/s6-rc.d/svc-workbuddy-agent/type; \
     touch /etc/s6-overlay/s6-rc.d/svc-workbuddy/dependencies.d/svc-de; \
+    touch /etc/s6-overlay/s6-rc.d/svc-workbuddy-agent/dependencies.d/init-services; \
     touch /etc/s6-overlay/s6-rc.d/user/contents.d/svc-workbuddy; \
+    touch /etc/s6-overlay/s6-rc.d/user/contents.d/svc-workbuddy-agent; \
     rm -f /usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service
 
 ENV PUID=1000 \
@@ -81,6 +105,10 @@ ENV PUID=1000 \
     TZ=Asia/Shanghai \
     START_DOCKER=false \
     PIXELFLUX_WAYLAND=false \
+    CLAWMANAGER_AGENT_RUNTIME_TYPE=workbuddy \
+    CLAWMANAGER_AGENT_PERSISTENT_DIR=/config \
+    CLAWMANAGER_AGENT_SKILL_DIRS=/config/.workbuddy/skills \
+    WORKBUDDY_MODEL_CONFIG_PATH=/config/.workbuddy/models.json \
     TITLE="WorkBuddy Linux (Unofficial POC)"
 
 LABEL org.opencontainers.image.title="WorkBuddy Linux Webtop (Unofficial POC)" \

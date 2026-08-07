@@ -25,6 +25,19 @@ const (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "apply-runtime-config" {
+		cfg, err := instanceagent.LoadConfig(version)
+		if err != nil {
+			log.Fatalf("load instance agent config: %v", err)
+		}
+		result, err := instanceagent.ApplyManagedRuntimeConfig(cfg)
+		if err != nil {
+			log.Fatalf("apply managed runtime config: %v", err)
+		}
+		log.Printf("managed runtime config applied: runtime=%s models=%d changed=%t", cfg.RuntimeType, result.ModelCount, result.Changed)
+		return
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -63,7 +76,7 @@ func selectMode() agentMode {
 	if runtimeagent.RuntimeAgentModeEnabled() && !instanceRequested {
 		return modeRuntimePod
 	}
-	if instanceRequested && hermesInstanceAllowed() {
+	if instanceRequested && instanceRuntimeAllowed() {
 		return modeInstance
 	}
 	return modeDisabled
@@ -82,10 +95,10 @@ func instanceAgentRequested() bool {
 	return true
 }
 
-// hermesInstanceAllowed decides whether this Hermes-shipped binary should run
-// the Pro instance agent. ClawManager uses CLAWMANAGER_RUNTIME_TYPE=desktop|gateway
-// as a backend marker; that must not reject Pro instance mode.
-func hermesInstanceAllowed() bool {
+// instanceRuntimeAllowed restricts instance mode to products implemented by
+// the shared agent. CLAWMANAGER_RUNTIME_TYPE=desktop|gateway is a backend
+// placement marker and must not reject a supported product runtime.
+func instanceRuntimeAllowed() bool {
 	product := strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_AGENT_RUNTIME_TYPE")))
 	if product == "" {
 		backend := strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_RUNTIME_TYPE")))
@@ -98,8 +111,9 @@ func hermesInstanceAllowed() bool {
 		}
 	}
 	if product == "" {
-		// Credentials alone are enough inside the Hermes image (doc: Pro instance agent).
+		// Preserve compatibility with older Hermes images that predate the
+		// product-specific CLAWMANAGER_AGENT_RUNTIME_TYPE marker.
 		return true
 	}
-	return product == "hermes"
+	return product == "hermes" || product == "workbuddy"
 }

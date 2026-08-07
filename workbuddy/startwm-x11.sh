@@ -8,6 +8,7 @@ export QT_QPA_PLATFORM=xcb
 export XDG_CURRENT_DESKTOP=KDE
 export XDG_SESSION_DESKTOP=KDE
 export XDG_SESSION_TYPE=x11
+export XDG_MENU_PREFIX=plasma-
 export KDE_SESSION_VERSION=6
 
 mkdir -p \
@@ -28,7 +29,7 @@ if [[ ! -f "$HOME/.config/kscreenlockerrc" ]]; then
       --group Daemon --key Autolock false
 fi
 
-kbuildsycoca6 || true
+kbuildsycoca6 --noincremental
 
 exec dbus-run-session bash -c '
   set -e
