@@ -9,50 +9,147 @@ if (packageJson.version !== expectedVersion) {
 }
 
 const distDir = path.join(packageRoot, "dist");
-const marker = "CLAWMANAGER_MANAGED_PREVIEW_PROXY_DNS";
-const candidates = fs.readdirSync(distDir)
-  .filter((name) => /^chrome-.*\.js$/.test(name))
-  .map((name) => path.join(distDir, name))
-  .filter((file) => fs.readFileSync(file, "utf8").includes("async function assertBrowserNavigationAllowed(opts)"));
+const patching = process.argv.includes("--patch");
 
-if (candidates.length !== 1) {
-  throw new Error(`expected one OpenClaw browser navigation module, found ${candidates.length}`);
-}
-
-const target = candidates[0];
-let source = fs.readFileSync(target, "utf8");
-const insertionPoint = "\tawait resolvePinnedHostnameWithPolicy(parsed.hostname, {";
-const patchBody = [
-  `\t// ${marker}: Chromium is already forced through the operator-managed`,
-  "\t// forward proxy. Interactive Team previews use a signature-derived,",
-  "\t// non-resolving origin. Delegate only that exact reserved host shape;",
-  "\t// direct profiles and every ordinary destination retain upstream checks.",
-  "\tif (opts.browserProxyMode === \"explicit-browser-proxy\" &&",
-  "\t\tisPrivateNetworkAllowedByPolicy(opts.ssrfPolicy) &&",
-  "\t\t/^p-[a-z0-9_-]{16}\\.clawmanager-team-preview\\.invalid$/.test(normalizeHostname(parsed.hostname))) return;",
-  insertionPoint,
-].join("\n");
-
-if (process.argv.includes("--patch") && !source.includes(marker)) {
-  const occurrences = source.split(insertionPoint).length - 1;
-  if (occurrences !== 1) {
-    throw new Error(`expected one navigation DNS call, found ${occurrences}`);
+function singleModule(pattern, needle, label) {
+  const candidates = fs.readdirSync(distDir)
+    .filter((name) => pattern.test(name))
+    .map((name) => path.join(distDir, name))
+    .filter((file) => fs.readFileSync(file, "utf8").includes(needle));
+  if (candidates.length !== 1) {
+    throw new Error(`expected one OpenClaw ${label} module, found ${candidates.length}`);
   }
-  source = source.replace(insertionPoint, patchBody);
-  fs.writeFileSync(target, source);
+  return candidates[0];
 }
 
-source = fs.readFileSync(target, "utf8");
-for (const required of [
-  marker,
+function replaceOnce(source, needle, replacement, label) {
+  const occurrences = source.split(needle).length - 1;
+  if (occurrences !== 1) throw new Error(`expected one ${label}, found ${occurrences}`);
+  return source.replace(needle, replacement);
+}
+
+function verify(source, requirements, label) {
+  for (const required of requirements) {
+    if (!source.includes(required)) throw new Error(`${label} patch is incomplete: ${required}`);
+  }
+}
+
+const chromeMarker = "CLAWMANAGER_MANAGED_PREVIEW_PROXY_DNS";
+const chromeTarget = singleModule(/^chrome-.*\.js$/, "async function assertBrowserNavigationAllowed(opts)", "browser navigation");
+let chromeSource = fs.readFileSync(chromeTarget, "utf8");
+const dnsCall = "\tawait resolvePinnedHostnameWithPolicy(parsed.hostname, {";
+if (patching && !chromeSource.includes(chromeMarker)) {
+  chromeSource = replaceOnce(chromeSource, dnsCall, [
+    `\t// ${chromeMarker}: Chromium is already forced through the operator-managed`,
+    "\t// forward proxy. Interactive Team previews use a signature-derived,",
+    "\t// non-resolving origin. Delegate only that exact reserved host shape;",
+    "\t// direct profiles and every ordinary destination retain upstream checks.",
+    "\tif (opts.browserProxyMode === \"explicit-browser-proxy\" &&",
+    "\t\tisPrivateNetworkAllowedByPolicy(opts.ssrfPolicy) &&",
+    "\t\t/^p-[a-z0-9_-]{16}\\.clawmanager-team-preview\\.invalid$/.test(normalizeHostname(parsed.hostname))) return;",
+    dnsCall,
+  ].join("\n"), "navigation DNS call");
+  fs.writeFileSync(chromeTarget, chromeSource);
+}
+chromeSource = fs.readFileSync(chromeTarget, "utf8");
+verify(chromeSource, [
+  chromeMarker,
   'opts.browserProxyMode === "explicit-browser-proxy"',
   "isPrivateNetworkAllowedByPolicy(opts.ssrfPolicy)",
   "/^p-[a-z0-9_-]{16}\\.clawmanager-team-preview\\.invalid$/",
-  insertionPoint,
-]) {
-  if (!source.includes(required)) {
-    throw new Error(`OpenClaw managed Preview Browser patch is incomplete: ${required}`);
-  }
-}
+  dnsCall,
+], "OpenClaw managed Preview Browser DNS");
 
-process.stdout.write(`OpenClaw managed Preview Browser patch verified in ${path.basename(target)}\n`);
+const contextMarker = "CLAWMANAGER_MANAGED_PREVIEW_PROXY_CONTEXT";
+const routeTarget = singleModule(/^routes-.*\.js$/, "function browserNavigationPolicyForProfile(ctx, profileCtx)", "browser routes");
+let routeSource = fs.readFileSync(routeTarget, "utf8");
+const policyFunction = [
+  "function browserNavigationPolicyForProfile(ctx, profileCtx) {",
+  "\treturn withBrowserNavigationPolicy(ctx.state().resolved.ssrfPolicy, { browserProxyMode: resolveBrowserNavigationProxyMode({",
+  "\t\tresolved: ctx.state().resolved,",
+  "\t\tprofile: profileCtx.profile",
+  "\t}) });",
+  "}",
+].join("\n");
+const patchedPolicyFunction = [
+  "function browserNavigationPolicyForProfile(ctx, profileCtx) {",
+  `\t// ${contextMarker}: keep the resolved proxy mode attached to the`,
+  "\t// per-call SSRF policy so nested Playwright helpers cannot silently",
+  "\t// fall back to local DNS after a managed-proxy navigation.",
+  "\tconst policy = withBrowserNavigationPolicy(ctx.state().resolved.ssrfPolicy, { browserProxyMode: resolveBrowserNavigationProxyMode({",
+  "\t\tresolved: ctx.state().resolved,",
+  "\t\tprofile: profileCtx.profile",
+  "\t}) });",
+  "\tif (policy.ssrfPolicy && policy.browserProxyMode) policy.ssrfPolicy = {",
+  "\t\t...policy.ssrfPolicy,",
+  "\t\t__clawmanagerBrowserProxyMode: policy.browserProxyMode",
+  "\t};",
+  "\treturn policy;",
+  "}",
+].join("\n");
+if (patching && !routeSource.includes(contextMarker)) {
+  routeSource = replaceOnce(routeSource, policyFunction, patchedPolicyFunction, "profile navigation policy function");
+  routeSource = replaceOnce(
+    routeSource,
+    "\t\t\t\tconst ssrfPolicy = ctx.state().resolved.ssrfPolicy;",
+    "\t\t\t\tconst ssrfPolicy = browserNavigationPolicyForProfile(ctx, profileCtx).ssrfPolicy;",
+    "Playwright act SSRF policy binding",
+  );
+  fs.writeFileSync(routeTarget, routeSource);
+}
+routeSource = fs.readFileSync(routeTarget, "utf8");
+verify(routeSource, [
+  contextMarker,
+  "__clawmanagerBrowserProxyMode: policy.browserProxyMode",
+  "const ssrfPolicy = browserNavigationPolicyForProfile(ctx, profileCtx).ssrfPolicy;",
+], "OpenClaw managed Preview Browser route context");
+
+const playwrightMarker = "CLAWMANAGER_MANAGED_PREVIEW_PROXY_POLICY";
+const playwrightTarget = singleModule(/^pw-ai-.*\.js$/, "async function assertPageNavigationCompletedSafely(opts)", "Playwright bridge");
+let playwrightSource = fs.readFileSync(playwrightTarget, "utf8");
+const pageGuardStart = [
+  "/** Validate a completed page navigation and quarantine policy-denied targets. */",
+  "async function assertPageNavigationCompletedSafely(opts) {",
+  "\tconst navigationPolicy = withBrowserNavigationPolicy(opts.ssrfPolicy, { browserProxyMode: opts.browserProxyMode });",
+].join("\n");
+const patchedPageGuardStart = [
+  `// ${playwrightMarker}: recover only the proxy mode resolved by the route`,
+  "// for this call. The marker never grants access by itself; the central",
+  "// navigation guard still checks the exact managed Preview host and policy.",
+  "function clawmanagerBrowserProxyModeForPolicy(policy) {",
+  "\treturn policy?.__clawmanagerBrowserProxyMode === \"explicit-browser-proxy\"",
+  "\t\t? \"explicit-browser-proxy\"",
+  "\t\t: void 0;",
+  "}",
+  "/** Validate a completed page navigation and quarantine policy-denied targets. */",
+  "async function assertPageNavigationCompletedSafely(opts) {",
+  "\tconst navigationPolicy = withBrowserNavigationPolicy(opts.ssrfPolicy, {",
+  "\t\tbrowserProxyMode: opts.browserProxyMode ?? clawmanagerBrowserProxyModeForPolicy(opts.ssrfPolicy)",
+  "\t});",
+].join("\n");
+if (patching && !playwrightSource.includes(playwrightMarker)) {
+  playwrightSource = replaceOnce(playwrightSource, pageGuardStart, patchedPageGuardStart, "Playwright page navigation guard");
+  playwrightSource = replaceOnce(
+    playwrightSource,
+    "\t\t...withBrowserNavigationPolicy(ssrfPolicy)\n",
+    "\t\t...withBrowserNavigationPolicy(ssrfPolicy, { browserProxyMode: clawmanagerBrowserProxyModeForPolicy(ssrfPolicy) })\n",
+    "Playwright subframe navigation policy",
+  );
+  playwrightSource = replaceOnce(
+    playwrightSource,
+    "\t\t\t...withBrowserNavigationPolicy(opts.ssrfPolicy)\n",
+    "\t\t\t...withBrowserNavigationPolicy(opts.ssrfPolicy, { browserProxyMode: clawmanagerBrowserProxyModeForPolicy(opts.ssrfPolicy) })\n",
+    "Playwright download navigation policy",
+  );
+  fs.writeFileSync(playwrightTarget, playwrightSource);
+}
+playwrightSource = fs.readFileSync(playwrightTarget, "utf8");
+verify(playwrightSource, [
+  playwrightMarker,
+  "clawmanagerBrowserProxyModeForPolicy(opts.ssrfPolicy)",
+  "clawmanagerBrowserProxyModeForPolicy(ssrfPolicy)",
+], "OpenClaw managed Preview Playwright policy");
+
+process.stdout.write(
+  `OpenClaw managed Preview Browser patch verified in ${path.basename(chromeTarget)}, ${path.basename(routeTarget)}, and ${path.basename(playwrightTarget)}\n`,
+);

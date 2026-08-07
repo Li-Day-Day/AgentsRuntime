@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -1840,6 +1841,9 @@ function reviewerBrowserToolResultDecision(envelope, event, state, now = Date.no
 	const action = browserToolAction(event);
 	if (REVIEW_BROWSER_PREPARATION_ACTIONS.has(action)) return guard;
 	if (browserToolCallFailed(event) || Number(event?.durationMs || event?.result?.durationMs || 0) >= REVIEW_BROWSER_WINDOW_MS) {
+		guard.lastFailureAction = action || "browser";
+		guard.lastFailure = trim(event?.error || event?.result?.error || event?.output?.error) || "browser_tool_failed";
+		guard.lastObservedAt = now;
 		guard.pendingOpen = false;
 		guard.calls = REVIEW_BROWSER_MAX_CALLS;
 		guard.startedAt = guard.startedAt || now;
@@ -1851,9 +1855,15 @@ function reviewerBrowserToolResultDecision(envelope, event, state, now = Date.no
 		guard.calls = 1;
 		guard.targetUrl = guard.pendingTarget || verificationTargetUrl(envelope);
 		guard.managedPreviewOpened = isManagedInteractivePreviewUrl(guard.targetUrl);
+		guard.targetId = trim(event?.result?.targetId || event?.output?.targetId || event?.targetId) || guard.targetId;
+		guard.lastSuccessfulAction = "open";
+		guard.lastObservedAt = now;
 		delete guard.pendingTarget;
 	} else if (guard.managedPreviewOpened && REVIEW_BROWSER_EVIDENCE_ACTIONS.has(action)) {
 		guard.managedPreviewInspected = true;
+		guard.targetId = trim(event?.result?.targetId || event?.output?.targetId || event?.targetId) || guard.targetId;
+		guard.lastSuccessfulAction = action;
+		guard.lastObservedAt = now;
 	}
 	return guard;
 }
@@ -1886,6 +1896,23 @@ function browserVerificationForCompletion(envelope, state) {
       targetHash: trim(state?.targetHash) || undefined,
     },
   };
+}
+
+function mergeBrowserVerificationState(...states) {
+	const merged = {};
+	for (const state of states) {
+		if (!state || typeof state !== "object") continue;
+		if (state.previewGenerated === true) merged.previewGenerated = true;
+		if (state.managedPreviewOpened === true) merged.managedPreviewOpened = true;
+		if (state.managedPreviewInspected === true) merged.managedPreviewInspected = true;
+		for (const key of ["targetUrl", "targetHash", "targetId", "lastSuccessfulAction", "lastFailureAction", "lastFailure"]) {
+			if (trim(state[key])) merged[key] = trim(state[key]);
+		}
+		if (Number(state.lastObservedAt || 0) > Number(merged.lastObservedAt || 0)) {
+			merged.lastObservedAt = Number(state.lastObservedAt);
+		}
+	}
+	return merged;
 }
 
 function reviewerBrowserGuardKey(envelope, event, ctx) {
@@ -1962,6 +1989,16 @@ function teamProcessToolDecision(envelope, event) {
 			},
 		);
 	}
+	if (
+		assignmentHasIndependentReview(envelope) &&
+		!assignmentExplicitlyRequiresBrowserEvidence(envelope) &&
+		!resolveRedisTeamVerificationRole(envelope)
+	) {
+		rules.push({
+			pattern: /\b(?:npm|pnpm|yarn)\s+(?:install|add|i)\b[^\r\n]*(?:puppeteer|playwright|selenium|chromedriver)|\bpip(?:3)?\s+install\b[^\r\n]*(?:puppeteer|playwright|selenium|pyppeteer)/i,
+			reason: "a duplicate Browser validation dependency install when independent review is already assigned",
+		});
+	}
 	const matched = rules.find((rule) => rule.pattern.test(command));
 	if (!matched) return {};
 	return {
@@ -1969,6 +2006,25 @@ function teamProcessToolDecision(envelope, event) {
 		blockReason:
 			`Redis Team blocked ${matched.reason}. Use team_artifact_preview for HTML, existing project tests for applications, and an exact owned PID for targeted cleanup.`,
 	};
+}
+
+function assignmentHasIndependentReview(envelope) {
+	if (!envelope || ["evidence", "code-review", "api-test"].includes(resolveRedisTeamVerificationRole(envelope))) return false;
+	return boolFrom(
+		envelope.reviewRequired ??
+			envelope.review_required ??
+			envelope.validationRequired ??
+			envelope.validation_required,
+		false,
+	) || Boolean(envelope.validationAssignment || envelope.validation_assignment);
+}
+
+function assignmentExplicitlyRequiresBrowserEvidence(envelope) {
+	const text = [envelope?.text, envelope?.prompt, envelope?.rawPrompt, envelope?.summary]
+		.map((value) => trim(value))
+		.filter(Boolean)
+		.join("\n");
+	return /(?:browser|playwright|puppeteer|e2e|end[- ]to[- ]end|visual|interaction|浏览器|交互|视觉).{0,48}(?:evidence|verify|verification|test|验收|验证|测试)|(?:evidence|verify|verification|test|验收|验证|测试).{0,48}(?:browser|playwright|puppeteer|e2e|end[- ]to[- ]end|visual|interaction|浏览器|交互|视觉)/i.test(text);
 }
 
 function redisTeamVerificationGuidance(envelope) {
@@ -1981,6 +2037,9 @@ function redisTeamVerificationGuidance(envelope) {
       return "API verification policy: use existing HTTP tools, available endpoints, artifacts, and static contract review. Browser verification is not required. Never install or download Postman, Newman, browsers, test frameworks, package dependencies, or system packages. If the service or network target is unavailable, record the limit and continue with static contract checks; report only directly observed reproducible failures.";
     default:
       if (isLeaderMember({ role: envelope?.role, memberId: envelope?.to })) return "";
+		if (assignmentHasIndependentReview(envelope) && !assignmentExplicitlyRequiresBrowserEvidence(envelope)) {
+			return "Assignment-specific verification scope: independent review is already assigned downstream. Complete the implementation, syntax checks, existing project tests, and only the small smoke check needed to hand off a usable artifact. Browser remains available for focused debugging, but do not install a second Browser automation stack or build a separate acceptance harness solely to duplicate the downstream review. Report the checks performed and hand off normally; this guidance is not a completion gate.";
+		}
       return "Execution verification policy: keep self-checks proportional to the assigned output by preferring syntax checks, existing project tests, existing tools, and a small smoke test. When the Team plan assigns independent review or QA downstream, deliver the verified implementation or artifact to that owner instead of building a second Browser or test harness solely to duplicate acceptance. If no independent verifier is planned, or this assignment explicitly requires Browser, visual, interaction, or end-to-end evidence, perform the proportionate validation needed for that requirement. Product dependencies required by the implementation remain allowed. Optional validation setup and environment limitations are not completion gates: report completed checks and remaining verification scope, then continue the handoff.";
   }
 }
@@ -2698,6 +2757,9 @@ async function recordTurnFacts(redis, cfg, envelope, facts = {}) {
     if (facts.completionProposed) {
       await redis.command("HSET", factsKey, "completionProposed", "1");
     }
+		if (facts.browserVerification && typeof facts.browserVerification === "object") {
+			await redis.command("HSET", factsKey, "browserVerification", JSON.stringify(facts.browserVerification));
+		}
     const refs = Array.isArray(facts.artifactRefs) ? facts.artifactRefs.map(trim).filter(Boolean) : [];
     if (refs.length) {
       await redis.command("SADD", artifactsKey, ...refs);
@@ -2715,7 +2777,7 @@ async function readTurnFacts(cfg, envelope) {
   const factsKey = turnFactsKey(cfg, envelope);
   const artifactsKey = turnArtifactFactsKey(cfg, envelope);
   if (!cfg?.redisUrl || !factsKey || !artifactsKey) {
-    return { outbound: null, completionProposed: false, artifactRefs: [] };
+    return { outbound: null, completionProposed: false, artifactRefs: [], browserVerification: null };
   }
   const redis = new RedisClient(cfg.redisUrl);
   try {
@@ -2736,14 +2798,23 @@ async function readTurnFacts(cfg, envelope) {
         outbound = null;
       }
     }
+		let browserVerification = null;
+		if (facts.browserVerification) {
+			try {
+				browserVerification = JSON.parse(String(facts.browserVerification));
+			} catch {
+				browserVerification = null;
+			}
+		}
     return {
       outbound,
       completionProposed: String(facts.completionProposed || "") === "1",
       artifactRefs: Array.isArray(rawArtifacts) ? rawArtifacts.map(String).map(trim).filter(Boolean) : [],
+			browserVerification,
     };
   } catch (err) {
     warnOnce("turn-facts-read", "redis-team: durable turn facts are unavailable; using in-process facts: " + (err?.message || err));
-    return { outbound: null, completionProposed: false, artifactRefs: [] };
+    return { outbound: null, completionProposed: false, artifactRefs: [], browserVerification: null };
   } finally {
     redis.close();
   }
@@ -3178,6 +3249,36 @@ function createRuntime(api) {
   let lastOutbound = null;
   let activeArtifactRefs = [];
   let activeReviewVerification = null;
+	const narrativeProjectionStorage = new AsyncLocalStorage();
+
+	function enqueueAssistantSessionNarrative(event, ctx = {}) {
+		const projection = narrativeProjectionStorage.getStore();
+		const emitter = projection?.emitter;
+		if (!emitter || !projection.envelope || projection.terminalSubmitted) return;
+		const narrativeText = normalizeAssistantSessionText(assistantTextFromRecord(event));
+		if (!narrativeText) return;
+		const message = event?.message && typeof event.message === "object" ? event.message : {};
+		const sourceTimestampMs = sessionRecordTimestampMs(message) || sessionRecordTimestampMs(event) || Date.now();
+		const sourceSequence = ++projection.sequence;
+		const sourceRecordId = trim(message.id || message.messageId || message.message_id || event?.id) ||
+			[trim(ctx.sessionKey || ctx.sessionId), sourceSequence].filter(Boolean).join(":");
+		const contentHash = createHash("sha256").update(narrativeText).digest("hex");
+		projection.queue = projection.queue
+			.then(() => emitter(narrativeText, "before_message_write", {}, {
+				contentHash,
+				sourceOccurredAt: new Date(sourceTimestampMs).toISOString(),
+				sourceSequence,
+				sourceRecordId: sourceRecordId || undefined,
+				lateProjection: false,
+			}))
+			.catch((err) => {
+				runtimeApi?.logger?.warn?.("redis-team: live assistant narrative projection failed: " + (err?.message || String(err)));
+			});
+	}
+
+	async function drainAssistantSessionNarratives() {
+		await narrativeProjectionStorage.getStore()?.queue?.catch(() => {});
+	}
 
   async function withRedis(cfg, existingRedis, fn) {
     if (existingRedis) return fn(existingRedis);
@@ -3368,6 +3469,11 @@ function createRuntime(api) {
     const summary = trim(meta.summary) || summarizeText(result);
     const responseLocale = meta.responseLocale || envelope?.responseLocale || "zh-CN";
     assertResponseLocale(responseLocale, summary + "\n" + resultMarkdown, "Team completion");
+		// Persist every assistant message observed before the completion tool so
+		// chat order follows the actual turn rather than a later batched callback.
+		await drainAssistantSessionNarratives();
+		const narrativeProjection = narrativeProjectionStorage.getStore();
+		if (narrativeProjection) narrativeProjection.terminalSubmitted = true;
     const artifactRefs = Array.isArray(meta.artifactRefs) ? meta.artifactRefs : [];
     const resultContentHash = trim(meta.contentHash) || teamResultContentHash(resultMarkdown, artifactRefs);
     const artifactMetadata = await artifactMetadataForRefs(cfg, artifactRefs);
@@ -3412,7 +3518,12 @@ function createRuntime(api) {
     const workflowFinal = meta.workflowFinal === undefined ? currentIsLeader : boolFrom(meta.workflowFinal, false);
     const finalAnswerReady = meta.finalAnswerReady === undefined ? currentIsLeader : boolFrom(meta.finalAnswerReady, false);
     const remainingActions = Array.isArray(meta.remainingActions) ? meta.remainingActions.filter(Boolean) : [];
-    const verificationEvidence = browserVerificationForCompletion(envelope, activeReviewVerification);
+		const durableTurnFacts = await readTurnFacts(cfg, envelope);
+		const effectiveReviewVerification = mergeBrowserVerificationState(
+			durableTurnFacts.browserVerification,
+			activeReviewVerification,
+		);
+		const verificationEvidence = browserVerificationForCompletion(envelope, effectiveReviewVerification);
     await ensureDirs(cfg);
     await writeLocalStatus(cfg, {
       availability: "busy",
@@ -4087,20 +4198,49 @@ function createRuntime(api) {
   }
 
   return {
+		async withNarrativeProjection(envelope, emitter, fn) {
+			const projection = {
+				envelope,
+				emitter: typeof emitter === "function" ? emitter : null,
+				queue: Promise.resolve(),
+				sequence: 0,
+				terminalSubmitted: false,
+			};
+			return await narrativeProjectionStorage.run(projection, async () => {
+				try {
+					return await fn();
+				} finally {
+					await drainAssistantSessionNarratives();
+				}
+			});
+		},
+
+		observeAssistantSessionMessage(event, ctx) {
+			enqueueAssistantSessionNarrative(event, ctx);
+		},
+
+		async flushAssistantSessionNarratives() {
+			await drainAssistantSessionNarratives();
+		},
+
     beforeBrowserToolCall(event, state, now) {
       return reviewerBrowserToolDecision(activeEnvelope, event, state, now);
     },
 
-		afterBrowserToolCall(event, state, now) {
+		async afterBrowserToolCall(event, state, now) {
 			const next = reviewerBrowserToolResultDecision(activeEnvelope, event, state, now);
 			if (["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(activeEnvelope))) {
-				activeReviewVerification = Object.assign({}, activeReviewVerification || {}, {
-					managedPreviewOpened: next.managedPreviewOpened === true,
-					managedPreviewInspected: next.managedPreviewInspected === true,
+				activeReviewVerification = mergeBrowserVerificationState(activeReviewVerification, next, {
 					targetHash: next.targetUrl
 						? createHash("sha256").update(next.targetUrl).digest("hex")
 						: activeReviewVerification?.targetHash,
 				});
+				const cfg = readChannelConfig(runtimeApi.config || {});
+				if (cfg.redisUrl && activeEnvelope && hasRequiredRedisTeamKeys(cfg)) {
+					await withRedis(cfg, null, (redis) => recordTurnFacts(redis, cfg, activeEnvelope, {
+						browserVerification: activeReviewVerification,
+					}));
+				}
 			}
 			return next;
 		},
@@ -4356,10 +4496,16 @@ function createRuntime(api) {
       if (!stat.isFile()) throw new Error("Team artifact is not a file: " + resolved.canonical);
       const preview = previewUrlForTeamArtifact(cfg, resolved.candidate);
       if (["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(currentEnvelope))) {
-        activeReviewVerification = Object.assign({}, activeReviewVerification || {}, {
+		activeReviewVerification = mergeBrowserVerificationState(activeReviewVerification, {
           previewGenerated: true,
           targetHash: createHash("sha256").update(preview.url).digest("hex"),
+			lastObservedAt: Date.now(),
         });
+		if (cfg.redisUrl && currentEnvelope && hasRequiredRedisTeamKeys(cfg)) {
+			await withRedis(cfg, null, (redis) => recordTurnFacts(redis, cfg, currentEnvelope, {
+				browserVerification: activeReviewVerification,
+			}));
+		}
       }
       return {
         path: resolved.canonical,
@@ -5200,6 +5346,20 @@ export default definePluginEntry({
     const runtime = createRuntime(api);
     const consumerHandles = new Map();
     const reviewerBrowserGuards = new Map();
+		try {
+			api.on(
+				"before_message_write",
+				(event, ctx) => {
+					runtime.observeAssistantSessionMessage(event, ctx);
+				},
+				{ priority: -100, timeoutMs: 250 },
+			);
+		} catch (err) {
+			api.logger?.warn?.(
+				"redis-team: live narrative hook is unavailable; retaining deliver callback compatibility: " +
+					(err?.message || String(err)),
+			);
+		}
 
     api.on(
       "before_tool_call",
@@ -5230,9 +5390,9 @@ export default definePluginEntry({
 				const guardKey = runtime.browserGuardKey(event, ctx);
         const current = reviewerBrowserGuards.get(guardKey);
         if (!current) return;
-				reviewerBrowserGuards.set(guardKey, runtime.afterBrowserToolCall(event, current, Date.now()));
+			reviewerBrowserGuards.set(guardKey, await runtime.afterBrowserToolCall(event, current, Date.now()));
       },
-      { priority: 100, timeoutMs: 1000 },
+      { priority: 100, timeoutMs: 3000 },
     );
 
     function createConsumerEntry() {
@@ -5533,9 +5693,9 @@ export default definePluginEntry({
                     ) {
                       return;
                     }
-                    const r = new RedisClient(cfg.redisUrl);
-                    await r.connect();
-                    try {
+                     const r = new RedisClient(cfg.redisUrl);
+                     try {
+										 await r.connect();
                       if (
                         event === "assignment_heartbeat" &&
                         runtime.isActiveTaskCompleted(envelope.taskId)
@@ -5720,13 +5880,14 @@ export default definePluginEntry({
                   let deliveredViaCallback = false;
                   const dispatchStartedAt = Date.now();
                   const emittedNarrativeHashes = new Set();
-                  const emitAgentNarrative = async (narrativeText, source, media = {}, sourceMeta = {}) => {
+                   const emitAgentNarrative = async (narrativeText, source, media = {}, sourceMeta = {}) => {
                     narrativeText = normalizeAssistantSessionText(narrativeText);
                     if (!narrativeText) return false;
                     const localeAnalysis = assertResponseLocale(envelope.responseLocale || "zh-CN", narrativeText, "Team reply");
-                    const contentHash = trim(sourceMeta.contentHash) || createHash("sha256").update(narrativeText).digest("hex");
-                    if (emittedNarrativeHashes.has(contentHash)) return false;
-                    const stableId = "agent-narrative:" + safeName(envelope.messageId) + ":" + contentHash.slice(0, 24);
+                     const contentHash = trim(sourceMeta.contentHash) || createHash("sha256").update(narrativeText).digest("hex");
+                     if (emittedNarrativeHashes.has(contentHash)) return false;
+									 emittedNarrativeHashes.add(contentHash);
+                     const stableId = "agent-narrative:" + safeName(envelope.messageId) + ":" + contentHash.slice(0, 24);
                     const r = new RedisClient(cfg.redisUrl);
                     await r.connect();
                     try {
@@ -5769,13 +5930,15 @@ export default definePluginEntry({
                         mediaUrls: media.mediaUrls,
                         mediaUrl: media.mediaUrl,
                       }));
-                      emittedNarrativeHashes.add(contentHash);
-                    } finally {
+									} catch (err) {
+										emittedNarrativeHashes.delete(contentHash);
+										throw err;
+                     } finally {
                       r.close();
                     }
-                    return true;
-                  };
-                  const stopHeartbeat = startAssignmentHeartbeat({
+                     return true;
+                   };
+                   const stopHeartbeat = startAssignmentHeartbeat({
                     envelope,
                     emitTaskEvent,
                     log: ctx.log || console,
@@ -5791,7 +5954,8 @@ export default definePluginEntry({
                   let incompleteTurnDetected = false;
                   const teamContextBody = await appendLeaderTeamContext(textIn, cfg, envelope);
                   try {
-                    activeResult = await runtime.withActiveEnvelope(envelope, async () => {
+                    activeResult = await runtime.withActiveEnvelope(envelope, async () =>
+                      runtime.withNarrativeProjection(envelope, emitAgentNarrative, async () => {
                     const dispatchResult = await dispatchInboundDirectDmWithRuntime({
                     cfg: ctx.cfg,
                     runtime: { channel: ctx.channelRuntime },
@@ -5826,7 +5990,12 @@ export default definePluginEntry({
                       ],
                     },
                     deliver: async (payload) => {
-                      if (runtime.isActiveTaskCompleted(envelope.taskId) || runtime.isActiveTaskCompletionPending(envelope.taskId)) {
+										const durableTurnFacts = await readTurnFacts(cfg, envelope);
+										if (
+											runtime.isActiveTaskCompleted(envelope.taskId) ||
+											runtime.isActiveTaskCompletionPending(envelope.taskId) ||
+											durableTurnFacts.completionProposed
+										) {
                         ctx.log?.info?.("redis-team: suppressed duplicate reply after submitted completion for " + envelope.messageId);
                         return;
                       }
@@ -5880,7 +6049,8 @@ export default definePluginEntry({
                     },
                     });
                     return { dispatchResult };
-                    }, cfg);
+                      }),
+                    cfg);
                   } finally {
                     stopHeartbeat();
                     await activityObserver.stop(

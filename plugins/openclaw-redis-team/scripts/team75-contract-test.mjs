@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, browserToolCallFailed, teamProcessToolDecision, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
+const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, teamProcessToolDecision, assignmentHasIndependentReview, assignmentExplicitlyRequiresBrowserEvidence, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -90,6 +90,78 @@ function resultContentHash(content, refs) {
 
 try {
   await fs.mkdir(shared, { recursive: true });
+	const liveRuntime = pluginModule.createRuntime({ config: {}, logger: { warn() {} } });
+	const liveNarratives = [];
+	const liveEmitter = async (text, source, media, meta) => {
+		liveNarratives.push({ text, source, media, meta });
+		return true;
+	};
+	const liveEnvelope = {
+		teamId: "75",
+		memberId: "developer",
+		role: "developer",
+		taskId: "team-75-task-live",
+		rootTaskId: "team-75-task-live",
+		messageId: "msg-live",
+		assignmentId: "dev-live",
+	};
+	await liveRuntime.withActiveEnvelope(
+		liveEnvelope,
+		async () => liveRuntime.withNarrativeProjection(liveEnvelope, liveEmitter, async () => {
+			liveRuntime.observeAssistantSessionMessage({
+				message: {
+					id: "assistant-live-1",
+					role: "assistant",
+					timestamp: new Date().toISOString(),
+					content: [
+						{ type: "text", text: "正在读取产物并开始检查。" },
+						{ type: "tool_use", name: "team_artifact_read" },
+					],
+				},
+			}, { sessionKey: "redis-team:75:developer" });
+			liveRuntime.observeAssistantSessionMessage({
+				message: { id: "assistant-live-2", role: "assistant", content: [{ type: "text", text: "NO_REPLY" }] },
+			}, { sessionKey: "redis-team:75:developer" });
+			await liveRuntime.flushAssistantSessionNarratives();
+		}),
+		{ teamId: "75", memberId: "developer", role: "developer", sharedDir: shared },
+	);
+	assert.equal(liveNarratives.length, 1, "live projection emits visible assistant text but not NO_REPLY");
+	assert.equal(liveNarratives[0].text, "正在读取产物并开始检查。");
+	assert.equal(liveNarratives[0].source, "before_message_write");
+	assert.equal(liveNarratives[0].meta.sourceRecordId, "assistant-live-1");
+	const concurrentNarratives = { first: [], second: [] };
+	const concurrentEnvelope = (suffix) => ({
+		...liveEnvelope,
+		taskId: `team-75-task-${suffix}`,
+		rootTaskId: `team-75-task-${suffix}`,
+		messageId: `msg-${suffix}`,
+		assignmentId: `dev-${suffix}`,
+	});
+	await Promise.all([
+		liveRuntime.withNarrativeProjection(
+			concurrentEnvelope("first"),
+			async (text) => { concurrentNarratives.first.push(text); return true; },
+			async () => {
+				await Promise.resolve();
+				liveRuntime.observeAssistantSessionMessage({
+					message: { id: "assistant-first", role: "assistant", content: [{ type: "text", text: "first task update" }] },
+				});
+			},
+		),
+		liveRuntime.withNarrativeProjection(
+			concurrentEnvelope("second"),
+			async (text) => { concurrentNarratives.second.push(text); return true; },
+			async () => {
+				liveRuntime.observeAssistantSessionMessage({
+					message: { id: "assistant-second", role: "assistant", content: [{ type: "text", text: "second task update" }] },
+				});
+				await Promise.resolve();
+			},
+		),
+	]);
+	assert.deepEqual(concurrentNarratives.first, ["first task update"], "concurrent tasks keep the first narrative isolated");
+	assert.deepEqual(concurrentNarratives.second, ["second task update"], "concurrent tasks keep the second narrative isolated");
   await fs.writeFile(path.join(shared, "team.json"), JSON.stringify({
     version: 1,
     teamId: "75",
@@ -343,6 +415,37 @@ try {
 		}).block,
 		true,
 		"ordinary Developers must not inherit the Reviewer-only Browser bypass guard",
+	);
+	assert.equal(pluginModule.assignmentHasIndependentReview({ role: "developer", reviewRequired: true }), true);
+	assert.equal(pluginModule.assignmentHasIndependentReview({ role: "reviewer", reviewRequired: true }), false);
+	assert.equal(
+		pluginModule.teamProcessToolDecision(
+			{ role: "developer", reviewRequired: true },
+			{ toolName: "exec", params: { command: "npm install puppeteer" } },
+		).block,
+		true,
+		"an implementer with independent review must not install a duplicate Browser harness",
+	);
+	assert.notEqual(
+		pluginModule.teamProcessToolDecision(
+			{ role: "developer", reviewRequired: true, text: "Provide Browser interaction verification evidence." },
+			{ toolName: "exec", params: { command: "npm install puppeteer" } },
+		).block,
+		true,
+		"an explicit implementer-owned Browser evidence assignment must remain available",
+	);
+	assert.deepEqual(
+		pluginModule.mergeBrowserVerificationState(
+			{ managedPreviewOpened: true, managedPreviewInspected: true, lastSuccessfulAction: "snapshot" },
+			{ managedPreviewOpened: false, managedPreviewInspected: false, lastFailureAction: "evaluate" },
+		),
+		{
+			managedPreviewOpened: true,
+			managedPreviewInspected: true,
+			lastSuccessfulAction: "snapshot",
+			lastFailureAction: "evaluate",
+		},
+		"a later Browser failure must not erase earlier successful evidence",
 	);
   assert.deepEqual(
     pluginModule.normalizePhaseDispositions([
