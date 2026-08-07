@@ -41,6 +41,7 @@ PROTOCOL_CAPABILITIES = [
     "assignment_heartbeat_v1",
     "durable_turn_facts_v1",
     "team_artifact_preview_v1",
+    "team_artifact_preview_v2",
     "review_contract_v1",
     "validation_contract_v2",
 ]
@@ -452,6 +453,69 @@ def validate_artifact_refs(settings: RedisTeamSettings, refs: Optional[list[str]
     return validated
 
 
+def _assigned_validation_writer(settings: RedisTeamSettings, envelope: dict[str, Any]) -> bool:
+    role = settings.role.lower()
+    member = settings.member_id.lower()
+    return bool(
+        "review" in role
+        or "qa" in role
+        or "review" in member
+        or member == "qa"
+        or envelope.get("validationAssignment")
+        or envelope.get("validation_assignment")
+        or _trim(
+            envelope.get("validationTargetAssignmentId")
+            or envelope.get("validation_target_assignment_id")
+            or envelope.get("reviewedAssignmentId")
+            or envelope.get("reviewed_assignment_id")
+        )
+    )
+
+
+def _canonicalize_reviewer_completion_report(
+    settings: RedisTeamSettings,
+    envelope: dict[str, Any],
+    result_markdown: str,
+    explicit_refs: Optional[list[str]],
+) -> list[str]:
+    root_task_id = _trim(envelope.get("rootTaskId") or envelope.get("taskId"))
+    assignment_id = _trim(envelope.get("assignmentId") or envelope.get("workId"))
+    if not root_task_id or not assignment_id or not _assigned_validation_writer(settings, envelope):
+        return []
+    text_refs = re.findall(r"/team/[^\s`'\"<>()[\]{}]+", result_markdown or "")
+    member_prefix = (
+        f"/team/artifacts/{_safe_name(root_task_id)}/members/"
+        f"{_safe_name(settings.member_id)}/{_safe_name(assignment_id)}/"
+    )
+    candidates: list[str] = []
+    for raw in [*(explicit_refs or []), *text_refs]:
+        ref = _trim(raw).rstrip(".,;:!?锛岋紱锛氥€傦紒")
+        if not ref.startswith(member_prefix) or Path(ref).suffix.lower() not in {".md", ".txt", ".json"}:
+            continue
+        if ref not in candidates:
+            candidates.append(ref)
+    if len(candidates) != 1:
+        return []
+    try:
+        source = settings.shared_path / _artifact_relative_path(candidates[0])
+        if not source.is_file():
+            return []
+        destination = (
+            settings.shared_path
+            / "results"
+            / _safe_name(root_task_id)
+            / "reviews"
+            / _safe_name(assignment_id)
+            / source.name
+        )
+        _assert_no_symlink_traversal(settings.shared_path, source)
+        _assert_no_symlink_traversal(settings.shared_path, destination)
+        _atomic_write_text(destination, source.read_text(encoding="utf-8"))
+        return [canonical_artifact_ref(settings, destination)]
+    except Exception:
+        return []
+
+
 def artifact_metadata(settings: RedisTeamSettings, refs: Optional[list[str]]) -> list[dict[str, Any]]:
     metadata: list[dict[str, Any]] = []
     for canonical in validate_artifact_refs(settings, refs):
@@ -570,7 +634,13 @@ def _preview_url(settings: RedisTeamSettings, target: Path) -> str:
         if signed_prefix
         else "_"
     )
-    payload = f"team-preview-v1\n{settings.team_id}\n{signed_prefix}"
+    interactive = target.suffix.lower() == ".html"
+    mode = "interactive" if interactive else ""
+    payload = (
+        f"team-preview-v2\n{mode}\n{settings.team_id}\n{signed_prefix}"
+        if interactive
+        else f"team-preview-v1\n{settings.team_id}\n{signed_prefix}"
+    )
     signature = (
         base64.urlsafe_b64encode(
             hmac.new(settings.team_token.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
@@ -578,6 +648,14 @@ def _preview_url(settings: RedisTeamSettings, target: Path) -> str:
         .decode("ascii")
         .rstrip("=")
     )
+    if interactive:
+        # Start on the resolvable managed service. ClawManager validates this
+        # signed bootstrap URL before redirecting the Browser to the isolated
+        # per-directory origin used for interactive state.
+        return (
+            f"{parsed.scheme}://{parsed.netloc}/v2/interactive/"
+            f"{quote(settings.team_id, safe='')}/{encoded_prefix}/{signature}/{quote(parts[-1], safe='')}"
+        )
     return (
         f"{parsed.scheme}://{parsed.netloc}/v1/"
         f"{quote(settings.team_id, safe='')}/{encoded_prefix}/{signature}/{quote(parts[-1], safe='')}"
@@ -1259,6 +1337,236 @@ async def _observe_late_completion(
             "artifactRefs": artifact_refs,
         },
     )
+
+
+def _substantive_final_text(value: Any) -> bool:
+    text = _trim(value)
+    if len(text) < 12:
+        return False
+    normalized = " ".join(text.lower().split())
+    if normalized.endswith("?") or normalized.endswith("？"):
+        return False
+    generic = {
+        "done",
+        "completed",
+        "task completed",
+        "redis team task processing completed",
+        "agent 回合已结束，正在等待显式完成回执。",
+    }
+    return normalized not in generic
+
+
+async def _propose_completion(
+    settings: RedisTeamSettings,
+    envelope: dict[str, Any],
+    *,
+    status: str,
+    summary: str,
+    result_markdown: str,
+    artifact_refs: Optional[list[str]] = None,
+    explicit: bool,
+    automatic_turn_result: bool = False,
+    review_verdict: str = "",
+    reviewed_assignment_id: str = "",
+    reviewed_revision: Optional[int] = None,
+    reviewed_artifact_refs: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    if not settings.valid:
+        raise ValueError("Redis Team env is incomplete")
+    status = _trim(status).lower()
+    if status not in {"succeeded", "failed", "cancelled"}:
+        raise ValueError("completion status must be succeeded, failed or cancelled")
+    task_id = _trim(envelope.get("taskId") or envelope.get("rootTaskId"))
+    if not task_id:
+        raise ValueError("active task identity is unavailable")
+    canonical_review_refs = _canonicalize_reviewer_completion_report(
+        settings,
+        envelope,
+        result_markdown,
+        artifact_refs,
+    )
+    normalized_artifact_refs = [*(artifact_refs or []), *canonical_review_refs]
+    result = write_task_result(
+        settings,
+        task_id,
+        envelope=envelope,
+        status=status,
+        summary=summary,
+        result_markdown=result_markdown,
+        artifact_refs=normalized_artifact_refs,
+    )
+    completion_id = _completion_id(settings, envelope)
+    attempt_id = f"attempt_{uuid.uuid4().hex}"
+    artifact_meta = artifact_metadata(settings, result["artifactRefs"])
+    reviewed_refs = validate_artifact_refs(settings, reviewed_artifact_refs)
+    reviewed_meta = artifact_metadata(settings, reviewed_refs)
+    result_content_hash = hashlib.sha256(
+        (result_markdown + "\n" + "\n".join(result["artifactRefs"])).encode("utf-8")
+    ).hexdigest()
+    completion = _task_event(
+        settings,
+        "completion_proposed",
+        envelope,
+        {
+            "completionId": completion_id,
+            "attemptId": attempt_id,
+            # Runtime-authored natural completion still uses the same strict
+            # completion envelope as the explicit tool. automaticTurnResult
+            # records how it was produced without weakening control-plane
+            # validation or falling back to prose heuristics.
+            "completionSource": COMPLETION_SOURCE,
+            "explicitCompletion": True,
+            "agentInvokedCompletionTool": explicit or None,
+            "automaticTurnResult": automatic_turn_result or None,
+            "assignmentResultOnly": True,
+            "rootTaskTerminal": False,
+            "status": status,
+            "availability": "idle" if status == "succeeded" else "blocked",
+            "runtimeStatus": "completion_pending",
+            "workflowFinal": False,
+            "finalAnswerReady": False,
+            "summary": summary,
+            "result": result_markdown,
+            "resultMarkdown": result_markdown,
+            "artifactRefs": result["artifactRefs"],
+            "artifactMetadata": artifact_meta,
+            "resultContentHash": result_content_hash,
+            "reviewVerdict": review_verdict or None,
+            "reviewedAssignmentId": reviewed_assignment_id or None,
+            "reviewedRevision": reviewed_revision,
+            "reviewedArtifactRefs": reviewed_refs,
+            "reviewedArtifactMetadata": reviewed_meta,
+            "visibleToChat": False,
+            "chatPolicy": "hidden",
+        },
+    )
+    redis = AsyncRedisClient(settings.redis_url)
+    try:
+        await redis.connect()
+        published = await _publish_once(
+            redis,
+            settings,
+            _completion_attempt_key(settings, completion_id, attempt_id),
+            completion,
+        )
+        acknowledgement = await _completion_ack(redis, settings, completion_id, attempt_id)
+    finally:
+        redis.close()
+    decision = _trim((acknowledgement or {}).get("decision")).lower() or "submitted"
+    runtime_status = "completion_pending"
+    availability = "busy"
+    if decision == "accepted":
+        runtime_status = status
+        availability = "idle" if status == "succeeded" else "blocked"
+    elif decision == "rejected":
+        runtime_status = "blocked"
+        availability = "blocked"
+    active = _load_active_envelope(settings)
+    if _trim(active.get("taskId") or active.get("rootTaskId")) == task_id:
+        active["completionDecision"] = decision
+        active["completionId"] = completion_id
+        if explicit:
+            active["explicitCompletionSubmitted"] = True
+        if decision == "accepted":
+            active["terminal"] = True
+            active["terminalStatus"] = status
+            active["completedAt"] = _now_iso()
+        elif decision == "rejected":
+            active["terminal"] = False
+            active["terminalStatus"] = ""
+        _persist_active_envelope(settings, active)
+    if decision in {"submitted", "deferred"}:
+        asyncio.create_task(
+            _observe_late_completion(
+                settings,
+                completion_id,
+                attempt_id,
+                task_id,
+                status,
+                summary,
+                result["artifactRefs"],
+            )
+        )
+    write_local_status(
+        settings,
+        {
+            "availability": availability,
+            "runtimeStatus": runtime_status,
+            "currentTaskId": task_id,
+            "currentAssignmentId": envelope.get("assignmentId") or envelope.get("workId"),
+            "progress": 100 if decision == "accepted" else 99,
+            "lastSummary": _trim((acknowledgement or {}).get("reason")) or summary,
+            "artifactRefs": result["artifactRefs"],
+        },
+    )
+    return {
+        "ok": True,
+        **result,
+        **published,
+        "completionId": completion_id,
+        "attemptId": attempt_id,
+        "decision": decision,
+        "acknowledgement": acknowledgement,
+    }
+
+
+async def _publish_event(settings: RedisTeamSettings, event: str, payload: dict[str, Any]) -> None:
+    if not settings.valid:
+        return
+    redis = AsyncRedisClient(settings.redis_url)
+    try:
+        await redis.connect()
+        await xadd_json(redis, events_key(settings), event_for(settings, event, payload))
+    finally:
+        redis.close()
+
+
+async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
+    settings = load_settings(None)
+    if not settings.valid:
+        return json.dumps({"error": "Redis Team env is incomplete"}, ensure_ascii=False)
+    to = _trim(args.get("to"))
+    text = _trim(args.get("text") or args.get("prompt"))
+    if not to or not text:
+        return json.dumps({"error": "to and text are required"}, ensure_ascii=False)
+    active = _load_active_envelope(settings)
+    task_id = _trim(args.get("taskId")) or _trim(active.get("taskId") or active.get("rootTaskId"))
+    message = {
+        "v": WIRE_SCHEMA_VERSION,
+        "protocolVersion": PROTOCOL_VERSION,
+        "messageId": f"msg_{uuid.uuid4().hex}",
+        "teamId": settings.team_id,
+        "from": settings.member_id,
+        "to": to,
+        "intent": _trim(args.get("intent")) or "send",
+        "taskId": task_id,
+        "rootTaskId": _trim(active.get("rootTaskId") or task_id),
+        "rootMessageId": _trim(active.get("rootMessageId")),
+        "workId": _trim(args.get("workId")) or _trim(active.get("assignmentId") or active.get("workId")),
+        "assignmentId": _trim(args.get("assignmentId")) or _trim(active.get("assignmentId") or active.get("workId")),
+        "phaseId": _trim(args.get("phaseId")) or _trim(active.get("phaseId")),
+        "revision": int(args.get("revision") or active.get("revision") or 1),
+        "title": _trim(args.get("title")) or "Team Message",
+        "text": text,
+        "contextRefs": args.get("contextRefs") if isinstance(args.get("contextRefs"), list) else [],
+        "ttlSeconds": args.get("ttlSeconds") if isinstance(args.get("ttlSeconds"), int) else 3600,
+        "priority": _trim(args.get("priority")) or "normal",
+        "metadata": args.get("metadata") if isinstance(args.get("metadata"), dict) else {},
+        "createdAt": _now_iso(),
+    }
+    redis = AsyncRedisClient(settings.redis_url)
+    try:
+        await redis.connect()
+        redis_id = await xadd_json(redis, inbox_key(settings, to), message)
+        await xadd_json(
+            redis,
+            events_key(settings),
+            event_for(settings, "outbound", {"messageId": message["messageId"], "to": to}),
+        )
+    finally:
+        redis.close()
+    message["redisId"] = redis_id
+    return json.dumps({"ok": True, "sent": message}, ensure_ascii=False)
 
 
 def _substantive_final_text(value: Any) -> bool:
@@ -3429,6 +3737,14 @@ def register(ctx) -> None:
             "/team/team.json when available. Prefer team_artifact_write/read/list/mkdir "
             "for shared files and use team_artifact_preview before opening a Team file "
             "in Browser; never use file:// or start a temporary server. A substantive "
+            "implementation self-check should stay proportional: prefer syntax checks, "
+            "existing tests, existing tools, and a small smoke test. When independent "
+            "review or QA is planned downstream, hand off the verified artifact instead "
+            "of building a second Browser or test harness solely to duplicate acceptance. "
+            "If no independent verifier is planned, or the assignment explicitly requires "
+            "Browser, visual, interaction, or end-to-end evidence, perform the proportionate "
+            "validation needed. Product dependencies remain allowed; optional validation "
+            "setup and environment limitations are not completion gates. A substantive "
             "final response is automatically submitted for control-plane validation, "
             "so do not repeat it only to satisfy a tool sequence. Use team_complete_task "
             "when reporting failure, cancellation, review metadata, or an explicit final "

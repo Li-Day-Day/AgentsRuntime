@@ -85,6 +85,15 @@ spec.loader.exec_module(adapter)
 
 
 class HermesRedisTeamContractTests(unittest.TestCase):
+    def test_platform_hint_keeps_execution_validation_proportional_and_non_blocking(self):
+        source = Path(adapter.__file__).read_text(encoding="utf-8")
+        self.assertIn("implementation self-check should stay proportional", source)
+        self.assertIn("When independent", source)
+        self.assertIn("review or QA is planned downstream", source)
+        self.assertIn("Product dependencies remain allowed", source)
+        self.assertIn("optional validation", source)
+        self.assertIn("not completion gates", source)
+
     def settings(self, root):
         return adapter.RedisTeamSettings(
             enabled=True,
@@ -103,6 +112,7 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertIn("automatic_turn_completion_v2", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("assignment_lifecycle_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("team_artifact_preview_v1", adapter.PROTOCOL_CAPABILITIES)
+        self.assertIn("team_artifact_preview_v2", adapter.PROTOCOL_CAPABILITIES)
 
     def test_managed_startup_identity_loads_from_environment(self):
         with mock.patch.dict(
@@ -338,9 +348,64 @@ class HermesRedisTeamContractTests(unittest.TestCase):
             target.parent.mkdir(parents=True)
             target.write_text("<h1>ok</h1>", encoding="utf-8")
             url = adapter._preview_url(settings, target)
-            self.assertTrue(url.startswith(settings.preview_origin + "/v1/42/"))
+            self.assertRegex(
+                url,
+                r"^http://clawmanager-egress-proxy\.system\.svc\.cluster\.local:3128/v2/interactive/42/",
+            )
             self.assertNotIn("expires", url)
             self.assertNotIn("token", url)
+
+    def test_reviewer_member_report_is_nonblocking_copied_to_canonical_review_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = adapter.RedisTeamSettings(
+                enabled=True,
+                redis_url="redis://example.invalid:6379/0",
+                team_id="42",
+                member_id="reviewer",
+                role="reviewer",
+                shared_dir=tmp,
+            )
+            envelope = {
+                "rootTaskId": "team-42-task-7",
+                "taskId": "team-42-task-7",
+                "assignmentId": "review-1",
+            }
+            source = (
+                Path(tmp)
+                / "artifacts"
+                / "team-42-task-7"
+                / "members"
+                / "reviewer"
+                / "review-1"
+                / "QA-REPORT.md"
+            )
+            source.parent.mkdir(parents=True)
+            source.write_text("# QA Report\n\nPASS\n", encoding="utf-8")
+            canonical = adapter._canonicalize_reviewer_completion_report(
+                settings,
+                envelope,
+                f"Report: {adapter.canonical_artifact_ref(settings, source)}",
+                [],
+            )
+            self.assertEqual(
+                canonical,
+                ["/team/results/team-42-task-7/reviews/review-1/QA-REPORT.md"],
+            )
+            self.assertEqual(
+                (
+                    Path(tmp)
+                    / "results"
+                    / "team-42-task-7"
+                    / "reviews"
+                    / "review-1"
+                    / "QA-REPORT.md"
+                ).read_text(encoding="utf-8"),
+                "# QA Report\n\nPASS\n",
+            )
+            self.assertTrue(
+                source.exists(),
+                "the compatibility copy must preserve the original member report",
+            )
 
     def test_worker_result_never_overwrites_team_final_result(self):
         with tempfile.TemporaryDirectory() as tmp:

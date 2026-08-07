@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -23,6 +24,7 @@ const RUNTIME_CAPABILITIES = Object.freeze([
   "assignment_heartbeat_v1",
   "durable_turn_facts_v1",
   "team_artifact_preview_v1",
+  "team_artifact_preview_v2",
   "review_contract_v1",
   "validation_contract_v2",
 ]);
@@ -634,6 +636,33 @@ function assertTeamArtifactWriteScope(cfg, params, activeEnvelope) {
   }
 }
 
+function inferCanonicalArtifactWriteContract(cfg, params, activeEnvelope) {
+  const current = params || {};
+  const explicitScope = trim(current.scope);
+  const explicitKind = trim(current.kind || current.artifactKind || current.artifact_kind);
+  if (explicitScope || explicitKind || !activeEnvelope || !isAssignedValidationWriter(cfg, activeEnvelope)) {
+    return current;
+  }
+
+  const rawPath = trim(current.path).replaceAll("\\", "/");
+  let relative = rawPath;
+  if (relative.startsWith("/team/")) relative = relative.slice("/team/".length);
+  if (!relative.startsWith("results/") || relative.split("/").includes("..")) return current;
+
+  // Review instructions publish an exact canonical /team/results path, while
+  // the tool historically defaulted omitted scope/kind to a member artifact.
+  // Infer only the active root and active validation assignment. This makes a
+  // valid path tolerant without widening access to another task or reviewer.
+  const reviewPrefix =
+    "results/" +
+    safeName(artifactRootTaskId(current, activeEnvelope)) +
+    "/reviews/" +
+    artifactAssignmentId(current, activeEnvelope) +
+    "/";
+  if (!relative.startsWith(reviewPrefix) || relative.length === reviewPrefix.length) return current;
+  return { ...current, scope: "team", kind: "review" };
+}
+
 function isLeaderMember(cfg) {
   const role = trim(cfg?.role).toLowerCase();
   const memberId = trim(cfg?.memberId).toLowerCase();
@@ -931,10 +960,19 @@ function previewUrlForTeamArtifact(cfg, file) {
   const encodedPrefix = signedPrefix
     ? Buffer.from(signedPrefix, "utf8").toString("base64url")
     : "_";
-  const payload = `team-preview-v1\n${teamId}\n${signedPrefix}`;
+  const interactive = path.extname(file).toLowerCase() === ".html";
+  const mode = interactive ? "interactive" : "";
+  const payload = interactive
+    ? `team-preview-v2\n${mode}\n${teamId}\n${signedPrefix}`
+    : `team-preview-v1\n${teamId}\n${signedPrefix}`;
   const signature = createHmac("sha256", token).update(payload).digest("base64url");
+  // Interactive links start on the resolvable managed proxy service. After
+  // validating the signature, ClawManager redirects Chromium to the unique
+  // per-directory .invalid origin. This keeps localStorage isolated without
+  // asking OpenClaw's pre-navigation SSRF resolver to resolve a reserved host.
   origin.pathname = [
-    "v1",
+    interactive ? "v2" : "v1",
+    ...(interactive ? [mode] : []),
     encodeURIComponent(teamId),
     encodedPrefix,
     signature,
@@ -942,7 +980,42 @@ function previewUrlForTeamArtifact(cfg, file) {
   ].join("/");
   origin.search = "";
   origin.hash = "";
-  return { url: origin.toString() };
+  return { url: origin.toString(), mode: interactive ? mode : "static" };
+}
+
+async function canonicalizeReviewerCompletionReport(cfg, envelope, rootTaskId, assignmentId, explicitRefs) {
+	if (!isAssignedValidationWriter(cfg, envelope) || !rootTaskId || !assignmentId) return [];
+	const memberPrefix =
+		`/team/artifacts/${safeName(rootTaskId)}/members/${safeName(cfg.memberId)}/${safeName(assignmentId)}/`;
+	const candidates = [];
+	for (const value of explicitRefs || []) {
+		const canonical = canonicalArtifactAlias(cfg, value, rootTaskId);
+		if (!canonical.startsWith(memberPrefix)) continue;
+		const extension = path.posix.extname(canonical).toLowerCase();
+		if (![".md", ".txt", ".json"].includes(extension)) continue;
+		if (!candidates.includes(canonical)) candidates.push(canonical);
+	}
+	// An explicit single member report is unambiguous. Multiple candidates are
+	// accepted as-is so normalization never adds a retry or completion gate.
+	if (candidates.length !== 1) return [];
+	try {
+		const source = path.join(cfg.sharedDir, ...candidates[0].slice("/team/".length).split("/"));
+		const stat = await fs.stat(source);
+		if (!stat.isFile()) return [];
+		const destinationDir = path.join(
+			cfg.sharedDir,
+			"results",
+			safeName(rootTaskId),
+			"reviews",
+			safeName(assignmentId),
+		);
+		await mkdirBestEffort(destinationDir, TEAM_SHARED_DIR_MODE, "canonical review result directory");
+		const destination = path.join(destinationDir, path.basename(source));
+		await writeText(destination, await fs.readFile(source, "utf8"));
+		return [canonicalArtifactRef(cfg, destination)];
+	} catch {
+		return [];
+	}
 }
 
 function optionalPreviewFields(cfg, file) {
@@ -1696,8 +1769,14 @@ function resolveRedisTeamVerificationRole(envelope) {
   return "";
 }
 
-const REVIEW_BROWSER_MAX_CALLS = 4;
+const REVIEW_BROWSER_MAX_CALLS = 5;
 const REVIEW_BROWSER_WINDOW_MS = 20_000;
+const REVIEW_BROWSER_PREPARATION_ACTIONS = new Set(["status", "start"]);
+const REVIEW_BROWSER_EVIDENCE_ACTIONS = new Set(["snapshot", "screenshot", "act", "evaluate", "inspect"]);
+
+function browserToolAction(event) {
+  return trim(event?.params?.action || event?.arguments?.action || event?.input?.action).toLowerCase();
+}
 
 function directHttpVerificationUrl(value) {
   const raw = trim(value);
@@ -1729,7 +1808,21 @@ function reviewerBrowserToolDecision(envelope, event, state, now = Date.now()) {
     return {};
   }
   const guard = state || {};
-  if (!guard.startedAt) guard.startedAt = now;
+	const action = browserToolAction(event);
+	if (REVIEW_BROWSER_PREPARATION_ACTIONS.has(action)) {
+		return { state: guard };
+	}
+	if (!guard.startedAt && action === "open") {
+		guard.pendingOpen = true;
+		guard.pendingTarget = directHttpVerificationUrl(event?.params?.url || event?.arguments?.url || event?.input?.url);
+		return { state: guard };
+	}
+	if (!guard.startedAt) {
+		return {
+			block: true,
+			blockReason: "Open the verification target before inspecting it, or continue immediately with static review.",
+		};
+	}
   if (now - guard.startedAt >= REVIEW_BROWSER_WINDOW_MS || Number(guard.calls || 0) >= REVIEW_BROWSER_MAX_CALLS) {
     return {
       block: true,
@@ -1738,6 +1831,98 @@ function reviewerBrowserToolDecision(envelope, event, state, now = Date.now()) {
   }
   guard.calls = Number(guard.calls || 0) + 1;
   return { state: guard };
+}
+
+function reviewerBrowserToolResultDecision(envelope, event, state, now = Date.now()) {
+	if (trim(event?.toolName).toLowerCase() !== "browser" || !["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(envelope))) {
+		return state || {};
+	}
+	const guard = state || {};
+	const action = browserToolAction(event);
+	if (REVIEW_BROWSER_PREPARATION_ACTIONS.has(action)) return guard;
+	if (browserToolCallFailed(event) || Number(event?.durationMs || event?.result?.durationMs || 0) >= REVIEW_BROWSER_WINDOW_MS) {
+		guard.lastFailureAction = action || "browser";
+		guard.lastFailure = trim(event?.error || event?.result?.error || event?.output?.error) || "browser_tool_failed";
+		guard.lastObservedAt = now;
+		guard.pendingOpen = false;
+		guard.calls = REVIEW_BROWSER_MAX_CALLS;
+		guard.startedAt = guard.startedAt || now;
+		return guard;
+	}
+	if (action === "open" && guard.pendingOpen) {
+		guard.pendingOpen = false;
+		guard.startedAt = now;
+		guard.calls = 1;
+		guard.targetUrl = guard.pendingTarget || verificationTargetUrl(envelope);
+		guard.managedPreviewOpened = isManagedInteractivePreviewUrl(guard.targetUrl);
+		guard.targetId = trim(event?.result?.targetId || event?.output?.targetId || event?.targetId) || guard.targetId;
+		guard.lastSuccessfulAction = "open";
+		guard.lastObservedAt = now;
+		delete guard.pendingTarget;
+	} else if (guard.managedPreviewOpened && REVIEW_BROWSER_EVIDENCE_ACTIONS.has(action)) {
+		guard.managedPreviewInspected = true;
+		guard.targetId = trim(event?.result?.targetId || event?.output?.targetId || event?.targetId) || guard.targetId;
+		guard.lastSuccessfulAction = action;
+		guard.lastObservedAt = now;
+	}
+	return guard;
+}
+
+function isManagedInteractivePreviewUrl(value) {
+  const raw = directHttpVerificationUrl(value);
+  if (!raw) return false;
+  try {
+    const parsed = new URL(raw);
+    const host = parsed.hostname.toLowerCase();
+    const managedHost = isManagedClusterServiceHost(host, EGRESS_PROXY_SERVICE_NAME);
+    const isolatedHost = host.endsWith("." + LEGACY_TEAM_PREVIEW_HOST);
+    return (managedHost || isolatedHost) && parsed.pathname.startsWith("/v2/interactive/");
+  } catch {
+    return false;
+  }
+}
+
+function browserVerificationForCompletion(envelope, state) {
+  if (!["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(envelope))) return {};
+  const managedPreviewVerified = state?.managedPreviewOpened === true && state?.managedPreviewInspected === true;
+  return {
+    verificationMode: managedPreviewVerified ? "managed_browser" : "static_only",
+    browserVerification: {
+      status: managedPreviewVerified ? "verified" : "not_verified",
+      source: "runtime_tool_events",
+      managedPreview: state?.previewGenerated === true || state?.managedPreviewOpened === true || undefined,
+      opened: state?.managedPreviewOpened === true,
+      inspected: state?.managedPreviewInspected === true,
+      targetHash: trim(state?.targetHash) || undefined,
+    },
+  };
+}
+
+function mergeBrowserVerificationState(...states) {
+	const merged = {};
+	for (const state of states) {
+		if (!state || typeof state !== "object") continue;
+		if (state.previewGenerated === true) merged.previewGenerated = true;
+		if (state.managedPreviewOpened === true) merged.managedPreviewOpened = true;
+		if (state.managedPreviewInspected === true) merged.managedPreviewInspected = true;
+		for (const key of ["targetUrl", "targetHash", "targetId", "lastSuccessfulAction", "lastFailureAction", "lastFailure"]) {
+			if (trim(state[key])) merged[key] = trim(state[key]);
+		}
+		if (Number(state.lastObservedAt || 0) > Number(merged.lastObservedAt || 0)) {
+			merged.lastObservedAt = Number(state.lastObservedAt);
+		}
+	}
+	return merged;
+}
+
+function reviewerBrowserGuardKey(envelope, event, ctx) {
+  const run = trim(event?.runId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId || "active-review");
+  const root = trim(envelope?.rootTaskId || envelope?.taskId);
+  const assignment = trim(envelope?.assignmentId || envelope?.workId || envelope?.reviewedAssignmentId);
+  // The URL is mutable call data: open carries it, while snapshot/screenshot
+  // commonly do not. Keep the review budget and successful-open evidence bound
+  // to the execution/assignment, and store the target inside that state.
+  return [run, root, assignment].join("|");
 }
 
 function browserToolCallFailed(event) {
@@ -1769,6 +1954,79 @@ function browserToolCallFailed(event) {
   return inspect(event?.result) || inspect(event?.output);
 }
 
+function teamProcessToolDecision(envelope, event) {
+	const toolName = trim(event?.toolName).toLowerCase();
+	if (!["exec", "shell", "bash", "terminal"].includes(toolName)) return {};
+	const command = trim(
+		event?.params?.command || event?.params?.cmd || event?.arguments?.command || event?.input?.command,
+	);
+	if (!command) return {};
+	const rules = [
+		{ pattern: /(^|[;&|\s])(?:sudo\s+)?(?:pkill|killall)(?:\s|$)/i, reason: "broad process-name termination" },
+		{ pattern: /(^|[;&|\s])(?:sudo\s+)?fuser\b[^\r\n;&|]*\s-k(?:\s|$)/i, reason: "port-wide process termination" },
+		{ pattern: /\b(?:chromium|chromium-browser|google-chrome|chrome)\b[^\r\n;&|]*--remote-debugging-port(?:=|\s)/i, reason: "an unmanaged Browser/CDP process" },
+		{ pattern: /\bpython(?:3)?\s+-m\s+(?:http\.server|SimpleHTTPServer)\b/i, reason: "a temporary file server" },
+		{ pattern: /\b(?:npx\s+)?(?:http-server|serve)\b[^\r\n;&|]*(?:\s\.?(?:\s|$)|--listen|-l\s)/i, reason: "a temporary file server" },
+		{ pattern: /\bbusybox\s+httpd\b/i, reason: "a temporary file server" },
+	];
+	if (["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(envelope))) {
+		rules.push(
+			{
+				pattern: /(^|[;&|]\s*)(?:sudo\s+)?(?:xvfb-run\s+)?(?:\/[^\s]+\/)?(?:chromium|chromium-browser|google-chrome|chrome|firefox)(?:\s|$)/i,
+				reason: "an unmanaged Browser process during review",
+			},
+			{
+				pattern: /\bnpx\s+(?:--yes\s+)?(?:playwright|puppeteer)\b/i,
+				reason: "a Browser automation bypass during review",
+			},
+			{
+				pattern: /\b(?:node|python(?:3)?)\s+(?:-e|-c)\b[^\r\n]*(?:puppeteer|playwright|selenium|pyppeteer)/i,
+				reason: "an inline Browser automation bypass during review",
+			},
+			{
+				pattern: /\b(?:npm|pnpm|yarn)\s+(?:install|add|i)\b[^\r\n]*(?:puppeteer|playwright|selenium|chromedriver)|\bpip(?:3)?\s+install\b[^\r\n]*(?:puppeteer|playwright|selenium|pyppeteer)/i,
+				reason: "a Browser dependency install during review",
+			},
+		);
+	}
+	if (
+		assignmentHasIndependentReview(envelope) &&
+		!assignmentExplicitlyRequiresBrowserEvidence(envelope) &&
+		!resolveRedisTeamVerificationRole(envelope)
+	) {
+		rules.push({
+			pattern: /\b(?:npm|pnpm|yarn)\s+(?:install|add|i)\b[^\r\n]*(?:puppeteer|playwright|selenium|chromedriver)|\bpip(?:3)?\s+install\b[^\r\n]*(?:puppeteer|playwright|selenium|pyppeteer)/i,
+			reason: "a duplicate Browser validation dependency install when independent review is already assigned",
+		});
+	}
+	const matched = rules.find((rule) => rule.pattern.test(command));
+	if (!matched) return {};
+	return {
+		block: true,
+		blockReason:
+			`Redis Team blocked ${matched.reason}. Use team_artifact_preview for HTML, existing project tests for applications, and an exact owned PID for targeted cleanup.`,
+	};
+}
+
+function assignmentHasIndependentReview(envelope) {
+	if (!envelope || ["evidence", "code-review", "api-test"].includes(resolveRedisTeamVerificationRole(envelope))) return false;
+	return boolFrom(
+		envelope.reviewRequired ??
+			envelope.review_required ??
+			envelope.validationRequired ??
+			envelope.validation_required,
+		false,
+	) || Boolean(envelope.validationAssignment || envelope.validation_assignment);
+}
+
+function assignmentExplicitlyRequiresBrowserEvidence(envelope) {
+	const text = [envelope?.text, envelope?.prompt, envelope?.rawPrompt, envelope?.summary]
+		.map((value) => trim(value))
+		.filter(Boolean)
+		.join("\n");
+	return /(?:browser|playwright|puppeteer|e2e|end[- ]to[- ]end|visual|interaction|浏览器|交互|视觉).{0,48}(?:evidence|verify|verification|test|验收|验证|测试)|(?:evidence|verify|verification|test|验收|验证|测试).{0,48}(?:browser|playwright|puppeteer|e2e|end[- ]to[- ]end|visual|interaction|浏览器|交互|视觉)/i.test(text);
+}
+
 function redisTeamVerificationGuidance(envelope) {
   switch (resolveRedisTeamVerificationRole(envelope)) {
     case "evidence":
@@ -1778,7 +2036,11 @@ function redisTeamVerificationGuidance(envelope) {
     case "api-test":
       return "API verification policy: use existing HTTP tools, available endpoints, artifacts, and static contract review. Browser verification is not required. Never install or download Postman, Newman, browsers, test frameworks, package dependencies, or system packages. If the service or network target is unavailable, record the limit and continue with static contract checks; report only directly observed reproducible failures.";
     default:
-      return "";
+      if (isLeaderMember({ role: envelope?.role, memberId: envelope?.to })) return "";
+		if (assignmentHasIndependentReview(envelope) && !assignmentExplicitlyRequiresBrowserEvidence(envelope)) {
+			return "Assignment-specific verification scope: independent review is already assigned downstream. Complete the implementation, syntax checks, existing project tests, and only the small smoke check needed to hand off a usable artifact. Browser remains available for focused debugging, but do not install a second Browser automation stack or build a separate acceptance harness solely to duplicate the downstream review. Report the checks performed and hand off normally; this guidance is not a completion gate.";
+		}
+      return "Execution verification policy: keep self-checks proportional to the assigned output by preferring syntax checks, existing project tests, existing tools, and a small smoke test. When the Team plan assigns independent review or QA downstream, deliver the verified implementation or artifact to that owner instead of building a second Browser or test harness solely to duplicate acceptance. If no independent verifier is planned, or this assignment explicitly requires Browser, visual, interaction, or end-to-end evidence, perform the proportionate validation needed for that requirement. Product dependencies required by the implementation remain allowed. Optional validation setup and environment limitations are not completion gates: report completed checks and remaining verification scope, then continue the handoff.";
   }
 }
 
@@ -1817,7 +2079,7 @@ function appendRedisTeamCompletionGuidance(text, envelope) {
     "Verification truth rule: an environment or Browser limitation is not a product defect. Continue with available static checks and say Browser verification passed only when it actually ran.",
     "Risk waiver rule: a failed or stale required assignment blocks root success unless the Leader records assignmentId, reason, and accepted risk in team_complete_task. Never waive work that is still running or pending.",
     "Optional-work rule: optional work may be omitted, but every omitted optional assignment must be listed in skippedAssignments with assignmentId and a concrete reason.",
-    "Phase finality rule: a required phase declared in leader_plan never disappears implicitly. If a planned phase is intentionally not started, the Leader must list it in team_complete_task phaseDispositions with phaseId, decision (cancelled, skipped, or superseded), and a concrete reason. Never use a disposition for running or unfinished assigned work.",
+    "Phase finality rule: a required phase declared in leader_plan never disappears implicitly. If a planned phase is intentionally not started, the Leader must list it in team_complete_task phaseDispositions with phaseId, decision (cancelled, skipped, or superseded), and a concrete reason. Omit phases whose assigned work already succeeded; the control plane closes those automatically. Never use a disposition for running or unfinished assigned work.",
     "Never list, search, resolve, or scan the parent of the current Team shared directory, and never inspect sibling Team directories.",
   ];
   const verificationGuidance = redisTeamVerificationGuidance(envelope);
@@ -1872,6 +2134,31 @@ function turnFinishedWithoutCompletionEvent(envelope, {
       ),
     ),
   };
+}
+
+function assignmentAttemptFailedEvent(envelope, reason = "incomplete_turn") {
+  return {
+    status: "running",
+    availability: "busy",
+    runtimeStatus: "retrying",
+    summary: "The model turn ended before OpenClaw produced a complete response; the assignment remains active for recovery.",
+    completionRequired: true,
+    eventKind: "assignment_attempt_failed",
+    activeTurnFinished: true,
+    retryable: true,
+    failureReason: trim(reason) || "incomplete_turn",
+    nonAuthoritative: true,
+    stateEffect: "none",
+    rootTaskTerminal: false,
+    visibleToChat: false,
+    visible_to_chat: false,
+    chatPolicy: "hidden",
+  };
+}
+
+function isIncompleteTurnDelivery(payload) {
+  if (payload?.isError !== true) return false;
+  return /agent couldn't generate a response/i.test(trim(payload?.text));
 }
 
 function isWorkflowReminderEnvelope(envelope) {
@@ -1967,8 +2254,21 @@ function assistantTextFromRecord(record) {
   return "";
 }
 
-function usableFallbackAssistantText(text) {
+// OpenClaw normalizes its delivery callback before it reaches the channel, but
+// the durable assistant session keeps the raw model text. A model can append
+// the silent-reply control token after otherwise visible prose, so normalize
+// recovered session text before hashing, completion fallback, or projection.
+// Only a token-only payload or a token on its own final line is removed; normal
+// prose that discusses NO_REPLY remains intact.
+function normalizeAssistantSessionText(text) {
   const value = trim(text);
+  if (!value) return "";
+  if (/^NO_REPLY$/i.test(value)) return "";
+  return value.replace(/(?:^|\r?\n[\t ]*|\*+)NO_REPLY[\t ]*$/i, "").trim();
+}
+
+function usableFallbackAssistantText(text) {
+  const value = normalizeAssistantSessionText(text);
   if (!value) return "";
   const compact = value.toLowerCase().replace(/\s+/g, "");
   if (
@@ -2322,7 +2622,7 @@ async function readAssistantNarrativesFromDispatch(dispatchResult, sinceMs = 0) 
           const recordMs = sessionRecordTimestampMs(record);
           if (recordMs > 0 && recordMs + 1000 < sinceMs) continue;
         }
-        const candidate = usableFallbackAssistantText(assistantTextFromRecord(record));
+        const candidate = normalizeAssistantSessionText(assistantTextFromRecord(record));
         if (!candidate) continue;
         const hash = createHash("sha256").update(candidate).digest("hex");
         if (seen.has(hash)) continue;
@@ -2344,6 +2644,24 @@ async function readAssistantNarrativesFromDispatch(dispatchResult, sinceMs = 0) 
 
 async function readAssistantTextsFromDispatch(dispatchResult, sinceMs = 0) {
   return (await readAssistantNarrativesFromDispatch(dispatchResult, sinceMs)).map((entry) => entry.text);
+}
+
+function lateNarrativeProjectionMeta(terminal) {
+	return {
+		lateProjection: true,
+		suppressedAfterTerminal: terminal === true,
+		terminalDelivery: false,
+	};
+}
+
+function assistantSessionNarrativesForProjection(narratives, deliveredViaCallback, terminalResult) {
+  if (deliveredViaCallback || terminalResult || !Array.isArray(narratives) || narratives.length === 0) return [];
+  // Session replay is a compatibility recovery path, not a second live chat
+  // source. Progress belongs in team_update_progress, so recover only the
+  // latest otherwise-unprojected assistant message while the turn is live.
+  // Once terminal, the structured completion owns the final delivery and old
+  // process prose must not be replayed after it.
+  return narratives.slice(-1);
 }
 
 function fieldsToObject(fields) {
@@ -2439,6 +2757,9 @@ async function recordTurnFacts(redis, cfg, envelope, facts = {}) {
     if (facts.completionProposed) {
       await redis.command("HSET", factsKey, "completionProposed", "1");
     }
+		if (facts.browserVerification && typeof facts.browserVerification === "object") {
+			await redis.command("HSET", factsKey, "browserVerification", JSON.stringify(facts.browserVerification));
+		}
     const refs = Array.isArray(facts.artifactRefs) ? facts.artifactRefs.map(trim).filter(Boolean) : [];
     if (refs.length) {
       await redis.command("SADD", artifactsKey, ...refs);
@@ -2456,7 +2777,7 @@ async function readTurnFacts(cfg, envelope) {
   const factsKey = turnFactsKey(cfg, envelope);
   const artifactsKey = turnArtifactFactsKey(cfg, envelope);
   if (!cfg?.redisUrl || !factsKey || !artifactsKey) {
-    return { outbound: null, completionProposed: false, artifactRefs: [] };
+    return { outbound: null, completionProposed: false, artifactRefs: [], browserVerification: null };
   }
   const redis = new RedisClient(cfg.redisUrl);
   try {
@@ -2477,14 +2798,23 @@ async function readTurnFacts(cfg, envelope) {
         outbound = null;
       }
     }
+		let browserVerification = null;
+		if (facts.browserVerification) {
+			try {
+				browserVerification = JSON.parse(String(facts.browserVerification));
+			} catch {
+				browserVerification = null;
+			}
+		}
     return {
       outbound,
       completionProposed: String(facts.completionProposed || "") === "1",
       artifactRefs: Array.isArray(rawArtifacts) ? rawArtifacts.map(String).map(trim).filter(Boolean) : [],
+			browserVerification,
     };
   } catch (err) {
     warnOnce("turn-facts-read", "redis-team: durable turn facts are unavailable; using in-process facts: " + (err?.message || err));
-    return { outbound: null, completionProposed: false, artifactRefs: [] };
+    return { outbound: null, completionProposed: false, artifactRefs: [], browserVerification: null };
   } finally {
     redis.close();
   }
@@ -2918,6 +3248,37 @@ function createRuntime(api) {
   let activeTaskCompletionPending = false;
   let lastOutbound = null;
   let activeArtifactRefs = [];
+  let activeReviewVerification = null;
+	const narrativeProjectionStorage = new AsyncLocalStorage();
+
+	function enqueueAssistantSessionNarrative(event, ctx = {}) {
+		const projection = narrativeProjectionStorage.getStore();
+		const emitter = projection?.emitter;
+		if (!emitter || !projection.envelope || projection.terminalSubmitted) return;
+		const narrativeText = normalizeAssistantSessionText(assistantTextFromRecord(event));
+		if (!narrativeText) return;
+		const message = event?.message && typeof event.message === "object" ? event.message : {};
+		const sourceTimestampMs = sessionRecordTimestampMs(message) || sessionRecordTimestampMs(event) || Date.now();
+		const sourceSequence = ++projection.sequence;
+		const sourceRecordId = trim(message.id || message.messageId || message.message_id || event?.id) ||
+			[trim(ctx.sessionKey || ctx.sessionId), sourceSequence].filter(Boolean).join(":");
+		const contentHash = createHash("sha256").update(narrativeText).digest("hex");
+		projection.queue = projection.queue
+			.then(() => emitter(narrativeText, "before_message_write", {}, {
+				contentHash,
+				sourceOccurredAt: new Date(sourceTimestampMs).toISOString(),
+				sourceSequence,
+				sourceRecordId: sourceRecordId || undefined,
+				lateProjection: false,
+			}))
+			.catch((err) => {
+				runtimeApi?.logger?.warn?.("redis-team: live assistant narrative projection failed: " + (err?.message || String(err)));
+			});
+	}
+
+	async function drainAssistantSessionNarratives() {
+		await narrativeProjectionStorage.getStore()?.queue?.catch(() => {});
+	}
 
   async function withRedis(cfg, existingRedis, fn) {
     if (existingRedis) return fn(existingRedis);
@@ -3108,6 +3469,11 @@ function createRuntime(api) {
     const summary = trim(meta.summary) || summarizeText(result);
     const responseLocale = meta.responseLocale || envelope?.responseLocale || "zh-CN";
     assertResponseLocale(responseLocale, summary + "\n" + resultMarkdown, "Team completion");
+		// Persist every assistant message observed before the completion tool so
+		// chat order follows the actual turn rather than a later batched callback.
+		await drainAssistantSessionNarratives();
+		const narrativeProjection = narrativeProjectionStorage.getStore();
+		if (narrativeProjection) narrativeProjection.terminalSubmitted = true;
     const artifactRefs = Array.isArray(meta.artifactRefs) ? meta.artifactRefs : [];
     const resultContentHash = trim(meta.contentHash) || teamResultContentHash(resultMarkdown, artifactRefs);
     const artifactMetadata = await artifactMetadataForRefs(cfg, artifactRefs);
@@ -3152,6 +3518,12 @@ function createRuntime(api) {
     const workflowFinal = meta.workflowFinal === undefined ? currentIsLeader : boolFrom(meta.workflowFinal, false);
     const finalAnswerReady = meta.finalAnswerReady === undefined ? currentIsLeader : boolFrom(meta.finalAnswerReady, false);
     const remainingActions = Array.isArray(meta.remainingActions) ? meta.remainingActions.filter(Boolean) : [];
+		const durableTurnFacts = await readTurnFacts(cfg, envelope);
+		const effectiveReviewVerification = mergeBrowserVerificationState(
+			durableTurnFacts.browserVerification,
+			activeReviewVerification,
+		);
+		const verificationEvidence = browserVerificationForCompletion(envelope, effectiveReviewVerification);
     await ensureDirs(cfg);
     await writeLocalStatus(cfg, {
       availability: "busy",
@@ -3254,6 +3626,8 @@ function createRuntime(api) {
         )
           ? trim(meta.validationVerdict || meta.validation_verdict || meta.reviewVerdict || meta.review_verdict).toLowerCase()
           : undefined,
+        verificationMode: verificationEvidence.verificationMode,
+        browserVerification: verificationEvidence.browserVerification,
       });
       const streamId = await xaddJson(redis, eventsKey(cfg), proposal);
       await recordTurnFacts(redis, cfg, envelope, {
@@ -3824,9 +4198,60 @@ function createRuntime(api) {
   }
 
   return {
+		async withNarrativeProjection(envelope, emitter, fn) {
+			const projection = {
+				envelope,
+				emitter: typeof emitter === "function" ? emitter : null,
+				queue: Promise.resolve(),
+				sequence: 0,
+				terminalSubmitted: false,
+			};
+			return await narrativeProjectionStorage.run(projection, async () => {
+				try {
+					return await fn();
+				} finally {
+					await drainAssistantSessionNarratives();
+				}
+			});
+		},
+
+		observeAssistantSessionMessage(event, ctx) {
+			enqueueAssistantSessionNarrative(event, ctx);
+		},
+
+		async flushAssistantSessionNarratives() {
+			await drainAssistantSessionNarratives();
+		},
+
     beforeBrowserToolCall(event, state, now) {
       return reviewerBrowserToolDecision(activeEnvelope, event, state, now);
     },
+
+		async afterBrowserToolCall(event, state, now) {
+			const next = reviewerBrowserToolResultDecision(activeEnvelope, event, state, now);
+			if (["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(activeEnvelope))) {
+				activeReviewVerification = mergeBrowserVerificationState(activeReviewVerification, next, {
+					targetHash: next.targetUrl
+						? createHash("sha256").update(next.targetUrl).digest("hex")
+						: activeReviewVerification?.targetHash,
+				});
+				const cfg = readChannelConfig(runtimeApi.config || {});
+				if (cfg.redisUrl && activeEnvelope && hasRequiredRedisTeamKeys(cfg)) {
+					await withRedis(cfg, null, (redis) => recordTurnFacts(redis, cfg, activeEnvelope, {
+						browserVerification: activeReviewVerification,
+					}));
+				}
+			}
+			return next;
+		},
+
+		browserGuardKey(event, ctx) {
+			return reviewerBrowserGuardKey(activeEnvelope, event, ctx);
+		},
+
+		currentActiveEnvelope() {
+			return activeEnvelope;
+		},
 
     async isRootTaskTerminal(cfg, envelope) {
       return rootEnvelopeIsTerminal(cfg, envelope);
@@ -3846,10 +4271,12 @@ function createRuntime(api) {
       const prevCompletionPending = activeTaskCompletionPending;
       const prevOutbound = lastOutbound;
       const prevArtifactRefs = activeArtifactRefs;
+      const prevReviewVerification = activeReviewVerification;
       activeTaskCompleted = false;
       activeTaskCompletionPending = false;
       lastOutbound = null;
       activeArtifactRefs = [];
+      activeReviewVerification = null;
       // The consumer already resolved the concrete account. Reuse that
       // configuration so one account cannot persist another account's active
       // assignment when several Redis Team accounts share a Runtime process.
@@ -3910,6 +4337,7 @@ function createRuntime(api) {
         activeTaskCompletionPending = prevCompletionPending;
         lastOutbound = prevOutbound;
         activeArtifactRefs = prevArtifactRefs;
+        activeReviewVerification = prevReviewVerification;
       }
     },
 
@@ -3938,13 +4366,14 @@ function createRuntime(api) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
       const currentEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
-      assertTeamArtifactWriteScope(cfg, params, currentEnvelope);
-      const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "member", true);
+      const effectiveParams = inferCanonicalArtifactWriteContract(cfg, params || {}, currentEnvelope);
+      assertTeamArtifactWriteScope(cfg, effectiveParams, currentEnvelope);
+      const resolved = await resolveTeamArtifactPath(cfg, effectiveParams, currentEnvelope, "member", true);
       await mkdirBestEffort(path.dirname(resolved.candidate), TEAM_SHARED_DIR_MODE, "Team artifact parent");
       await writeText(resolved.candidate, String(params?.content ?? ""));
       if (currentEnvelope && !activeArtifactRefs.includes(resolved.canonical)) activeArtifactRefs.push(resolved.canonical);
-      const artifactScope = trim(params?.scope).toLowerCase() || "member";
-      const artifactKind = trim(params?.kind || params?.artifactKind || params?.artifact_kind).toLowerCase();
+      const artifactScope = trim(effectiveParams?.scope).toLowerCase() || "member";
+      const artifactKind = trim(effectiveParams?.kind || effectiveParams?.artifactKind || effectiveParams?.artifact_kind).toLowerCase();
       if (
         currentEnvelope &&
         isLeaderMember(cfg) &&
@@ -4066,6 +4495,18 @@ function createRuntime(api) {
       const stat = await fs.stat(resolved.candidate);
       if (!stat.isFile()) throw new Error("Team artifact is not a file: " + resolved.canonical);
       const preview = previewUrlForTeamArtifact(cfg, resolved.candidate);
+      if (["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(currentEnvelope))) {
+		activeReviewVerification = mergeBrowserVerificationState(activeReviewVerification, {
+          previewGenerated: true,
+          targetHash: createHash("sha256").update(preview.url).digest("hex"),
+			lastObservedAt: Date.now(),
+        });
+		if (cfg.redisUrl && currentEnvelope && hasRequiredRedisTeamKeys(cfg)) {
+			await withRedis(cfg, null, (redis) => recordTurnFacts(redis, cfg, currentEnvelope, {
+				browserVerification: activeReviewVerification,
+			}));
+		}
+      }
       return {
         path: resolved.canonical,
         bytes: stat.size,
@@ -4077,8 +4518,9 @@ function createRuntime(api) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
       const currentEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {});
-      assertTeamArtifactWriteScope(cfg, params, currentEnvelope);
-      const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "member", true);
+      const effectiveParams = inferCanonicalArtifactWriteContract(cfg, params || {}, currentEnvelope);
+      assertTeamArtifactWriteScope(cfg, effectiveParams, currentEnvelope);
+      const resolved = await resolveTeamArtifactPath(cfg, effectiveParams, currentEnvelope, "member", true);
       if (!(await mkdirBestEffort(resolved.candidate, TEAM_SHARED_DIR_MODE, "Team artifact directory"))) {
         throw new Error("Unable to create Team artifact directory: " + resolved.canonical);
       }
@@ -4324,13 +4766,22 @@ function createRuntime(api) {
       const discoveredArtifactRefs = isLeaderMember(cfg)
         ? await collectRootTaskArtifactRefs(cfg, resultTaskId)
         : await collectMemberAssignmentArtifactRefs(cfg, resultTaskId, cfg.memberId, normalizedCompletionAssignmentId);
+			const explicitCompletionRefs = [
+				...(Array.isArray(params.artifactRefs) ? params.artifactRefs : []),
+				...canonicalTeamArtifactRefsFromText(cfg, resultMarkdown, resultTaskId),
+			];
+			const canonicalReviewRefs = await canonicalizeReviewerCompletionReport(
+				cfg,
+				completionEnvelope,
+				resultTaskId,
+				normalizedCompletionAssignmentId,
+				explicitCompletionRefs,
+			);
       const artifactRefs = await validateArtifactRefs(cfg, [
-        ...(Array.isArray(params.artifactRefs)
-          ? params.artifactRefs.map((ref) => canonicalArtifactAlias(cfg, ref, resultTaskId))
-          : []),
+			...explicitCompletionRefs.map((ref) => canonicalArtifactAlias(cfg, ref, resultTaskId)),
         ...activeArtifactRefs,
         ...discoveredArtifactRefs,
-        ...canonicalTeamArtifactRefsFromText(cfg, resultMarkdown, resultTaskId),
+			...canonicalReviewRefs,
       ]);
       const resultContentHash = teamResultContentHash(resultMarkdown, artifactRefs);
       if (completionEnvelope && await isTaskTerminal(cfg, completionEnvelope)) {
@@ -4895,12 +5346,28 @@ export default definePluginEntry({
     const runtime = createRuntime(api);
     const consumerHandles = new Map();
     const reviewerBrowserGuards = new Map();
+		try {
+			api.on(
+				"before_message_write",
+				(event, ctx) => {
+					runtime.observeAssistantSessionMessage(event, ctx);
+				},
+				{ priority: -100, timeoutMs: 250 },
+			);
+		} catch (err) {
+			api.logger?.warn?.(
+				"redis-team: live narrative hook is unavailable; retaining deliver callback compatibility: " +
+					(err?.message || String(err)),
+			);
+		}
 
     api.on(
       "before_tool_call",
       async (event, ctx) => {
+				const processDecision = teamProcessToolDecision(runtime.currentActiveEnvelope(), event);
+				if (processDecision.block) return processDecision;
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
-        const guardKey = trim(event?.runId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId || "active-review");
+				const guardKey = runtime.browserGuardKey(event, ctx);
         const current = reviewerBrowserGuards.get(guardKey) || { calls: 0, startedAt: 0 };
         const decision = runtime.beforeBrowserToolCall(event, current, Date.now());
         if (decision?.state) reviewerBrowserGuards.set(guardKey, decision.state);
@@ -4920,15 +5387,12 @@ export default definePluginEntry({
       "after_tool_call",
       async (event, ctx) => {
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
-        const guardKey = trim(event?.runId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId || "active-review");
+				const guardKey = runtime.browserGuardKey(event, ctx);
         const current = reviewerBrowserGuards.get(guardKey);
         if (!current) return;
-        if (browserToolCallFailed(event) || Number(event?.durationMs || event?.result?.durationMs || 0) >= REVIEW_BROWSER_WINDOW_MS) {
-          current.calls = REVIEW_BROWSER_MAX_CALLS;
-          reviewerBrowserGuards.set(guardKey, current);
-        }
+			reviewerBrowserGuards.set(guardKey, await runtime.afterBrowserToolCall(event, current, Date.now()));
       },
-      { priority: 100, timeoutMs: 1000 },
+      { priority: 100, timeoutMs: 3000 },
     );
 
     function createConsumerEntry() {
@@ -5229,9 +5693,9 @@ export default definePluginEntry({
                     ) {
                       return;
                     }
-                    const r = new RedisClient(cfg.redisUrl);
-                    await r.connect();
-                    try {
+                     const r = new RedisClient(cfg.redisUrl);
+                     try {
+										 await r.connect();
                       if (
                         event === "assignment_heartbeat" &&
                         runtime.isActiveTaskCompleted(envelope.taskId)
@@ -5416,13 +5880,14 @@ export default definePluginEntry({
                   let deliveredViaCallback = false;
                   const dispatchStartedAt = Date.now();
                   const emittedNarrativeHashes = new Set();
-                  const emitAgentNarrative = async (narrativeText, source, media = {}, sourceMeta = {}) => {
-                    narrativeText = trim(narrativeText);
+                   const emitAgentNarrative = async (narrativeText, source, media = {}, sourceMeta = {}) => {
+                    narrativeText = normalizeAssistantSessionText(narrativeText);
                     if (!narrativeText) return false;
                     const localeAnalysis = assertResponseLocale(envelope.responseLocale || "zh-CN", narrativeText, "Team reply");
-                    const contentHash = trim(sourceMeta.contentHash) || createHash("sha256").update(narrativeText).digest("hex");
-                    if (emittedNarrativeHashes.has(contentHash)) return false;
-                    const stableId = "agent-narrative:" + safeName(envelope.messageId) + ":" + contentHash.slice(0, 24);
+                     const contentHash = trim(sourceMeta.contentHash) || createHash("sha256").update(narrativeText).digest("hex");
+                     if (emittedNarrativeHashes.has(contentHash)) return false;
+									 emittedNarrativeHashes.add(contentHash);
+                     const stableId = "agent-narrative:" + safeName(envelope.messageId) + ":" + contentHash.slice(0, 24);
                     const r = new RedisClient(cfg.redisUrl);
                     await r.connect();
                     try {
@@ -5457,19 +5922,23 @@ export default definePluginEntry({
                         sourceSequence: sourceMeta.sourceSequence,
                         sourceRecordId: sourceMeta.sourceRecordId,
                         lateProjection: sourceMeta.lateProjection === true,
+                        suppressedAfterTerminal: sourceMeta.suppressedAfterTerminal === true,
+                        terminalDelivery: sourceMeta.terminalDelivery === true,
                         text: narrativeText,
                         content: narrativeText,
                         summary: narrativeText.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "Team narrative",
                         mediaUrls: media.mediaUrls,
                         mediaUrl: media.mediaUrl,
                       }));
-                      emittedNarrativeHashes.add(contentHash);
-                    } finally {
+									} catch (err) {
+										emittedNarrativeHashes.delete(contentHash);
+										throw err;
+                     } finally {
                       r.close();
                     }
-                    return true;
-                  };
-                  const stopHeartbeat = startAssignmentHeartbeat({
+                     return true;
+                   };
+                   const stopHeartbeat = startAssignmentHeartbeat({
                     envelope,
                     emitTaskEvent,
                     log: ctx.log || console,
@@ -5482,9 +5951,11 @@ export default definePluginEntry({
                     log: ctx.log || console,
                   });
                   let activeResult;
+                  let incompleteTurnDetected = false;
                   const teamContextBody = await appendLeaderTeamContext(textIn, cfg, envelope);
                   try {
-                    activeResult = await runtime.withActiveEnvelope(envelope, async () => {
+                    activeResult = await runtime.withActiveEnvelope(envelope, async () =>
+                      runtime.withNarrativeProjection(envelope, emitAgentNarrative, async () => {
                     const dispatchResult = await dispatchInboundDirectDmWithRuntime({
                     cfg: ctx.cfg,
                     runtime: { channel: ctx.channelRuntime },
@@ -5519,14 +5990,19 @@ export default definePluginEntry({
                       ],
                     },
                     deliver: async (payload) => {
-                      if (runtime.isActiveTaskCompleted(envelope.taskId) || runtime.isActiveTaskCompletionPending(envelope.taskId)) {
+										const durableTurnFacts = await readTurnFacts(cfg, envelope);
+										if (
+											runtime.isActiveTaskCompleted(envelope.taskId) ||
+											runtime.isActiveTaskCompletionPending(envelope.taskId) ||
+											durableTurnFacts.completionProposed
+										) {
                         ctx.log?.info?.("redis-team: suppressed duplicate reply after submitted completion for " + envelope.messageId);
                         return;
                       }
-                      deliveredViaCallback = true;
+                      if (isIncompleteTurnDelivery(payload)) incompleteTurnDetected = true;
                       ctx.log?.info?.("redis-team: delivering reply for " + envelope.messageId);
                       try {
-                        await emitAgentNarrative(
+                        const projected = await emitAgentNarrative(
                           payload?.text || "",
                           "deliver_callback",
                           payload || {},
@@ -5536,6 +6012,7 @@ export default definePluginEntry({
                             lateProjection: false,
                           },
                         );
+                        if (projected) deliveredViaCallback = true;
                       } catch (err) {
                         // Chat projection is auxiliary. Keep the assignment turn
                         // alive and let the session replay retry this stable hash.
@@ -5572,7 +6049,8 @@ export default definePluginEntry({
                     },
                     });
                     return { dispatchResult };
-                    }, cfg);
+                      }),
+                    cfg);
                   } finally {
                     stopHeartbeat();
                     await activityObserver.stop(
@@ -5608,7 +6086,7 @@ export default definePluginEntry({
                     ? workerOutboundText || fallbackText
                     : fallbackText;
                   const terminalAfterDispatch = await runtime.isTaskTerminal(cfg, envelope);
-                  if (!dispatchFailed && !activeResult?.completed && !activeResult?.completionPending && !routing.leaderCoordination) {
+                  if (!dispatchFailed && !incompleteTurnDetected && !activeResult?.completed && !activeResult?.completionPending && !routing.leaderCoordination) {
                     if (!terminalAfterDispatch && await shouldUseAssistantSessionFallback(cfg, envelope, turnResultText)) {
                       const usableFallbackText = usableFallbackAssistantText(turnResultText);
                       const rootTaskId = preferredRootTaskId(envelope.rootTaskId, envelope.taskId);
@@ -5643,16 +6121,23 @@ export default definePluginEntry({
                   // user-visible assistant prose from the current dispatch only.
                   // If the final text became a completion, omit that last copy;
                   // the structured completion event is the canonical delivery.
-                  const narrativeLimit = (fallbackCompleted || fallbackPending || terminalAfterDispatch)
-                    ? Math.max(0, assistantNarratives.length - 1)
-                    : assistantNarratives.length;
-                  for (const narrative of assistantNarratives.slice(0, narrativeLimit)) {
+                  const suppressLateProcessNarratives =
+                    fallbackCompleted || fallbackPending || terminalAfterDispatch;
+                  const recoveryNarratives = assistantSessionNarrativesForProjection(
+                    assistantNarratives,
+                    deliveredViaCallback,
+                    suppressLateProcessNarratives,
+                  );
+                  for (const narrative of recoveryNarratives) {
                     try {
                       await emitAgentNarrative(
                         narrative.text,
                         "assistant_session",
                         {},
-                        { ...narrative, lateProjection: true },
+                        {
+                          ...narrative,
+                          ...lateNarrativeProjectionMeta(suppressLateProcessNarratives),
+                        },
                       );
                     } catch (err) {
                       ctx.log?.warn?.(
@@ -5668,12 +6153,19 @@ export default definePluginEntry({
                         "redis-team: task " + envelope.taskId + " already terminal after dispatch",
                       );
                     } else {
-                      const summary = "Agent \u56de\u5408\u5df2\u7ed3\u675f\uff0c\u6b63\u5728\u7b49\u5f85\u663e\u5f0f\u5b8c\u6210\u56de\u6267\u3002";
+                      const retryEvent = incompleteTurnDetected
+                        ? assignmentAttemptFailedEvent(envelope)
+                        : turnFinishedWithoutCompletionEvent(envelope, {
+                            deliveredViaCallback,
+                            assistantNarratives,
+                            fallbackText,
+                            hadOutboundAssignment: !!activeResult?.outbound,
+                          });
                       await writeLocalStatus(cfg, {
-                        availability: "waiting_completion",
-                        runtimeStatus: "waiting_completion",
+                        availability: retryEvent.availability,
+                        runtimeStatus: retryEvent.runtimeStatus,
                         currentTaskId: envelope.taskId,
-                        lastSummary: summary,
+                        lastSummary: retryEvent.summary,
                       });
                       const r = new RedisClient(cfg.redisUrl);
                       await r.connect();
@@ -5682,12 +6174,7 @@ export default definePluginEntry({
                           cfg,
                           "task_progress",
                           envelope,
-                          turnFinishedWithoutCompletionEvent(envelope, {
-                            deliveredViaCallback,
-                            assistantNarratives,
-                            fallbackText,
-                            hadOutboundAssignment: !!activeResult?.outbound,
-                          }),
+                          retryEvent,
                         ));
                       } finally {
                         r.close();
