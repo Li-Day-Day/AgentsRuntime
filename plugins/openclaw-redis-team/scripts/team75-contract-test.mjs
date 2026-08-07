@@ -465,7 +465,7 @@ try {
 		"unknown",
 		"lost Browser evidence must not be misreported as a factual static-only review",
 	);
-  for (let index = 0; index < 4; index += 1) {
+  for (let index = 0; index < 10; index += 1) {
     const decision = pluginModule.reviewerBrowserToolDecision(
       browserEnvelope,
 			{ toolName: "browser", params: { action: "snapshot" } },
@@ -605,7 +605,7 @@ try {
 		genericValidatorState,
 		3001,
 	);
-  for (let index = 0; index < 4; index += 1) {
+  for (let index = 0; index < 10; index += 1) {
     const genericValidatorBrowser = pluginModule.reviewerBrowserToolDecision(
 			genericValidatorEnvelope,
       { toolName: "browser", params: { action: "snapshot" } },
@@ -1042,13 +1042,16 @@ try {
     "/team/results/team-75-task-150/reviews/review-01/canonical-review-report.md",
     "the active Reviewer canonical path must infer the non-blocking review contract",
   );
-  await assert.rejects(
-    () => reviewerTools.get("team_artifact_write").execute("review-wrong-assignment", {
+  const normalizedStaleReviewPath = toolResult(
+    await reviewerTools.get("team_artifact_write").execute("review-wrong-assignment", {
       path: "/team/results/team-75-task-150/reviews/review-02/wrong-review-report.md",
-      content: "must not be written",
+      content: "# Normalized stale path\n\nPASS\n",
     }),
-    /outside the active artifact scope/,
-    "canonical inference must not widen a Reviewer to another assignment",
+  );
+  assert.equal(
+    normalizedStaleReviewPath.artifact.path,
+    "/team/results/team-75-task-150/reviews/review-01/wrong-review-report.md",
+    "a stale target/retry directory must normalize into the active validation assignment",
   );
   const legacyPrefixedReview = toolResult(await reviewerTools.get("team_artifact_write").execute("review-prefixed", {
     scope: "team",
@@ -1070,17 +1073,36 @@ try {
 		legacyMemberReport.artifact.path,
 		"/team/artifacts/team-75-task-150/members/reviewer/review-01/QA-REPORT.md",
 	);
+	const legacyMemberEvidence = toolResult(await reviewerTools.get("team_artifact_write").execute("review-member-evidence", {
+		scope: "member",
+		path: "EVIDENCE.json",
+		content: '{"pass":true}\n',
+	}));
 	const normalizedReviewCompletion = toolResult(await reviewerTools.get("team_complete_task").execute("review-complete", {
 		status: "succeeded",
 		summary: "\u5ba1\u6838\u5b8c\u6210",
 		resultMarkdown: `\u5ba1\u6838\u62a5\u544a\uff1a${legacyMemberReport.artifact.path}`,
-		artifactRefs: [legacyMemberReport.artifact.path],
+		artifactRefs: [legacyMemberReport.artifact.path, legacyMemberEvidence.artifact.path],
 	}));
 	assert.ok(
 		normalizedReviewCompletion.artifactRefs.includes("/team/results/team-75-task-150/reviews/review-01/QA-REPORT.md"),
 		"an explicitly referenced legacy member report must be copied to the canonical review root",
 	);
+	assert.ok(
+		normalizedReviewCompletion.artifactRefs.includes("/team/results/team-75-task-150/reviews/review-01/EVIDENCE.json"),
+		"multiple explicit review evidence files must mirror without creating a completion retry",
+	);
 	await fs.access(path.join(shared, "results", "team-75-task-150", "reviews", "review-01", "QA-REPORT.md"));
+  const tolerantReviewRead = toolResult(await reviewerTools.get("team_artifact_read").execute("review-read-stale-path", {
+    scope: "team",
+    path: "/team/results/team-75-task-150/reviews/old-review-assignment/QA-REPORT.md",
+  }));
+  assert.equal(tolerantReviewRead.ok, true);
+  assert.equal(
+    tolerantReviewRead.artifact.path,
+    "/team/results/team-75-task-150/reviews/review-01/QA-REPORT.md",
+    "a unique report in the current root work must remain readable through a stale assignment path",
+  );
   await seedActive("auditor", "domain-specialist", "audit-01", {
     validationAssignment: true,
     validationTargetAssignmentId: "dev-01",

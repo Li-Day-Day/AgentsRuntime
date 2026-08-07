@@ -417,15 +417,66 @@ def _artifact_path(
             / _safe_name(settings.member_id)
             / _safe_name(assignment_id)
         )
-        candidate = root / relative
+        canonical_candidate = settings.shared_path / relative
+        if _trim(args.get("path")).replace("\\", "/").startswith("/team/"):
+            try:
+                canonical_candidate.relative_to(root)
+            except ValueError as exc:
+                raise ValueError("Canonical Team artifact path is outside the active member scope") from exc
+            candidate = canonical_candidate
+        else:
+            candidate = root / relative
     elif scope == "team":
-        if write and "leader" not in settings.role.lower() and "leader" not in settings.member_id.lower():
-            raise ValueError("Only the Team Leader may write team-scoped artifacts")
         candidate = settings.shared_path / relative
+        if write and "leader" not in settings.role.lower() and "leader" not in settings.member_id.lower():
+            active = _load_active_envelope(settings)
+            root_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
+            assignment_id = _trim(active.get("assignmentId") or active.get("workId"))
+            allowed_root = (
+                settings.shared_path
+                / "results"
+                / _safe_name(root_task_id)
+                / "reviews"
+                / _safe_name(assignment_id)
+            )
+            if not _assigned_validation_writer(settings, active):
+                raise ValueError("Only the Team Leader or assigned validator may write this team-scoped artifact")
+            try:
+                candidate.relative_to(allowed_root)
+            except ValueError as exc:
+                raise ValueError("Canonical Team artifact path is outside the active validation scope") from exc
     else:
         raise ValueError("Team artifact scope must be member or team")
     _assert_no_symlink_traversal(shared_root, candidate)
     return candidate
+
+
+def _normalize_validation_artifact_write_args(
+    settings: RedisTeamSettings,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    active = _load_active_envelope(settings)
+    if not _assigned_validation_writer(settings, active):
+        return args
+    root_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
+    assignment_id = _trim(active.get("assignmentId") or active.get("workId"))
+    raw = _trim(args.get("path")).replace("\\", "/")
+    relative = raw[len("/team/") :] if raw.startswith("/team/") else raw
+    prefix = f"results/{_safe_name(root_task_id)}/reviews/"
+    if not root_task_id or not assignment_id or not relative.startswith(prefix):
+        return args
+    remainder = relative[len(prefix) :]
+    parts = remainder.split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1] or ".." in parts[1].split("/"):
+        return args
+    normalized = dict(args)
+    normalized["scope"] = "team"
+    normalized["kind"] = "review"
+    normalized["path"] = (
+        f"/team/results/{_safe_name(root_task_id)}/reviews/"
+        f"{_safe_name(assignment_id)}/{parts[1]}"
+    )
+    return normalized
 
 
 def canonical_artifact_ref(settings: RedisTeamSettings, path: Path) -> str:
@@ -533,30 +584,36 @@ def _canonicalize_reviewer_completion_report(
     candidates: list[str] = []
     for raw in [*(explicit_refs or []), *text_refs]:
         ref = _trim(raw).rstrip(".,;:!?锛岋紱锛氥€傦紒")
+        ref = ref.rstrip("，。；：、！？")
         if not ref.startswith(member_prefix) or Path(ref).suffix.lower() not in {".md", ".txt", ".json"}:
             continue
         if ref not in candidates:
             candidates.append(ref)
-    if len(candidates) != 1:
+    if not candidates:
         return []
+    mirrored: list[str] = []
     try:
-        source = settings.shared_path / _artifact_relative_path(candidates[0])
-        if not source.is_file():
-            return []
-        destination = (
-            settings.shared_path
-            / "results"
-            / _safe_name(root_task_id)
-            / "reviews"
-            / _safe_name(assignment_id)
-            / source.name
-        )
-        _assert_no_symlink_traversal(settings.shared_path, source)
-        _assert_no_symlink_traversal(settings.shared_path, destination)
-        _atomic_write_text(destination, source.read_text(encoding="utf-8"))
-        return [canonical_artifact_ref(settings, destination)]
+        for candidate in candidates[:16]:
+            source = settings.shared_path / _artifact_relative_path(candidate)
+            if not source.is_file():
+                continue
+            destination = (
+                settings.shared_path
+                / "results"
+                / _safe_name(root_task_id)
+                / "reviews"
+                / _safe_name(assignment_id)
+                / source.name
+            )
+            _assert_no_symlink_traversal(settings.shared_path, source)
+            _assert_no_symlink_traversal(settings.shared_path, destination)
+            _atomic_write_text(destination, source.read_text(encoding="utf-8"))
+            canonical = canonical_artifact_ref(settings, destination)
+            if canonical not in mirrored:
+                mirrored.append(canonical)
     except Exception:
-        return []
+        pass
+    return mirrored
 
 
 def artifact_metadata(settings: RedisTeamSettings, refs: Optional[list[str]]) -> list[dict[str, Any]]:
@@ -574,10 +631,65 @@ def artifact_metadata(settings: RedisTeamSettings, refs: Optional[list[str]]) ->
     return metadata
 
 
+def _artifact_read_path_with_fallback(settings: RedisTeamSettings, args: dict[str, Any]) -> Path:
+    target = _artifact_path(settings, args, default_scope="team")
+    if target.is_file():
+        return target
+    raw = _trim(args.get("path")).replace("\\", "/")
+    relative = raw[len("/team/") :] if raw.startswith("/team/") else raw
+    parts = [part for part in relative.split("/") if part]
+    requested_root = parts[1] if len(parts) > 2 and parts[0] in {"results", "artifacts"} else ""
+    active = _load_active_envelope(settings)
+    active_root = _trim(active.get("rootTaskId") or active.get("taskId"))
+    root_task_id = _safe_name(requested_root or active_root)
+    if not root_task_id or (requested_root and active_root and _safe_name(active_root) != root_task_id):
+        return target
+    basename = target.name
+    allowed_roots = (
+        settings.shared_path / "results" / root_task_id,
+        settings.shared_path / "artifacts" / root_task_id,
+    )
+    referenced: list[Path] = []
+    for ref in [*(active.get("artifactRefs") or []), *(active.get("contextRefs") or [])]:
+        try:
+            candidate = settings.shared_path / _artifact_relative_path(ref)
+            if candidate.name != basename or not candidate.is_file():
+                continue
+            if not any(candidate == root or root in candidate.parents for root in allowed_roots):
+                continue
+            _assert_no_symlink_traversal(settings.shared_path, candidate)
+            if candidate not in referenced:
+                referenced.append(candidate)
+        except Exception:
+            continue
+    if len(referenced) == 1:
+        return referenced[0]
+    if len(referenced) > 1:
+        return target
+
+    matches: list[Path] = []
+    inspected = 0
+    for root in allowed_roots:
+        if not root.is_dir():
+            continue
+        for candidate in root.rglob("*"):
+            inspected += 1
+            if inspected > 128:
+                return target
+            if candidate.is_symlink() or not candidate.is_file() or candidate.name != basename:
+                continue
+            _assert_no_symlink_traversal(settings.shared_path, candidate)
+            matches.append(candidate)
+            if len(matches) > 1:
+                return target
+    return matches[0] if len(matches) == 1 else target
+
+
 async def _tool_team_artifact_write(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     try:
-        target = _artifact_path(settings, args, default_scope="member", write=True)
+        effective_args = _normalize_validation_artifact_write_args(settings, args)
+        target = _artifact_path(settings, effective_args, default_scope="member", write=True)
         _atomic_write_text(target, str(args.get("content") or ""))
         return json.dumps(
             {"ok": True, "artifact": {"path": canonical_artifact_ref(settings, target), "bytes": target.stat().st_size}},
@@ -590,7 +702,7 @@ async def _tool_team_artifact_write(args: dict[str, Any], **_kwargs) -> str:
 async def _tool_team_artifact_read(args: dict[str, Any], **_kwargs) -> str:
     settings = load_settings(None)
     try:
-        target = _artifact_path(settings, args, default_scope="team")
+        target = _artifact_read_path_with_fallback(settings, args)
         max_bytes = min(MAX_ARTIFACT_BYTES, max(1, int(args.get("maxBytes") or 256 * 1024)))
         if not target.is_file():
             raise ValueError("Team artifact is not a file")

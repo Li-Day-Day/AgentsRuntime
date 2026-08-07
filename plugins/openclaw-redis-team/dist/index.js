@@ -638,9 +638,7 @@ function assertTeamArtifactWriteScope(cfg, params, activeEnvelope) {
 
 function inferCanonicalArtifactWriteContract(cfg, params, activeEnvelope) {
   const current = params || {};
-  const explicitScope = trim(current.scope);
-  const explicitKind = trim(current.kind || current.artifactKind || current.artifact_kind);
-  if (explicitScope || explicitKind || !activeEnvelope || !isAssignedValidationWriter(cfg, activeEnvelope)) {
+  if (!activeEnvelope || !isAssignedValidationWriter(cfg, activeEnvelope)) {
     return current;
   }
 
@@ -649,18 +647,26 @@ function inferCanonicalArtifactWriteContract(cfg, params, activeEnvelope) {
   if (relative.startsWith("/team/")) relative = relative.slice("/team/".length);
   if (!relative.startsWith("results/") || relative.split("/").includes("..")) return current;
 
-  // Review instructions publish an exact canonical /team/results path, while
-  // the tool historically defaulted omitted scope/kind to a member artifact.
-  // Infer only the active root and active validation assignment. This makes a
-  // valid path tolerant without widening access to another task or reviewer.
-  const reviewPrefix =
-    "results/" +
-    safeName(artifactRootTaskId(current, activeEnvelope)) +
-    "/reviews/" +
-    artifactAssignmentId(current, activeEnvelope) +
-    "/";
-  if (!relative.startsWith(reviewPrefix) || relative.length === reviewPrefix.length) return current;
-  return { ...current, scope: "team", kind: "review" };
+  const rootTaskId = safeName(artifactRootTaskId(current, activeEnvelope));
+  const activeAssignmentId = artifactAssignmentId(current, activeEnvelope);
+  const prefix = `results/${rootTaskId}/reviews/`;
+  if (!relative.startsWith(prefix)) return current;
+  const remainder = relative.slice(prefix.length);
+  const separator = remainder.indexOf("/");
+  if (separator <= 0 || separator === remainder.length - 1) return current;
+  const reportRelative = remainder.slice(separator + 1);
+  if (!reportRelative || reportRelative.split("/").includes("..")) return current;
+
+  // The active assignment envelope, not Agent-authored directory text, owns
+  // the validation report lane. A validator may accidentally use the target
+  // assignment id or an earlier retry id; normalize that path into the active
+  // lane instead of failing the tool call or widening access to another root.
+  return {
+    ...current,
+    path: `/team/results/${rootTaskId}/reviews/${activeAssignmentId}/${reportRelative}`,
+    scope: "team",
+    kind: "review",
+  };
 }
 
 function isLeaderMember(cfg) {
@@ -995,27 +1001,28 @@ async function canonicalizeReviewerCompletionReport(cfg, envelope, rootTaskId, a
 		if (![".md", ".txt", ".json"].includes(extension)) continue;
 		if (!candidates.includes(canonical)) candidates.push(canonical);
 	}
-	// An explicit single member report is unambiguous. Multiple candidates are
-	// accepted as-is so normalization never adds a retry or completion gate.
-	if (candidates.length !== 1) return [];
+	if (!candidates.length) return [];
+	const mirrored = [];
+	const destinationDir = path.join(
+		cfg.sharedDir,
+		"results",
+		safeName(rootTaskId),
+		"reviews",
+		safeName(assignmentId),
+	);
 	try {
-		const source = path.join(cfg.sharedDir, ...candidates[0].slice("/team/".length).split("/"));
-		const stat = await fs.stat(source);
-		if (!stat.isFile()) return [];
-		const destinationDir = path.join(
-			cfg.sharedDir,
-			"results",
-			safeName(rootTaskId),
-			"reviews",
-			safeName(assignmentId),
-		);
 		await mkdirBestEffort(destinationDir, TEAM_SHARED_DIR_MODE, "canonical review result directory");
-		const destination = path.join(destinationDir, path.basename(source));
-		await writeText(destination, await fs.readFile(source, "utf8"));
-		return [canonicalArtifactRef(cfg, destination)];
-	} catch {
-		return [];
-	}
+		for (const candidate of candidates.slice(0, 16)) {
+			const source = path.join(cfg.sharedDir, ...candidate.slice("/team/".length).split("/"));
+			const stat = await fs.stat(source);
+			if (!stat.isFile()) continue;
+			const destination = path.join(destinationDir, path.basename(source));
+			await writeText(destination, await fs.readFile(source, "utf8"));
+			const canonical = canonicalArtifactRef(cfg, destination);
+			if (!mirrored.includes(canonical)) mirrored.push(canonical);
+		}
+	} catch {}
+	return mirrored;
 }
 
 function optionalPreviewFields(cfg, file) {
@@ -1056,6 +1063,89 @@ async function listDirectoryArtifacts(dir, limit = 200) {
   }
   await walk(dir);
   return out;
+}
+
+function artifactReadRootTaskId(params, activeEnvelope) {
+  try {
+    return safeName(artifactRootTaskId(params || {}, activeEnvelope));
+  } catch {}
+  const raw = trim(params?.path).replaceAll("\\", "/").replace(/^\/team\//, "");
+  const match = raw.match(/^(?:results|artifacts)\/([^/]+)\//);
+  return match ? safeName(match[1]) : "";
+}
+
+async function resolveTeamArtifactReadWithFallback(cfg, params, activeEnvelope, additionalRefs = []) {
+  const resolved = await resolveTeamArtifactPath(cfg, params || {}, activeEnvelope, "team");
+  try {
+    const stat = await fs.stat(resolved.candidate);
+    if (stat.isFile()) return resolved;
+    return resolved;
+  } catch (err) {
+    if (err?.code !== "ENOENT") throw err;
+  }
+
+  const rootTaskId = artifactReadRootTaskId(params, activeEnvelope);
+  const basename = path.basename(resolved.candidate);
+  if (!rootTaskId || !basename) return resolved;
+  const sharedRoot = path.resolve(cfg.sharedDir);
+  const allowedPrefixes = [
+    `/team/results/${rootTaskId}/`,
+    `/team/artifacts/${rootTaskId}/`,
+  ];
+  const requestedRelative = trim(params?.path).replaceAll("\\", "/").replace(/^\/team\//, "");
+  const preferredRoot = requestedRelative.startsWith(`results/${rootTaskId}/`)
+    ? path.join(sharedRoot, "results", rootTaskId)
+    : requestedRelative.startsWith(`artifacts/${rootTaskId}/`)
+      ? path.join(sharedRoot, "artifacts", rootTaskId)
+      : "";
+  if (preferredRoot) {
+    const preferredMatches = [];
+    for (const candidate of await listDirectoryArtifacts(preferredRoot, 128)) {
+      if (path.basename(candidate) !== basename) continue;
+      await assertNoArtifactSymlinkTraversal(sharedRoot, candidate);
+      preferredMatches.push({ candidate, canonical: canonicalArtifactRef(cfg, candidate) });
+      if (preferredMatches.length > 1) break;
+    }
+    if (preferredMatches.length === 1) return preferredMatches[0];
+    if (preferredMatches.length > 1) return resolved;
+  }
+  const referenced = [];
+  for (const raw of [
+    ...(Array.isArray(activeEnvelope?.artifactRefs) ? activeEnvelope.artifactRefs : []),
+    ...(Array.isArray(activeEnvelope?.contextRefs) ? activeEnvelope.contextRefs : []),
+    ...(Array.isArray(additionalRefs) ? additionalRefs : []),
+  ]) {
+    const canonical = canonicalArtifactAlias(cfg, raw, rootTaskId);
+    if (!allowedPrefixes.some((prefix) => canonical.startsWith(prefix)) || path.posix.basename(canonical) !== basename) continue;
+    const candidate = path.resolve(sharedRoot, ...canonical.slice("/team/".length).split("/"));
+    try {
+      const stat = await fs.stat(candidate);
+      if (stat.isFile() && !referenced.some((entry) => entry.candidate === candidate)) {
+        await assertNoArtifactSymlinkTraversal(sharedRoot, candidate);
+        referenced.push({ candidate, canonical });
+      }
+    } catch {}
+  }
+  if (referenced.length === 1) return referenced[0];
+  if (referenced.length > 1) return resolved;
+
+  // Compatibility for an older Runtime or an Agent-authored stale assignment
+  // path: search only this persisted root task and only for the requested file
+  // name. A unique match is safe to recover; ambiguity remains an ordinary
+  // not-found result so the control plane never guesses the wrong artifact.
+  const matches = [];
+  for (const root of [
+    path.join(sharedRoot, "results", rootTaskId),
+    path.join(sharedRoot, "artifacts", rootTaskId),
+  ]) {
+    for (const candidate of await listDirectoryArtifacts(root, 128)) {
+      if (path.basename(candidate) !== basename) continue;
+      await assertNoArtifactSymlinkTraversal(sharedRoot, candidate);
+      matches.push({ candidate, canonical: canonicalArtifactRef(cfg, candidate) });
+      if (matches.length > 1) return resolved;
+    }
+  }
+  return matches.length === 1 ? matches[0] : resolved;
 }
 
 async function writeArtifactManifest(cfg, sourcePath, ref, files, note = "") {
@@ -1220,7 +1310,7 @@ function canonicalTeamArtifactRefsFromText(cfg, text, rootTaskId = "") {
   const pattern = /(?:\/team\/|\$\{?CLAWMANAGER_TEAM_SHARED_DIR\}?\/|\/workspaces\/teams\/[^\s/]+\/team-[^\s/]+-shared\/)[^\s)\]}>`,"']+/gi;
   for (const match of String(text || "").match(pattern) || []) {
     const ref = match.replace(/[.,;:!?。；：，、！]+$/u, "");
-    const canonicalRef = canonicalArtifactAlias(cfg, ref, rootTaskId);
+    const canonicalRef = canonicalArtifactAlias(cfg, ref.replace(/[，。；：、！？]+$/u, ""), rootTaskId);
     if (!canonicalRef || canonicalRef.endsWith("/") || !isCanonicalTeamArtifactRef(canonicalRef) || seen.has(canonicalRef)) continue;
     seen.add(canonicalRef);
     refs.push(canonicalRef);
@@ -1779,8 +1869,8 @@ function resolveRedisTeamVerificationRole(envelope) {
   return "";
 }
 
-const REVIEW_BROWSER_MAX_CALLS = 5;
-const REVIEW_BROWSER_WINDOW_MS = 20_000;
+const REVIEW_BROWSER_MAX_CALLS = 10;
+const REVIEW_BROWSER_WINDOW_MS = 90_000;
 const REVIEW_BROWSER_PREPARATION_ACTIONS = new Set(["status", "start"]);
 const REVIEW_BROWSER_EVIDENCE_ACTIONS = new Set(["snapshot", "screenshot", "act", "evaluate", "inspect"]);
 
@@ -1862,7 +1952,10 @@ function reviewerBrowserToolResultDecision(envelope, event, state, now = Date.no
 	if (action === "open" && guard.pendingOpen) {
 		guard.pendingOpen = false;
 		guard.startedAt = now;
-		guard.calls = 1;
+		// Opening the managed target establishes the verification session; it is
+		// preparation, not evidence. Reserve the bounded evidence budget for the
+		// actual snapshot/evaluate/interaction sequence.
+		guard.calls = 0;
 		guard.targetUrl = guard.pendingTarget || verificationTargetUrl(envelope);
 		guard.managedPreviewOpened = isManagedInteractivePreviewUrl(guard.targetUrl);
 		guard.targetId = trim(event?.result?.targetId || event?.output?.targetId || event?.targetId) || guard.targetId;
@@ -4575,7 +4668,12 @@ function createRuntime(api) {
       const cfg = readChannelConfig(runtimeApi.config || {});
       if (!cfg.enabled || !trim(cfg.sharedDir)) throw new Error("Redis Team shared workspace is disabled");
       const currentEnvelope = activeEnvelope || await resolveActiveAssignmentEnvelope(cfg, params || {});
-      const resolved = await resolveTeamArtifactPath(cfg, params || {}, currentEnvelope, "team");
+      const resolved = await resolveTeamArtifactReadWithFallback(
+        cfg,
+        params || {},
+        currentEnvelope,
+        activeArtifactRefs,
+      );
       const stat = await fs.stat(resolved.candidate);
       if (!stat.isFile()) throw new Error("Team artifact is not a file: " + resolved.canonical);
       const maxBytes = Math.min(1024 * 1024, Math.max(1, intFrom(params?.maxBytes, 256 * 1024)));

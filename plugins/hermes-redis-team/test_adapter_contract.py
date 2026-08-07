@@ -482,6 +482,61 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                 "the compatibility copy must preserve the original member report",
             )
 
+    def test_validation_report_path_uses_active_assignment_and_stale_reads_recover_uniquely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = adapter.RedisTeamSettings(
+                enabled=True,
+                redis_url="redis://example.invalid:6379/0",
+                team_id="42",
+                member_id="reviewer",
+                role="reviewer",
+                shared_dir=tmp,
+            )
+            adapter.ensure_team_dirs(settings)
+            adapter._persist_active_envelope(
+                settings,
+                {
+                    "rootTaskId": "team-42-task-7",
+                    "taskId": "team-42-task-7",
+                    "assignmentId": "review-r2",
+                    "validationAssignment": True,
+                    "validationTargetAssignmentId": "developer-r1",
+                },
+            )
+            stale_args = {
+                "scope": "member",
+                "path": "/team/results/team-42-task-7/reviews/developer-r1/QA-REPORT.md",
+            }
+            effective = adapter._normalize_validation_artifact_write_args(settings, stale_args)
+            self.assertEqual(effective["scope"], "team")
+            self.assertEqual(
+                effective["path"],
+                "/team/results/team-42-task-7/reviews/review-r2/QA-REPORT.md",
+            )
+            target = adapter._artifact_path(settings, effective, default_scope="member", write=True)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# QA\n\nPASS\n", encoding="utf-8")
+            recovered = adapter._artifact_read_path_with_fallback(
+                settings,
+                {
+                    "scope": "team",
+                    "path": "/team/results/team-42-task-7/reviews/review-old/QA-REPORT.md",
+                },
+            )
+            self.assertEqual(recovered, target)
+
+            duplicate = Path(tmp) / "artifacts" / "team-42-task-7" / "copy" / "QA-REPORT.md"
+            duplicate.parent.mkdir(parents=True)
+            duplicate.write_text("different report", encoding="utf-8")
+            ambiguous = adapter._artifact_read_path_with_fallback(
+                settings,
+                {
+                    "scope": "team",
+                    "path": "/team/results/team-42-task-7/reviews/review-old/QA-REPORT.md",
+                },
+            )
+            self.assertNotEqual(ambiguous, target, "ambiguous filenames must never be guessed")
+
     def test_worker_result_never_overwrites_team_final_result(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.settings(Path(tmp))
