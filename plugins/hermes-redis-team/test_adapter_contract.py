@@ -85,14 +85,87 @@ spec.loader.exec_module(adapter)
 
 
 class HermesRedisTeamContractTests(unittest.TestCase):
-    def test_platform_hint_keeps_execution_validation_proportional_and_non_blocking(self):
+    def test_platform_hint_uses_assignment_validation_ownership_without_blocking(self):
         source = Path(adapter.__file__).read_text(encoding="utf-8")
-        self.assertIn("implementation self-check should stay proportional", source)
-        self.assertIn("When independent", source)
-        self.assertIn("review or QA is planned downstream", source)
-        self.assertIn("Product dependencies remain allowed", source)
-        self.assertIn("optional validation", source)
-        self.assertIn("not completion gates", source)
+        self.assertIn("Validation is", source)
+        self.assertIn("assignment-specific", source)
+        self.assertIn("production-only assignments", source)
+        self.assertIn("review, or evidence work", source)
+        self.assertIn("never block delivery", source)
+        self.assertIn("call team_complete_task", source)
+
+    def test_assignment_validation_guidance_is_contract_driven_and_role_agnostic(self):
+        developer = adapter.RedisTeamSettings(
+            enabled=True,
+            redis_url="redis://example.invalid:6379/0",
+            team_id="42",
+            member_id="developer",
+            role="developer",
+        )
+        production = adapter._assignment_validation_guidance(developer, {"reviewRequired": True})
+        self.assertIn("production-only", production)
+        self.assertIn("without running syntax checks, tests, Browser acceptance", production)
+        validator = adapter._assignment_validation_guidance(
+            developer,
+            {"validationAssignment": True, "validationTargetAssignmentId": "dev-1"},
+        )
+        self.assertIn("test/review/evidence work", validator)
+        self.assertIn("regardless of role name", validator)
+        reviewer = adapter.RedisTeamSettings(
+            enabled=True,
+            redis_url="redis://example.invalid:6379/0",
+            team_id="42",
+            member_id="reviewer",
+            role="reviewer",
+        )
+        reviewer_production = adapter._assignment_validation_guidance(reviewer, {"reviewRequired": True})
+        self.assertIn("production-only", reviewer_production)
+        self.assertIn("without running syntax checks, tests, Browser acceptance", reviewer_production)
+
+    def test_team_send_preserves_assignment_validation_contract(self):
+        async def run_test():
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = self.settings(Path(tmp))
+                adapter.ensure_team_dirs(settings)
+                adapter._persist_active_envelope(
+                    settings,
+                    {"taskId": "team-42-task-1", "rootTaskId": "team-42-task-1", "rootMessageId": "root-1"},
+                )
+
+                class FakeRedis:
+                    def __init__(self, *_args, **_kwargs):
+                        pass
+
+                    async def connect(self):
+                        return None
+
+                    async def command(self, *_args):
+                        return "1-0"
+
+                    def close(self):
+                        pass
+
+                with mock.patch.object(adapter, "load_settings", return_value=settings), mock.patch.object(
+                    adapter, "AsyncRedisClient", FakeRedis
+                ):
+                    raw = await adapter._tool_team_send(
+                        {
+                            "to": "auditor",
+                            "text": "Validate revision 2.",
+                            "assignmentId": "review-2",
+                            "validationAssignment": True,
+                            "validationTargetAssignmentId": "dev-2",
+                            "validationTargetRevision": 2,
+                            "dependsOn": ["dev-2"],
+                        }
+                    )
+                sent = json.loads(raw)["sent"]
+                self.assertTrue(sent["validationAssignment"])
+                self.assertEqual(sent["validationTargetAssignmentId"], "dev-2")
+                self.assertEqual(sent["validationTargetRevision"], 2)
+                self.assertEqual(sent["dependsOn"], ["dev-2"])
+
+        asyncio.run(run_test())
 
     def settings(self, root):
         return adapter.RedisTeamSettings(
@@ -109,7 +182,9 @@ class HermesRedisTeamContractTests(unittest.TestCase):
     def test_protocol_matches_current_worker_contract(self):
         self.assertEqual(adapter.PROTOCOL_VERSION, 4)
         self.assertIn("completion_ack_v1", adapter.PROTOCOL_CAPABILITIES)
-        self.assertIn("automatic_turn_completion_v2", adapter.PROTOCOL_CAPABILITIES)
+        self.assertNotIn("automatic_turn_completion_v2", adapter.PROTOCOL_CAPABILITIES)
+        self.assertIn("explicit_completion_receipt_v1", adapter.PROTOCOL_CAPABILITIES)
+        self.assertIn("turn_end_monitor_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("assignment_lifecycle_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("team_artifact_preview_v1", adapter.PROTOCOL_CAPABILITIES)
         self.assertIn("team_artifact_preview_v2", adapter.PROTOCOL_CAPABILITIES)
@@ -515,15 +590,14 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                         status="succeeded",
                         summary="implementation complete",
                         result_markdown="The requested implementation is complete.",
-                        explicit=False,
-                        automatic_turn_result=True,
+                        explicit=True,
                     )
                 )
 
             event = captured
             self.assertEqual(event["completionSource"], "team_complete_task")
             self.assertTrue(event["explicitCompletion"])
-            self.assertTrue(event["automaticTurnResult"])
+            self.assertNotIn("automaticTurnResult", event)
             self.assertTrue(event["assignmentResultOnly"])
             self.assertFalse(event["rootTaskTerminal"])
 
@@ -545,6 +619,40 @@ class HermesRedisTeamContractTests(unittest.TestCase):
         self.assertEqual(value["rootMessageId"], "root-msg")
         self.assertEqual(value["revision"], 3)
         self.assertFalse(value["requiresCompletion"])
+
+    def test_completion_uses_active_envelope_when_agent_reports_wrong_task_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.settings(Path(tmp))
+            active = {
+                "messageId": "msg-active",
+                "taskId": "team-42-task-7",
+                "rootTaskId": "team-42-task-7",
+                "rootMessageId": "root-msg",
+                "assignmentId": "dev-1",
+                "workId": "dev-1",
+                "revision": 2,
+            }
+            adapter._persist_active_envelope(settings, active)
+            captured = {}
+
+            async def fake_propose(_settings, envelope, **_kwargs):
+                captured.update(envelope)
+                return {"decision": "accepted"}
+
+            with (
+                mock.patch.object(adapter, "load_settings", return_value=settings),
+                mock.patch.object(adapter, "_propose_completion", fake_propose),
+            ):
+                result = asyncio.run(
+                    adapter._tool_team_complete_task(
+                        {"taskId": "team-999-task-999", "status": "succeeded", "summary": "Delivered"}
+                    )
+                )
+            self.assertEqual(json.loads(result)["decision"], "accepted")
+            self.assertEqual(captured["rootTaskId"], "team-42-task-7")
+            self.assertEqual(captured["taskId"], "team-42-task-7")
+            self.assertEqual(captured["assignmentId"], "dev-1")
+            self.assertEqual(captured["reportedTaskId"], "team-999-task-999")
 
     def test_normalized_envelope_rejects_unstable_transport_identity(self):
         self.assertIsNone(adapter.normalize_envelope({"taskId": "team-42-task-7"}))
@@ -832,10 +940,11 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                 if command[0] == "XADD" and command[1] == adapter.events_key(settings)
             ]
             self.assertEqual(len(replies), 1)
-            self.assertTrue(replies[0]["visibleToChat"])
+            self.assertFalse(replies[0]["visibleToChat"])
+            self.assertEqual(replies[0]["chatPolicy"], "hidden")
             self.assertEqual(replies[0]["stateEffect"], "none")
 
-    def test_terminal_assignment_shows_final_delivery_once_then_hides_late_narrative(self):
+    def test_terminal_assignment_keeps_all_raw_narratives_internal(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.settings(Path(tmp))
             commands = []
@@ -901,8 +1010,8 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                 if command[0] == "XADD" and command[1] == adapter.events_key(settings)
             ]
             self.assertEqual(len(replies), 2)
-            self.assertTrue(replies[0]["visibleToChat"])
-            self.assertEqual(replies[0]["chatPolicy"], "visible")
+            self.assertFalse(replies[0]["visibleToChat"])
+            self.assertEqual(replies[0]["chatPolicy"], "hidden")
             self.assertTrue(replies[0]["terminalDelivery"])
             self.assertIsNone(replies[0].get("suppressedAfterTerminal"))
             self.assertFalse(replies[1]["visibleToChat"])
@@ -910,7 +1019,7 @@ class HermesRedisTeamContractTests(unittest.TestCase):
             self.assertTrue(replies[1]["lateProjection"])
             self.assertTrue(replies[1]["suppressedAfterTerminal"])
 
-    def test_failed_terminal_delivery_projection_remains_retryable_and_visible(self):
+    def test_failed_terminal_delivery_audit_projection_remains_retryable_and_hidden(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.settings(Path(tmp))
             commands = []
@@ -977,7 +1086,8 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                 if command[0] == "XADD" and len(command) >= 5 and command[1] == adapter.events_key(settings)
             ]
             self.assertEqual(len(published), 2)
-            self.assertTrue(all(event["visibleToChat"] for event in published))
+            self.assertTrue(all(not event["visibleToChat"] for event in published))
+            self.assertTrue(all(event["chatPolicy"] == "hidden" for event in published))
             self.assertEqual(published[0]["eventId"], published[1]["eventId"])
 
     def test_turn_without_completion_keeps_assignment_active_for_monitoring(self):
@@ -1020,7 +1130,7 @@ class HermesRedisTeamContractTests(unittest.TestCase):
             asyncio.run(run_test())
             status = adapter.read_team_statuses(settings, settings.member_id)
             self.assertEqual(status["availability"], "busy")
-            self.assertEqual(status["runtimeStatus"], "running")
+            self.assertEqual(status["runtimeStatus"], "awaiting_completion_receipt")
 
     def test_consumer_switches_from_empty_pending_to_new_messages(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1323,22 +1433,14 @@ class HermesRedisTeamContractTests(unittest.TestCase):
                 self.assertEqual(active_after["messageId"], "assignment-1")
 
             asyncio.run(run_test())
-            self.assertEqual(dispatched, ["assignment-1"])
+            self.assertEqual(dispatched, ["assignment-1", "monitor-1"])
             monitor_events = []
             for command in commands:
                 if command[0] == "XADD" and command[1] == adapter.events_key(settings):
                     payload = json.loads(command[-1])
                     if payload.get("eventKind") == "assignment_check_result":
                         monitor_events.append(payload)
-            self.assertEqual(len(monitor_events), 1)
-            self.assertFalse(monitor_events[0]["visibleToChat"])
-            self.assertEqual(monitor_events[0]["stateEffect"], "none")
-
-    def test_generic_processing_text_is_not_a_final_result(self):
-        self.assertFalse(adapter._substantive_final_text("Redis Team task processing completed"))
-        self.assertFalse(adapter._substantive_final_text("需要你确认下一步吗？"))
-        self.assertTrue(adapter._substantive_final_text("实现和静态验证均已完成，产物已写入当前成员目录。"))
-
+            self.assertEqual(len(monitor_events), 0, "a non-terminal Monitor must reach the model instead of being answered mechanically")
 
 if __name__ == "__main__":
     unittest.main()

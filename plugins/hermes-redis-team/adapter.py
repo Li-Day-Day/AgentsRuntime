@@ -36,7 +36,8 @@ WIRE_SCHEMA_VERSION = 1
 PROTOCOL_VERSION = 4
 PROTOCOL_CAPABILITIES = [
     "completion_ack_v1",
-    "automatic_turn_completion_v2",
+    "explicit_completion_receipt_v1",
+    "turn_end_monitor_v1",
     "assignment_lifecycle_v1",
     "assignment_heartbeat_v1",
     "durable_turn_facts_v1",
@@ -469,6 +470,48 @@ def _assigned_validation_writer(settings: RedisTeamSettings, envelope: dict[str,
             or envelope.get("reviewedAssignmentId")
             or envelope.get("reviewed_assignment_id")
         )
+    )
+
+
+def _explicit_validation_assignment(envelope: dict[str, Any]) -> bool:
+    return bool(
+        _truthy(envelope.get("validationAssignment") or envelope.get("validation_assignment"), False)
+        or _trim(
+            envelope.get("validationTargetAssignmentId")
+            or envelope.get("validation_target_assignment_id")
+            or envelope.get("reviewedAssignmentId")
+            or envelope.get("reviewed_assignment_id")
+        )
+    )
+
+
+def _assignment_validation_guidance(settings: RedisTeamSettings, envelope: dict[str, Any]) -> str:
+    if _explicit_validation_assignment(envelope):
+        return (
+            "Validation ownership: this assignment is test/review/evidence work. "
+            "Perform the validation requested by the Leader normally; validation is assignment-specific "
+            "and may be distributed across several members regardless of role name."
+        )
+    if _truthy(envelope.get("reviewRequired") or envelope.get("review_required"), False) or _truthy(
+        envelope.get("validationRequired") or envelope.get("validation_required"), False
+    ):
+        return (
+            "Validation ownership: this is production-only work with independent validation downstream. "
+            "Produce and hand off the requested artifact without running syntax checks, tests, Browser "
+            "acceptance, or another validation pass. Tools remain available for implementation and focused "
+            "debugging; always hand off a usable result or an exact blocker."
+        )
+    if _assigned_validation_writer(settings, envelope):
+        return (
+            "Validation ownership: this legacy assignment has a validation-oriented member role but no "
+            "explicit validation contract. Perform only the validation requested in the assignment; future "
+            "assignments should use validationAssignment so ownership does not depend on role names."
+        )
+    return (
+        "Validation ownership: follow the Leader's assignment scope instead of inferring testing duties "
+        "from your role. Production-only work should produce and hand off the artifact without tests or "
+        "acceptance checks. Only perform validation when this assignment explicitly asks for test, review, "
+        "or evidence work. This guidance must never block delivery."
     )
 
 
@@ -1339,23 +1382,6 @@ async def _observe_late_completion(
     )
 
 
-def _substantive_final_text(value: Any) -> bool:
-    text = _trim(value)
-    if len(text) < 12:
-        return False
-    normalized = " ".join(text.lower().split())
-    if normalized.endswith("?") or normalized.endswith("？"):
-        return False
-    generic = {
-        "done",
-        "completed",
-        "task completed",
-        "redis team task processing completed",
-        "agent 回合已结束，正在等待显式完成回执。",
-    }
-    return normalized not in generic
-
-
 async def _propose_completion(
     settings: RedisTeamSettings,
     envelope: dict[str, Any],
@@ -1365,7 +1391,6 @@ async def _propose_completion(
     result_markdown: str,
     artifact_refs: Optional[list[str]] = None,
     explicit: bool,
-    automatic_turn_result: bool = False,
     review_verdict: str = "",
     reviewed_assignment_id: str = "",
     reviewed_revision: Optional[int] = None,
@@ -1410,14 +1435,12 @@ async def _propose_completion(
         {
             "completionId": completion_id,
             "attemptId": attempt_id,
-            # Runtime-authored natural completion still uses the same strict
-            # completion envelope as the explicit tool. automaticTurnResult
-            # records how it was produced without weakening control-plane
-            # validation or falling back to prose heuristics.
+            # Business completion is emitted only by the explicit completion
+            # tool. A finished model turn without that receipt remains running
+            # and is handled by the out-of-band Monitor.
             "completionSource": COMPLETION_SOURCE,
             "explicitCompletion": True,
             "agentInvokedCompletionTool": explicit or None,
-            "automaticTurnResult": automatic_turn_result or None,
             "assignmentResultOnly": True,
             "rootTaskTerminal": False,
             "status": status,
@@ -1459,8 +1482,8 @@ async def _propose_completion(
         runtime_status = status
         availability = "idle" if status == "succeeded" else "blocked"
     elif decision == "rejected":
-        runtime_status = "blocked"
-        availability = "blocked"
+        runtime_status = "running"
+        availability = "busy"
     active = _load_active_envelope(settings)
     if _trim(active.get("taskId") or active.get("rootTaskId")) == task_id:
         active["completionDecision"] = decision
@@ -1546,6 +1569,24 @@ async def _tool_team_send(args: dict[str, Any], **_kwargs) -> str:
         "assignmentId": _trim(args.get("assignmentId")) or _trim(active.get("assignmentId") or active.get("workId")),
         "phaseId": _trim(args.get("phaseId")) or _trim(active.get("phaseId")),
         "revision": int(args.get("revision") or active.get("revision") or 1),
+        "required": _truthy(args.get("required"), True),
+        "reviewRequired": _truthy(args.get("reviewRequired") or args.get("review_required"), False),
+        "validationRequired": _truthy(args.get("validationRequired") or args.get("validation_required"), False),
+        "validationAssignment": _truthy(args.get("validationAssignment") or args.get("validation_assignment"), False),
+        "validationTargetAssignmentId": _trim(
+            args.get("validationTargetAssignmentId")
+            or args.get("reviewedAssignmentId")
+        ),
+        "validationTargetRevision": int(
+            args.get("validationTargetRevision")
+            or args.get("reviewedRevision")
+            or 0
+        ),
+        "dependsOn": [
+            _trim(value)
+            for value in (args.get("dependsOn") if isinstance(args.get("dependsOn"), list) else [])
+            if _trim(value)
+        ],
         "title": _trim(args.get("title")) or "Team Message",
         "text": text,
         "contextRefs": args.get("contextRefs") if isinstance(args.get("contextRefs"), list) else [],
@@ -1584,7 +1625,9 @@ async def _tool_team_update_progress(args: dict[str, Any], **_kwargs) -> str:
     if not settings.enabled:
         return json.dumps({"error": "Redis Team is disabled"}, ensure_ascii=False)
     active = _load_active_envelope(settings)
-    task_id = _trim(args.get("taskId")) or _trim(active.get("taskId") or active.get("rootTaskId"))
+    reported_task_id = _trim(args.get("taskId"))
+    active_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
+    task_id = active_task_id or reported_task_id
     status_text = _trim(args.get("status"))
     summary = _trim(args.get("summary"))
     if not task_id or not status_text:
@@ -1610,6 +1653,7 @@ async def _tool_team_update_progress(args: dict[str, Any], **_kwargs) -> str:
         "phaseId": active.get("phaseId"),
         "revision": active.get("revision") or 1,
         "eventKind": _trim(args.get("eventKind")) or "worker_progress",
+        "reportedTaskId": reported_task_id if reported_task_id and reported_task_id != task_id else None,
     }
     await _publish_event(settings, "task_progress", progress_payload)
     return json.dumps({"ok": True, "status": status}, ensure_ascii=False)
@@ -1620,7 +1664,9 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
     if not settings.enabled:
         return json.dumps({"error": "Redis Team is disabled"}, ensure_ascii=False)
     active = _load_active_envelope(settings)
-    task_id = _trim(args.get("taskId")) or _trim(active.get("taskId") or active.get("rootTaskId"))
+    reported_task_id = _trim(args.get("taskId"))
+    active_task_id = _trim(active.get("rootTaskId") or active.get("taskId"))
+    task_id = active_task_id or reported_task_id
     status_text = _trim(args.get("status")).lower()
     summary = _trim(args.get("summary"))
     if not task_id or not status_text or not summary:
@@ -1630,7 +1676,10 @@ async def _tool_team_complete_task(args: dict[str, Any], **_kwargs) -> str:
             {"error": "status must be succeeded, failed or cancelled"},
             ensure_ascii=False,
         )
-    active["taskId"] = task_id
+    if reported_task_id and reported_task_id != task_id:
+        active["reportedTaskId"] = reported_task_id
+    active["taskId"] = active.get("taskId") or task_id
+    active["rootTaskId"] = active.get("rootTaskId") or task_id
     _persist_active_envelope(settings, active)
     try:
         result = await _propose_completion(
@@ -2139,11 +2188,11 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 "replyTo": reply_to,
                 "eventKind": "agent_narrative",
                 "messageKind": "narrative",
-                # An explicit completion can be accepted before Hermes emits
-                # its final assistant body. Keep that one delivery visible;
-                # later callbacks for the terminal turn are audit-only.
-                "chatPolicy": "visible" if not terminal_callback or terminal_delivery_visible else "hidden",
-                "visibleToChat": not terminal_callback or terminal_delivery_visible,
+                # Raw Hermes assistant prose remains audit telemetry. Team chat is
+                # reserved for explicit plans, progress, handoffs, blockers, reviews,
+                # and structured completion results.
+                "chatPolicy": "hidden",
+                "visibleToChat": False,
                 "nonAuthoritative": True,
                 "stateEffect": "none",
                 "contentHash": content_hash,
@@ -2353,6 +2402,11 @@ class RedisTeamAdapter(BasePlatformAdapter):
         )
         if not accepted and not terminal:
             return False
+        # Non-terminal Monitor envelopes must reach the model so it can continue,
+        # report an exact blocker, or submit a ready result. Mechanical replies are
+        # safe only after the assignment is already terminal.
+        if not terminal:
+            return False
 
         metadata = envelope.get("metadata") if isinstance(envelope.get("metadata"), dict) else {}
         check_id = _trim(metadata.get("checkId") or metadata.get("check_id") or envelope.get("messageId"))
@@ -2493,8 +2547,8 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 write_local_status(
                     self.settings,
                     {
-                        "availability": "blocked",
-                        "runtimeStatus": "blocked",
+                        "availability": "busy",
+                        "runtimeStatus": "running",
                         "currentTaskId": task_id,
                         "progress": 99,
                         "lastSummary": _short_text(response) or "Completion was rejected",
@@ -2511,24 +2565,14 @@ class RedisTeamAdapter(BasePlatformAdapter):
                         "lastSummary": _short_text(response) or "Completion submitted",
                     },
                 )
-            elif _substantive_final_text(response):
-                await _propose_completion(
-                    self.settings,
-                    envelope,
-                    status="succeeded",
-                    summary=_short_text(response, 500),
-                    result_markdown=response,
-                    explicit=False,
-                    automatic_turn_result=True,
-                )
             else:
                 write_local_status(
                     self.settings,
                     {
                         "availability": "busy",
-                        "runtimeStatus": "running",
+                        "runtimeStatus": "awaiting_completion_receipt",
                         "currentTaskId": task_id,
-                        "lastSummary": _short_text(response) or "Turn finished without a final result",
+                        "lastSummary": _short_text(response) or "Turn finished without an explicit completion receipt",
                     },
                 )
                 if self._redis:
@@ -2541,8 +2585,15 @@ class RedisTeamAdapter(BasePlatformAdapter):
                             envelope,
                             {
                                 "messageId": message_id,
-                                "summary": "Turn finished without a substantive final result",
+                                "summary": "Turn finished without an explicit completion receipt",
+                                "status": "running",
+                                "availability": "busy",
+                                "runtimeStatus": "awaiting_completion_receipt",
                                 "stateEffect": "none",
+                                "nonAuthoritative": True,
+                                "rootTaskTerminal": False,
+                                "activeTurnFinished": True,
+                                "resultMarkdown": response or None,
                                 "visibleToChat": False,
                                 "chatPolicy": "hidden",
                             },
@@ -2918,30 +2969,32 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 events_key(self.settings),
                 _task_event(
                     self.settings,
-                    "task_failed",
+                    "task_progress",
                     envelope,
                     {
-                        "status": "failed",
+                        "status": "running",
+                        "availability": "busy",
+                        "runtimeStatus": "retryable_error",
                         "summary": error,
                         "error": error,
                         "completionSource": "runtime_dispatch_error",
                         "explicitCompletion": False,
+                        "eventKind": "assignment_attempt_failed",
+                        "failureDomain": "runtime_adapter",
+                        "retryable": True,
+                        "stateEffect": "none",
+                        "nonAuthoritative": True,
+                        "rootTaskTerminal": False,
+                        "visibleToChat": False,
+                        "chatPolicy": "hidden",
                     },
                 ),
             )
-            identity = _assignment_identity(envelope)
-            active = _load_active_envelope(self.settings)
-            if _assignment_identity(active) == identity:
-                active["terminal"] = True
-                active["terminalStatus"] = "failed"
-                active["completedAt"] = _now_iso()
-                _persist_active_envelope(self.settings, active)
-            self._active_assignments.pop(identity, None)
             write_local_status(
                 self.settings,
                 {
-                    "availability": "blocked",
-                    "runtimeStatus": "failed",
+                    "availability": "busy",
+                    "runtimeStatus": "retryable_error",
                     "currentTaskId": envelope["taskId"],
                     "currentAssignmentId": envelope.get("assignmentId") or envelope.get("workId"),
                     "lastSummary": error,
@@ -3087,9 +3140,10 @@ class RedisTeamAdapter(BasePlatformAdapter):
                 text += f"- Current member artifact root: {member_artifact_root}\n"
             text += (
                 "- The Runtime inherits these IDs for Team tools; omit optional IDs instead of inventing replacements.\n"
-                "- A substantive final response is submitted automatically. Use team_complete_task for explicit "
-                "failure/cancellation, review metadata, or when you need to control final result fields.\n"
+                "- When the assigned work is ready, call team_complete_task once with the actual result. "
+                "If the call is missed, end the turn normally; ClawManager Monitor will send a separate reminder without treating prose as completion.\n"
             )
+            text += f"- {_assignment_validation_guidance(self.settings, envelope)}\n"
 
         event = MessageEvent(
             text=text,
@@ -3402,6 +3456,21 @@ def register(ctx) -> None:
                     "assignmentId": {"type": "string"},
                     "phaseId": {"type": "string"},
                     "revision": {"type": "integer"},
+                    "required": {"type": "boolean"},
+                    "reviewRequired": {
+                        "type": "boolean",
+                        "description": "Set true on production-only work with downstream validation; tell the producer to hand off without self-testing",
+                    },
+                    "validationRequired": {"type": "boolean"},
+                    "validationAssignment": {
+                        "type": "boolean",
+                        "description": "Marks this as test/review/evidence work; any member role may validate and several validators may run in parallel",
+                    },
+                    "validationTargetAssignmentId": {"type": "string"},
+                    "validationTargetRevision": {"type": "integer"},
+                    "reviewedAssignmentId": {"type": "string"},
+                    "reviewedRevision": {"type": "integer"},
+                    "dependsOn": {"type": "array", "items": {"type": "string"}},
                     "title": {"type": "string"},
                     "contextRefs": {"type": "array", "items": {"type": "string"}},
                     "ttlSeconds": {"type": "integer"},
@@ -3513,19 +3582,14 @@ def register(ctx) -> None:
             "message as delegated Worker work. Read the task context and "
             "/team/team.json when available. Prefer team_artifact_write/read/list/mkdir "
             "for shared files and use team_artifact_preview before opening a Team file "
-            "in Browser; never use file:// or start a temporary server. A substantive "
-            "implementation self-check should stay proportional: prefer syntax checks, "
-            "existing tests, existing tools, and a small smoke test. When independent "
-            "review or QA is planned downstream, hand off the verified artifact instead "
-            "of building a second Browser or test harness solely to duplicate acceptance. "
-            "If no independent verifier is planned, or the assignment explicitly requires "
-            "Browser, visual, interaction, or end-to-end evidence, perform the proportionate "
-            "validation needed. Product dependencies remain allowed; optional validation "
-            "setup and environment limitations are not completion gates. A substantive "
-            "final response is automatically submitted for control-plane validation, "
-            "so do not repeat it only to satisfy a tool sequence. Use team_complete_task "
-            "when reporting failure, cancellation, review metadata, or an explicit final "
-            "result. Missing optional Team metadata is not a reason to stop. Never write "
+            "in Browser; never use file:// or start a temporary server. Validation is "
+            "assignment-specific: production-only assignments produce and hand off artifacts "
+            "without tests, while assignments explicitly designated by the Leader as test, "
+            "review, or evidence work validate normally regardless of the member role. "
+            "These instructions never block delivery and tools remain available for required "
+            "implementation or validation work. When work is ready, call team_complete_task "
+            "once with the actual result; automatic final-turn submission is only a compatibility "
+            "fallback. Missing optional Team metadata is not a reason to stop. Never write "
             "Team tokens, API keys, or Redis credentials into Team files or logs."
         ),
     )

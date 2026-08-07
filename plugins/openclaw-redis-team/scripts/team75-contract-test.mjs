@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, shouldUseAssistantSessionFallback, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, teamProcessToolDecision, assignmentHasIndependentReview, assignmentExplicitlyRequiresBrowserEvidence, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact };\n";
+const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readLastToolOutcomeFromDispatch, completionProposalProvenance };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -162,6 +162,80 @@ try {
 	]);
 	assert.deepEqual(concurrentNarratives.first, ["first task update"], "concurrent tasks keep the first narrative isolated");
 	assert.deepEqual(concurrentNarratives.second, ["second task update"], "concurrent tasks keep the second narrative isolated");
+	const crossTeamNarratives = { first: [], second: [] };
+	let releaseCrossTeamFirst;
+	let releaseCrossTeamSecond;
+	const crossTeamFirstEnvelope = { ...concurrentEnvelope("cross-first"), teamId: "75" };
+	const crossTeamSecondEnvelope = { ...concurrentEnvelope("cross-second"), teamId: "76" };
+	const crossTeamFirst = liveRuntime.withNarrativeProjection(
+		crossTeamFirstEnvelope,
+		async (text) => { crossTeamNarratives.first.push(text); return true; },
+		async () => new Promise((resolve) => { releaseCrossTeamFirst = resolve; }),
+	);
+	const crossTeamSecond = liveRuntime.withNarrativeProjection(
+		crossTeamSecondEnvelope,
+		async (text) => { crossTeamNarratives.second.push(text); return true; },
+		async () => new Promise((resolve) => { releaseCrossTeamSecond = resolve; }),
+	);
+	await Promise.resolve();
+	liveRuntime.observeAssistantSessionMessage({
+		sessionKey: "agent:main:redis-team:group:76",
+		message: { id: "assistant-team-76", role: "assistant", content: [{ type: "text", text: "team 76 update" }] },
+	});
+	releaseCrossTeamFirst();
+	releaseCrossTeamSecond();
+	await Promise.all([crossTeamFirst, crossTeamSecond]);
+	assert.deepEqual(crossTeamNarratives.first, [], "a detached hook never crosses into another Team");
+	assert.deepEqual(crossTeamNarratives.second, ["team 76 update"], "a detached hook binds by exact Team session");
+	const detachedNarratives = [];
+	let releaseDetachedProjection;
+	const detachedProjection = liveRuntime.withNarrativeProjection(
+		concurrentEnvelope("detached"),
+		async (text) => { detachedNarratives.push(text); return true; },
+		async () => new Promise((resolve) => { releaseDetachedProjection = resolve; }),
+	);
+	await Promise.resolve();
+	liveRuntime.observeAssistantSessionMessage({
+		message: { id: "assistant-detached", role: "assistant", content: [{ type: "text", text: "detached hook update" }] },
+	}, { sessionKey: "redis-team:75:developer:detached" });
+	releaseDetachedProjection();
+	await detachedProjection;
+	assert.deepEqual(
+		detachedNarratives,
+		["detached hook update"],
+		"a detached OpenClaw transcript hook binds to the only active projection",
+	);
+	const ambiguousNarratives = { first: [], second: [] };
+	let releaseAmbiguousFirst;
+	let releaseAmbiguousSecond;
+	const ambiguousFirst = liveRuntime.withNarrativeProjection(
+		concurrentEnvelope("ambiguous-first"),
+		async (text) => { ambiguousNarratives.first.push(text); return true; },
+		async () => new Promise((resolve) => { releaseAmbiguousFirst = resolve; }),
+	);
+	const ambiguousSecond = liveRuntime.withNarrativeProjection(
+		concurrentEnvelope("ambiguous-second"),
+		async (text) => { ambiguousNarratives.second.push(text); return true; },
+		async () => new Promise((resolve) => { releaseAmbiguousSecond = resolve; }),
+	);
+	await Promise.resolve();
+	liveRuntime.observeAssistantSessionMessage({
+		message: { id: "assistant-ambiguous", role: "assistant", content: [{ type: "text", text: "must not cross-deliver" }] },
+	}, { sessionKey: "redis-team:75:unknown-session" });
+	releaseAmbiguousFirst();
+	releaseAmbiguousSecond();
+	await Promise.all([ambiguousFirst, ambiguousSecond]);
+	assert.deepEqual(ambiguousNarratives, { first: [], second: [] }, "an ambiguous detached hook stays fail-soft");
+	assert.deepEqual(
+		pluginModule.completionProposalProvenance({ automaticTurnResult: true }),
+		{ completionSource: "team_complete_task", explicitCompletion: true },
+		"completion proposal provenance is reserved for the explicit completion tool",
+	);
+	assert.deepEqual(
+		pluginModule.completionProposalProvenance({}),
+		{ completionSource: "team_complete_task", explicitCompletion: true },
+		"the explicit completion tool keeps its original provenance",
+	);
   await fs.writeFile(path.join(shared, "team.json"), JSON.stringify({
     version: 1,
     teamId: "75",
@@ -250,6 +324,12 @@ try {
   );
   const visibleLeaderReply = "Development dispatched; waiting for the worker result.";
   assert.equal(pluginModule.normalizeAssistantSessionText("NO_REPLY"), "");
+  assert.equal(pluginModule.normalizeAssistantSessionText("Redis Team task completed"), "");
+  assert.equal(
+    pluginModule.normalizeAssistantSessionText("The phrase Redis Team task completed is a Runtime control placeholder."),
+    "The phrase Redis Team task completed is a Runtime control placeholder.",
+    "only the standalone Runtime control reply is hidden",
+  );
   assert.equal(
     pluginModule.normalizeAssistantSessionText(`${visibleLeaderReply}\n\nNO_REPLY`),
     visibleLeaderReply,
@@ -336,14 +416,54 @@ try {
 				opened: true,
 				inspected: true,
 				targetHash: undefined,
+				evidenceIncomplete: undefined,
 			},
 		},
 		"only successful managed Browser tool events may produce a managed-browser verification fact",
 	);
+	const activeBrowserEnvelope = {
+		...browserEnvelope,
+		teamId: "75",
+		memberId: "reviewer",
+		role: "reviewer",
+		rootTaskId: "team-75-task-149",
+		messageId: "reviewer-browser-turn",
+		assignmentId: "review-149",
+	};
+	const activeBrowserResult = await liveRuntime.withActiveEnvelope(
+		activeBrowserEnvelope,
+		async () => {
+			const state = {};
+			liveRuntime.beforeBrowserToolCall(
+				{ toolName: "browser", params: { action: "open", url: managedPreviewUrl } },
+				state,
+				1020,
+			);
+			await liveRuntime.afterBrowserToolCall(
+				{ toolName: "browser", params: { action: "open", url: managedPreviewUrl }, result: { status: "ok" } },
+				state,
+				1021,
+			);
+			await liveRuntime.afterBrowserToolCall(
+				{ toolName: "browser", params: { action: "evaluate" }, result: { status: "ok" } },
+				state,
+				1022,
+			);
+		},
+		{ teamId: "75", memberId: "reviewer", role: "reviewer", sharedDir: shared },
+	);
+	assert.equal(activeBrowserResult.browserVerification.managedPreviewOpened, true);
+	assert.equal(activeBrowserResult.browserVerification.managedPreviewInspected, true);
+	assert.equal(activeBrowserResult.browserVerification.lastSuccessfulAction, "evaluate");
 	assert.equal(
 		pluginModule.browserVerificationForCompletion(browserEnvelope, {}).verificationMode,
 		"static_only",
 		"a Reviewer may still complete after static review without claiming Browser verification",
+	);
+	assert.equal(
+		pluginModule.browserVerificationForCompletion(browserEnvelope, { evidenceIncomplete: true }).verificationMode,
+		"unknown",
+		"lost Browser evidence must not be misreported as a factual static-only review",
 	);
   for (let index = 0; index < 4; index += 1) {
     const decision = pluginModule.reviewerBrowserToolDecision(
@@ -395,10 +515,10 @@ try {
 		"npm install puppeteer",
 		"pip install selenium",
 	]) {
-		assert.equal(
+		assert.notEqual(
 			pluginModule.teamProcessToolDecision({ role: "reviewer" }, { toolName: "exec", params: { command } }).block,
 			true,
-			`Reviewer Browser bypass must be blocked: ${command}`,
+			`an explicitly assigned validator must not be role-blocked from required validation tooling: ${command}`,
 		);
 	}
 	for (const command of ["npm test", "npm run build", "python3 scripts/check.py", "rg puppeteer package.json"]) {
@@ -417,22 +537,23 @@ try {
 		"ordinary Developers must not inherit the Reviewer-only Browser bypass guard",
 	);
 	assert.equal(pluginModule.assignmentHasIndependentReview({ role: "developer", reviewRequired: true }), true);
-	assert.equal(pluginModule.assignmentHasIndependentReview({ role: "reviewer", reviewRequired: true }), false);
-	assert.equal(
+	assert.equal(pluginModule.assignmentHasIndependentReview({ role: "reviewer", reviewRequired: true }), true);
+	assert.equal(pluginModule.assignmentHasIndependentReview({ role: "developer", validationAssignment: true }), false);
+	assert.notEqual(
 		pluginModule.teamProcessToolDecision(
 			{ role: "developer", reviewRequired: true },
 			{ toolName: "exec", params: { command: "npm install puppeteer" } },
 		).block,
 		true,
-		"an implementer with independent review must not install a duplicate Browser harness",
+		"validation ownership is soft guidance and must not hard-block an implementation tool call",
 	);
 	assert.notEqual(
 		pluginModule.teamProcessToolDecision(
-			{ role: "developer", reviewRequired: true, text: "Provide Browser interaction verification evidence." },
+			{ role: "developer", validationAssignment: true, validationTargetAssignmentId: "dev-01" },
 			{ toolName: "exec", params: { command: "npm install puppeteer" } },
 		).block,
 		true,
-		"an explicit implementer-owned Browser evidence assignment must remain available",
+		"an explicit member-owned validation assignment must remain available regardless of role",
 	);
 	assert.deepEqual(
 		pluginModule.mergeBrowserVerificationState(
@@ -530,6 +651,42 @@ try {
   assert.equal(turnFinished.completionRecoveryAttempt, 1);
   assert.equal(turnFinished.visibleToChat, false);
   assert.equal(turnFinished.chatPolicy, "hidden");
+  assert.equal(turnFinished.status, "running");
+  assert.equal(turnFinished.stateEffect, "none");
+  assert.equal(turnFinished.rootTaskTerminal, false);
+  const failedHandoffTurn = pluginModule.turnFinishedWithoutCompletionEvent(
+    { metadata: { completionRecoveryAttempt: 0 } },
+    {
+      fallbackText: "The team_send failed because the to field was missing. Let me resend with to: leader.",
+      assistantNarratives: [{ text: "The team_send failed because the to field was missing." }],
+      lastToolOutcome: { failed: true, toolName: "team_send", toolCallId: "call-team-send" },
+      browserVerification: {
+        verificationMode: "managed_browser",
+        browserVerification: { status: "verified", opened: true, inspected: true },
+      },
+    },
+  );
+  assert.equal(failedHandoffTurn.lastToolFailed, true);
+  assert.equal(failedHandoffTurn.completionContinuationRequired, true);
+  assert.equal(failedHandoffTurn.lastToolName, "team_send");
+  assert.equal(failedHandoffTurn.verificationMode, "managed_browser");
+  assert.match(failedHandoffTurn.resultMarkdown, /Let me resend/);
+  const toolCalls = new Map();
+  assert.equal(pluginModule.sessionToolOutcome({
+    message: { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "team_send" }] },
+  }, toolCalls), null);
+  assert.deepEqual(pluginModule.sessionToolOutcome({
+    id: "tool-result-1",
+    message: {
+      role: "tool",
+      content: [{ type: "tool_result", tool_use_id: "call-1", is_error: true, content: "missing required field: to" }],
+    },
+  }, toolCalls), {
+    failed: true,
+    toolName: "team_send",
+    toolCallId: "call-1",
+    sourceRecordId: "tool-result-1",
+  });
   const incompleteAttempt = pluginModule.assignmentAttemptFailedEvent({ taskId: "team-75-task-150" });
   assert.equal(incompleteAttempt.eventKind, "assignment_attempt_failed");
   assert.equal(incompleteAttempt.stateEffect, "none");
@@ -590,16 +747,6 @@ try {
   );
   assert.equal(controlTarget.route, "control");
   assert.equal(controlTarget.completion, false);
-  assert.equal(
-    await pluginModule.shouldUseAssistantSessionFallback(
-      { teamId: "75", memberId: "leader", role: "leader", sharedDir: shared },
-      leaderContextEnvelope,
-      "A natural-language answer that did not call the completion tool.",
-    ),
-    true,
-    "a complete Leader turn must be submitted through the same completion proposal path",
-  );
-
   await seedActive("leader", "leader", "leader-final-synthesis");
   const leaderTools = createHarness("leader", "leader");
   const plan = toolResult(await leaderTools.get("team_artifact_write").execute("plan-write", {
@@ -719,10 +866,29 @@ try {
   const guidedPrompt = pluginModule.appendRedisTeamCompletionGuidance("Implement the page.", normalizedEnvelope);
   assert.match(guidedPrompt, /read these exact canonical paths/);
   assert.match(guidedPrompt, /\/team\/results\/team-75-task-150\/plan\/collaboration-plan\.md/);
-  assert.match(guidedPrompt, /keep self-checks proportional/i);
-  assert.match(guidedPrompt, /independent review or QA downstream/i);
-  assert.match(guidedPrompt, /Product dependencies required by the implementation remain allowed/i);
-  assert.match(guidedPrompt, /not completion gates/i);
+	assert.match(guidedPrompt, /call team_complete_task once/i);
+	assert.match(guidedPrompt, /Production-only work should produce and hand off the artifact without tests/i);
+	assert.match(guidedPrompt, /explicitly marked validationAssignment/i);
+	assert.match(guidedPrompt, /never blocks delivery/i);
+	const productionOnlyPrompt = pluginModule.appendRedisTeamCompletionGuidance("Implement the page.", {
+		...normalizedEnvelope,
+		reviewRequired: true,
+	});
+	assert.match(productionOnlyPrompt, /production-only work and independent validation is assigned downstream/i);
+	assert.match(productionOnlyPrompt, /without running syntax checks, tests, Browser acceptance/i);
+	const productionOnlyReviewerPrompt = pluginModule.appendRedisTeamCompletionGuidance("Implement the page.", {
+		...normalizedEnvelope,
+		role: "reviewer",
+		reviewRequired: true,
+	});
+	assert.match(productionOnlyReviewerPrompt, /production-only work and independent validation is assigned downstream/i);
+	const assignedValidatorPrompt = pluginModule.appendRedisTeamCompletionGuidance("Validate the page.", {
+		...normalizedEnvelope,
+		role: "domain-specialist",
+		validationAssignment: true,
+		validationTargetAssignmentId: "dev-01",
+	});
+	assert.match(assignedValidatorPrompt, /Code review policy/i);
   assert.deepEqual(
     pluginModule.canonicalTeamArtifactRefsFromText(
       { sharedDir: shared },
@@ -970,7 +1136,9 @@ try {
   assert.doesNotMatch(source, /must use \$\{locale \|\| "zh-CN"\}/);
   assert.match(source, /workflowReminderIsStale/);
   assert.match(source, /ignored message post-processing failure after terminal assignment/);
-  assert.match(source, /automatic_turn_completion_v2/);
+  assert.doesNotMatch(source, /automatic_turn_completion_v2/);
+  assert.match(source, /explicit_completion_receipt_v1/);
+  assert.match(source, /turn_end_monitor_v1/);
   assert.match(source, /validation_contract_v2/);
 
   console.log("Team75 Redis Team contract test passed");
