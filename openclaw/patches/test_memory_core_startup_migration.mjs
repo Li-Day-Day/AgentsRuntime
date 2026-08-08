@@ -22,6 +22,17 @@ try {
     "async function workspaceHasRows(_namespace, _workspaceDir) { return process.env.TARGET_HAS_ROWS === '1'; }",
     "async function migrateSource(source) { if (source.fail) throw new Error('broken legacy JSON'); return 1; }",
     "async function archiveLegacyStateSource() {}",
+    "async function archiveLegacyMemorySidecar(params) {",
+    "\tconst existingArchives = ['/state/memory/main.sqlite.migrated'];",
+    "\tif (process.env.ARCHIVE_EXISTS === '1') {",
+    "\t\tparams.warnings.push(`Left migrated Memory Core legacy memory index sidecar in place because ${existingArchives[0]} already exists`);",
+    "\t\treturn;",
+    "\t}",
+    "}",
+    "async function collectLegacyMemorySidecarSources() { return [{ agentId: 'main' }]; }",
+    "function groupLegacyMemorySidecarSourcesByPath(sources) { return [sources]; }",
+    "async function migrateLegacyMemorySidecarSource() { return { archiveReady: true }; }",
+    "async function preserveLegacyMemorySidecarRetryPath() {}",
     "const stateMigrations = [{",
     "\tid: \"memory-core-dreams-json-to-sqlite\",",
     "\tlabel: \"Memory Core dreaming state\",",
@@ -52,7 +63,32 @@ try {
     "\t}",
     "}, {",
     "\tid: \"memory-core-legacy-sidecar-index-to-agent-sqlite\",",
-    "\tlabel: \"next migration\"",
+    "\tlabel: \"Memory Core legacy memory index sidecar\",",
+    "\tasync migrateLegacyState(params) {",
+    "\t\tconst changes = [];",
+    "\t\tconst warnings = [];",
+    "\t\tconst groups = groupLegacyMemorySidecarSourcesByPath(await collectLegacyMemorySidecarSources());",
+    "\t\tfor (const sources of groups) {",
+    "\t\t\tlet archiveReady = true;",
+    "\t\t\tfor (const source of sources) try {",
+    "\t\t\t\tconst result = await migrateLegacyMemorySidecarSource({ source, changes, warnings });",
+    "\t\t\t\tarchiveReady &&= result.archiveReady;",
+    "\t\t\t} catch (err) {",
+    "\t\t\t\tarchiveReady = false;",
+    "\t\t\t\tawait preserveLegacyMemorySidecarRetryPath({ source, changes, warnings });",
+    "\t\t\t\twarnings.push(`Skipped Memory Core legacy memory index import for agent ${source.agentId} because the sidecar could not be imported: ${String(err)}`);",
+    "\t\t\t}",
+    "\t\t\tif (archiveReady && sources[0]) await archiveLegacyMemorySidecar({",
+    "\t\t\t\tsource: sources[0],",
+    "\t\t\t\tchanges,",
+    "\t\t\t\twarnings",
+    "\t\t\t});",
+    "\t\t}",
+    "\t\treturn {",
+    "\t\t\tchanges,",
+    "\t\t\twarnings",
+    "\t\t};",
+    "\t}",
     "}];",
     "export { stateMigrations };",
   ].join("\n"));
@@ -89,8 +125,16 @@ try {
   });
   assert.equal(failedImport.warnings.length, 1, "real import failures must remain startup-blocking warnings");
   assert.match(failedImport.warnings[0], /legacy source could not be imported/);
+
+  process.env.ARCHIVE_EXISTS = "1";
+  const archiveCollision = await module.stateMigrations[1].migrateLegacyState({ config: {}, env: {} });
+  assert.deepEqual(archiveCollision.warnings, [], "an existing .migrated archive must not block startup");
+  assert.equal(archiveCollision.notices.length, 1);
+  assert.match(archiveCollision.notices[0], /already exists/);
+  assert.equal(archiveCollision.warnings.length === 0, true, "an idempotent archive collision must allow the startup checkpoint");
 } finally {
   delete process.env.TARGET_HAS_ROWS;
+  delete process.env.ARCHIVE_EXISTS;
   fs.rmSync(fixtureRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 

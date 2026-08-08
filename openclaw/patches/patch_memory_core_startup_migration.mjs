@@ -11,6 +11,7 @@ if (packageJson.version !== expectedVersion) {
 const target = path.join(packageRoot, "dist", "extensions", "memory-core", "doctor-contract-api.js");
 const patching = process.argv.includes("--patch");
 const patchMarker = "CLAWMANAGER_IDEMPOTENT_MEMORY_CORE_MIGRATION";
+const archivePatchMarker = "CLAWMANAGER_IDEMPOTENT_MEMORY_CORE_ARCHIVE";
 const migrationStart = 'id: "memory-core-dreams-json-to-sqlite",';
 const migrationEnd = 'id: "memory-core-legacy-sidecar-index-to-agent-sqlite",';
 const declarations = [
@@ -38,6 +39,35 @@ const patchedMigrationReturn = [
   "\t\t\tnotices",
   "\t\t};",
 ].join("\n");
+const archiveExistingWarning = "params.warnings.push(`Left migrated Memory Core legacy memory index sidecar in place because ${existingArchives[0]} already exists`);";
+const archiveExistingNotice = "params.notices.push(`Left migrated Memory Core legacy memory index sidecar in place because ${existingArchives[0]} already exists`);";
+const legacyIndexDeclarations = [
+  "\tasync migrateLegacyState(params) {",
+  "\t\tconst changes = [];",
+  "\t\tconst warnings = [];",
+].join("\n");
+const patchedLegacyIndexDeclarations = [
+  "\tasync migrateLegacyState(params) {",
+  "\t\tconst changes = [];",
+  "\t\tconst warnings = [];",
+  `\t\t// ${archivePatchMarker}: a prior archive is an idempotent completion signal.`,
+  "\t\tconst notices = [];",
+].join("\n");
+const archiveCall = [
+  "\t\t\tif (archiveReady && sources[0]) await archiveLegacyMemorySidecar({",
+  "\t\t\t\tsource: sources[0],",
+  "\t\t\t\tchanges,",
+  "\t\t\t\twarnings",
+  "\t\t\t});",
+].join("\n");
+const patchedArchiveCall = [
+  "\t\t\tif (archiveReady && sources[0]) await archiveLegacyMemorySidecar({",
+  "\t\t\t\tsource: sources[0],",
+  "\t\t\t\tchanges,",
+  "\t\t\t\twarnings,",
+  "\t\t\t\tnotices",
+  "\t\t\t});",
+].join("\n");
 
 function replaceOnce(source, needle, replacement, label) {
   const occurrences = source.split(needle).length - 1;
@@ -62,6 +92,12 @@ function verify(source) {
   if (migration.includes(existingRowsWarning)) {
     throw new Error("existing target rows are still classified as a startup-blocking warning");
   }
+  for (const required of [archivePatchMarker, archiveExistingNotice, patchedLegacyIndexDeclarations, patchedArchiveCall]) {
+    if (!source.includes(required)) throw new Error(`Memory Core archive migration patch is incomplete: ${required}`);
+  }
+  if (source.includes(archiveExistingWarning)) {
+    throw new Error("an existing Memory Core archive is still classified as a startup-blocking warning");
+  }
 }
 
 let source = fs.readFileSync(target, "utf8");
@@ -72,6 +108,19 @@ if (patching && !source.includes(patchMarker)) {
   patchedMigration = replaceOnce(patchedMigration, existingRowsWarning, existingRowsNotice, "idempotent Memory Core import result");
   patchedMigration = replaceOnce(patchedMigration, migrationReturn, patchedMigrationReturn, "Memory Core migration result return");
   source = source.slice(0, migration.start) + patchedMigration + source.slice(migration.end);
+}
+if (patching && !source.includes(archivePatchMarker)) {
+  const legacyIndexStart = source.indexOf(migrationEnd);
+  if (legacyIndexStart < 0) throw new Error("could not isolate the Memory Core legacy index migration");
+  const prefix = source.slice(0, legacyIndexStart);
+  let legacyIndexMigration = source.slice(legacyIndexStart);
+  legacyIndexMigration = replaceOnce(legacyIndexMigration, legacyIndexDeclarations, patchedLegacyIndexDeclarations, "Memory Core legacy index declarations");
+  legacyIndexMigration = replaceOnce(legacyIndexMigration, archiveCall, patchedArchiveCall, "Memory Core archive call");
+  legacyIndexMigration = replaceOnce(legacyIndexMigration, migrationReturn, patchedMigrationReturn, "Memory Core legacy index result return");
+  source = prefix + legacyIndexMigration;
+  source = replaceOnce(source, archiveExistingWarning, archiveExistingNotice, "idempotent Memory Core archive result");
+}
+if (patching) {
   fs.writeFileSync(target, source);
 }
 
