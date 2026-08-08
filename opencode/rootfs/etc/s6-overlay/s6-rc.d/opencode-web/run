@@ -1,0 +1,17 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+if [ -n "${RUNTIME_AGENT_CONTROL_TOKEN:-}" ] || [ -n "${RUNTIME_AGENT_REPORT_TOKEN:-}" ]; then
+  echo "OpenCode global web disabled in shared Runtime Pod mode"
+  exec sleep infinity
+fi
+
+/usr/local/bin/opencode-apply-runtime-config || true
+
+# The Pro terminal and desktop session run as abc.  Starting the web server as
+# root creates root-owned OpenCode logs under /config and makes the terminal
+# client fail with PermissionDenied on its next launch.
+if command -v s6-setuidgid >/dev/null 2>&1; then
+  exec s6-setuidgid abc /usr/local/bin/start-opencode-pro-web
+fi
+exec /usr/local/bin/start-opencode-pro-web
