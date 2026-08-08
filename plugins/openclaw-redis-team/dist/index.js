@@ -192,6 +192,22 @@ function rootWorkflowStateKey(cfg, rootTaskId) {
   return keyPrefix(cfg) + ":root:" + redisKeyPart(rootTaskId) + ":state";
 }
 
+function assignmentDispatchStateKey(cfg, rootTaskId) {
+  return keyPrefix(cfg) + ":root:" + redisKeyPart(rootTaskId) + ":assignment-dispatch";
+}
+
+function deferredAssignmentsKey(cfg, rootTaskId) {
+  return keyPrefix(cfg) + ":root:" + redisKeyPart(rootTaskId) + ":deferred:" + redisKeyPart(cfg.memberId);
+}
+
+function deferredRootsKey(cfg) {
+  return keyPrefix(cfg) + ":deferred-roots:" + redisKeyPart(cfg.memberId);
+}
+
+function deferredAssignmentField(message) {
+  return redisKeyPart(message.assignmentId || message.workId) + ":r" + Math.max(1, intFrom(message.revision, 1));
+}
+
 function normalizePhaseDispositions(value) {
   if (!Array.isArray(value)) return [];
   const result = [];
@@ -717,7 +733,11 @@ function inferCanonicalArtifactWriteContract(cfg, params, activeEnvelope) {
   if (!relative.startsWith(prefix)) return current;
   const remainder = relative.slice(prefix.length);
   const separator = remainder.indexOf("/");
-  const reportRelative = separator >= 0 ? remainder.slice(separator + 1) : "";
+	let reportRelative = separator >= 0 ? remainder.slice(separator + 1) : "";
+	const activeRevisionDirectory = validationRevisionDirectory(cfg, activeEnvelope).replaceAll("\\", "/");
+	if (activeRevisionDirectory && reportRelative.startsWith(activeRevisionDirectory + "/")) {
+		reportRelative = reportRelative.slice(activeRevisionDirectory.length + 1);
+	}
   if (reportRelative.split("/").includes("..")) return current;
 
   // The active assignment envelope, not Agent-authored directory text, owns
@@ -728,6 +748,7 @@ function inferCanonicalArtifactWriteContract(cfg, params, activeEnvelope) {
     ...current,
     path: [
       `/team/results/${rootTaskId}/reviews/${activeAssignmentId}`,
+		activeRevisionDirectory,
       reportRelative,
     ].filter(Boolean).join("/"),
     scope: "team",
@@ -769,6 +790,12 @@ function artifactAssignmentId(params, activeEnvelope) {
     throw new Error("Member artifact writes require assignmentId or workId");
   }
   return safeName(assignmentId);
+}
+
+function validationRevisionDirectory(cfg, activeEnvelope) {
+  if (!activeEnvelope || !isAssignedValidationWriter(cfg, activeEnvelope)) return "";
+  const revision = Math.max(1, intFrom(activeEnvelope.revision, 1));
+  return revision > 1 ? path.join("revisions", "r" + revision) : "";
 }
 
 async function assertNoArtifactSymlinkTraversal(root, candidate) {
@@ -821,7 +848,14 @@ function teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite = 
       if (forWrite && !isLeaderMember(cfg) && !isAssignedValidationWriter(cfg, activeEnvelope)) {
         throw new Error("Only the assigned validator or Team Leader may publish a validation report");
       }
-      return path.join(sharedRoot, "results", safeName(rootTaskId), "reviews", artifactAssignmentId(params, activeEnvelope));
+      return path.join(
+        sharedRoot,
+        "results",
+        safeName(rootTaskId),
+        "reviews",
+        artifactAssignmentId(params, activeEnvelope),
+        validationRevisionDirectory(cfg, activeEnvelope),
+      );
     }
     if (forWrite) {
       throw new Error("Team-scoped artifact writes require kind=plan, kind=context, kind=review, or kind=final; use scope=member for working files");
@@ -830,7 +864,15 @@ function teamArtifactRoot(cfg, params, activeEnvelope, defaultScope, forWrite = 
   }
   if (scope !== "member") throw new Error("Team artifact scope must be member or team");
   const rootTaskId = artifactRootTaskId(params, activeEnvelope);
-  return path.join(sharedRoot, "artifacts", safeName(rootTaskId), "members", safeName(cfg.memberId), artifactAssignmentId(params, activeEnvelope));
+  return path.join(
+    sharedRoot,
+    "artifacts",
+    safeName(rootTaskId),
+    "members",
+    safeName(cfg.memberId),
+    artifactAssignmentId(params, activeEnvelope),
+    isAssignedValidationWriter(cfg, activeEnvelope) ? validationRevisionDirectory(cfg, activeEnvelope) : "",
+  );
 }
 
 function isCanonicalTeamRelativeArtifactPath(value) {
@@ -1059,6 +1101,7 @@ async function canonicalizeReviewerCompletionReport(cfg, envelope, rootTaskId, a
 	if (!isAssignedValidationWriter(cfg, envelope) || !rootTaskId || !assignmentId) return [];
 	const memberPrefix =
 		`/team/artifacts/${safeName(rootTaskId)}/members/${safeName(cfg.memberId)}/${safeName(assignmentId)}/`;
+	const revisionDirectory = validationRevisionDirectory(cfg, envelope);
 	const candidates = [];
 	for (const value of explicitRefs || []) {
 		const canonical = canonicalArtifactAlias(cfg, value, rootTaskId);
@@ -1075,6 +1118,7 @@ async function canonicalizeReviewerCompletionReport(cfg, envelope, rootTaskId, a
 		safeName(rootTaskId),
 		"reviews",
 		safeName(assignmentId),
+		revisionDirectory,
 	);
 	try {
 		await mkdirBestEffort(destinationDir, TEAM_SHARED_DIR_MODE, "canonical review result directory");
@@ -1956,6 +2000,7 @@ const REVIEW_BROWSER_MAX_OPEN_ATTEMPTS = 3;
 const REVIEW_BROWSER_MAX_CONSECUTIVE_FAILURES = 3;
 const REVIEW_BROWSER_MAX_SAME_FAILURES = 2;
 const REVIEW_BROWSER_PREPARATION_ACTIONS = new Set(["status", "start"]);
+const REVIEW_BROWSER_OPEN_ACTIONS = new Set(["open", "navigate"]);
 const REVIEW_BROWSER_EVIDENCE_ACTIONS = new Set(["snapshot", "screenshot", "act", "evaluate", "inspect"]);
 
 function browserToolAction(event) {
@@ -1969,8 +2014,22 @@ function browserToolAction(event) {
   if (explicit) return explicit;
   const suffix = trim(event?.toolName)
     .toLowerCase()
-    .match(/^browser[.:/_-](status|start|open|snapshot|screenshot|act|evaluate|inspect)$/);
+    .match(/^browser[.:/_-](status|start|open|navigate|snapshot|screenshot|act|evaluate|inspect)$/);
   return suffix?.[1] || "";
+}
+
+function browserToolResultUrl(event) {
+  const candidates = [
+    event?.result?.url,
+    event?.result?.details?.url,
+    event?.output?.url,
+    event?.output?.details?.url,
+  ];
+  for (const candidate of candidates) {
+    const normalized = directHttpVerificationUrl(candidate);
+    if (normalized) return normalized;
+  }
+  return "";
 }
 
 function browserToolTargetUrl(event) {
@@ -2021,7 +2080,7 @@ function reviewerBrowserToolDecision(envelope, event, state, now = Date.now()) {
 		guard.preparationAttempts = Number(guard.preparationAttempts || 0) + 1;
 		return { state: guard };
 	}
-	if (action === "open") {
+	if (REVIEW_BROWSER_OPEN_ACTIONS.has(action)) {
 		if (Number(guard.openAttempts || 0) >= REVIEW_BROWSER_MAX_OPEN_ATTEMPTS) {
 			return { block: true, blockReason: "Browser target opening was repeated without usable evidence. Continue with available static evidence." };
 		}
@@ -2086,17 +2145,17 @@ function reviewerBrowserToolResultDecision(envelope, event, state, now = Date.no
 			Number(guard.attempts || 0) >= REVIEW_BROWSER_MAX_ATTEMPTS;
 		return guard;
 	}
-	if (action === "open") {
+	if (REVIEW_BROWSER_OPEN_ACTIONS.has(action)) {
 		guard.pendingOpen = false;
 		guard.startedAt = guard.startedAt || now;
 		// Opening the managed target establishes the verification session; it is
 		// preparation, not evidence. Reserve the bounded evidence budget for the
 		// actual snapshot/evaluate/interaction sequence.
 		guard.calls = Number(guard.calls || 0);
-		guard.targetUrl = browserToolTargetUrl(event) || guard.pendingTarget || verificationTargetUrl(envelope) || guard.targetUrl;
+		guard.targetUrl = browserToolResultUrl(event) || browserToolTargetUrl(event) || guard.pendingTarget || verificationTargetUrl(envelope) || guard.targetUrl;
 		guard.managedPreviewOpened = isManagedInteractivePreviewUrl(guard.targetUrl);
 		guard.targetId = trim(event?.result?.targetId || event?.output?.targetId || event?.targetId) || guard.targetId;
-		guard.lastSuccessfulAction = "open";
+		guard.lastSuccessfulAction = action;
 		guard.lastObservedAt = now;
 		guard.consecutiveFailures = 0;
 		guard.sameFailureCount = 0;
@@ -3417,6 +3476,240 @@ function taskEvent(cfg, event, envelope, extra = {}) {
   );
 }
 
+function workflowAssignment(state, assignmentId) {
+  const assignments = state?.assignments;
+  if (!assignments || typeof assignments !== "object") return null;
+  const direct = assignments[trim(assignmentId)];
+  return direct && typeof direct === "object" ? direct : null;
+}
+
+function activeRuntimeStatus(status) {
+  if (!status || typeof status !== "object") return false;
+  const runtimeStatus = trim(status.runtimeStatus).toLowerCase();
+  const availability = trim(status.availability).toLowerCase();
+  if (!["running", "busy", "completion_pending", "recovering"].includes(runtimeStatus) && availability !== "busy") return false;
+  const lastSeen = Date.parse(status.lastSeenAt || "");
+  return Number.isFinite(lastSeen) && Date.now() - lastSeen <= 120000;
+}
+
+function equivalentActiveAssignment(status, message) {
+  if (!activeRuntimeStatus(status)) return false;
+  const currentRootTaskId = preferredRootTaskId(status.currentTaskId, status.rootTaskId);
+  const messageRootTaskId = preferredRootTaskId(message.rootTaskId, message.taskId);
+  if (!currentRootTaskId || !messageRootTaskId || !taskIdsMatch(currentRootTaskId, messageRootTaskId)) return false;
+  const currentAssignment = trim(status.currentAssignmentId || status.assignmentId || status.workId);
+  if (!currentAssignment || !taskIdsMatch(currentAssignment, message.assignmentId || message.workId)) return false;
+  const currentRevision = intFrom(status.currentRevision, 0);
+  const requestedRevision = Math.max(1, intFrom(message.revision, 1));
+  if (!currentRevision || currentRevision > requestedRevision) return false;
+  const currentTarget = trim(status.currentValidationTargetAssignmentId);
+  const messageTarget = trim(message.validationTargetAssignmentId);
+  if (currentTarget && messageTarget && currentTarget !== messageTarget) return false;
+  const currentTargetRevision = intFrom(status.currentValidationTargetRevision, 0);
+  const messageTargetRevision = intFrom(message.validationTargetRevision, 0);
+  if (currentTargetRevision && messageTargetRevision && currentTargetRevision !== messageTargetRevision) return false;
+  return true;
+}
+
+async function recordAssignmentDispatch(redis, cfg, message, status = "dispatched") {
+  if (!redis || !message?.rootTaskId || !message?.assignmentId) return;
+  const value = JSON.stringify({
+    assignmentId: message.assignmentId,
+    workId: message.workId,
+    revision: Math.max(1, intFrom(message.revision, 1)),
+    rootTaskId: message.rootTaskId,
+    to: message.to,
+    messageId: message.messageId,
+    status,
+    createdAt: message.createdAt || nowIso(),
+  });
+  const key = assignmentDispatchStateKey(cfg, message.rootTaskId);
+  await redis.command("HSET", key, message.assignmentId, value);
+  await redis.command("EXPIRE", key, 604800);
+}
+
+async function recentEquivalentDispatch(redis, cfg, message) {
+  if (!redis || !message?.rootTaskId || !message?.assignmentId) return null;
+  const raw = await redis.command("HGET", assignmentDispatchStateKey(cfg, message.rootTaskId), message.assignmentId);
+  if (!raw) return null;
+  try {
+    const state = JSON.parse(String(raw));
+    const createdAt = Date.parse(state.createdAt || "");
+    if (!Number.isFinite(createdAt) || Date.now() - createdAt > 120000) return null;
+    if (!taskIdsMatch(state.rootTaskId, message.rootTaskId)) return null;
+    if (trim(state.to) !== trim(message.to)) return null;
+    if (Math.max(1, intFrom(state.revision, 1)) !== Math.max(1, intFrom(message.revision, 1))) return null;
+    if (!["dispatched", "waiting_dependencies"].includes(trim(state.status).toLowerCase())) return null;
+    return state;
+  } catch {
+    return null;
+  }
+}
+
+function equivalentWorkflowAttempt(workflowState, message) {
+  const state = workflowAssignment(workflowState, message.assignmentId || message.workId);
+  if (!state || !["pending", "dispatched", "running"].includes(trim(state.status).toLowerCase())) return null;
+  const updatedAt = Date.parse(state.updatedAt || "");
+  if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > 120000) return null;
+  const currentRevision = Math.max(1, intFrom(state.revision, 1));
+  const requestedRevision = Math.max(1, intFrom(message.revision, 1));
+  if (currentRevision > requestedRevision) return null;
+  const currentTarget = trim(state.validationTargetAssignmentId);
+  const requestedTarget = trim(message.validationTargetAssignmentId);
+  if (currentTarget && requestedTarget && currentTarget !== requestedTarget) return null;
+  const currentTargetRevision = intFrom(state.validationTargetRevision, 0);
+  const requestedTargetRevision = intFrom(message.validationTargetRevision, 0);
+  if (currentTargetRevision && requestedTargetRevision && currentTargetRevision !== requestedTargetRevision) return null;
+  return state;
+}
+
+async function dependencyDispatchState(redis, cfg, rootTaskId, dependency, workflowState) {
+  const workflow = workflowAssignment(workflowState, dependency);
+  if (workflow) return { known: true, status: trim(workflow.status).toLowerCase(), source: "workflow" };
+  const raw = await redis.command("HGET", assignmentDispatchStateKey(cfg, rootTaskId), dependency);
+  if (!raw) return { known: false, status: "unknown", source: "none" };
+  try {
+    const state = JSON.parse(String(raw));
+    return { known: true, status: trim(state.status).toLowerCase() || "dispatched", source: "runtime", createdAt: state.createdAt };
+  } catch {
+    return { known: false, status: "unknown", source: "invalid" };
+  }
+}
+
+async function dispatchDeferredAssignment(redis, cfg, message, deferredKey, deferredField, expectedPayload) {
+  const dispatchEvent = eventFor(cfg, "assignment_released", {
+    messageId: message.messageId,
+    taskId: message.taskId,
+    rootTaskId: message.rootTaskId,
+    rootMessageId: message.rootMessageId,
+    workId: message.workId,
+    assignmentId: message.assignmentId,
+    canonicalWorkId: message.canonicalWorkId,
+    revision: message.revision,
+    phaseId: message.phaseId,
+    to: message.originalTo || message.to,
+    dependsOn: message.dependsOn,
+    status: "dispatched",
+    runtimeStatus: "running",
+    executionDeferred: false,
+    summary: "Assignment dependencies are ready; execution released.",
+    visibleToChat: false,
+  });
+  const dispatchState = JSON.stringify({
+    assignmentId: message.assignmentId,
+    workId: message.workId,
+    revision: Math.max(1, intFrom(message.revision, 1)),
+    rootTaskId: message.rootTaskId,
+    to: message.to,
+    messageId: message.messageId,
+    status: "dispatched",
+    createdAt: nowIso(),
+  });
+  const result = await redis.command(
+    "EVAL",
+    [
+      "local current = redis.call('HGET', KEYS[1], ARGV[1])",
+      "if not current or current ~= ARGV[2] then return {0, ''} end",
+      "local streamId = redis.call('XADD', KEYS[2], '*', 'payload', ARGV[3])",
+      "redis.call('HSET', KEYS[3], ARGV[4], ARGV[5])",
+      "redis.call('EXPIRE', KEYS[3], 604800)",
+      "redis.call('XADD', KEYS[4], '*', 'payload', ARGV[6])",
+      "redis.call('HDEL', KEYS[1], ARGV[1])",
+      "return {1, streamId}",
+    ].join("\n"),
+    4,
+    deferredKey,
+    inboxKey(cfg, message.to),
+    assignmentDispatchStateKey(cfg, message.rootTaskId),
+    eventsKey(cfg),
+    deferredField,
+    expectedPayload,
+    JSON.stringify(message),
+    message.assignmentId,
+    dispatchState,
+    JSON.stringify(dispatchEvent),
+  );
+  return Array.isArray(result) && Number(result[0]) === 1;
+}
+
+async function refreshDeferredAssignment(redis, cfg, message) {
+  const key = deferredAssignmentsKey(cfg, message.rootTaskId);
+  const field = deferredAssignmentField(message);
+  const raw = await redis.command("HGET", key, field);
+  if (!raw) return false;
+  try {
+    const existing = JSON.parse(String(raw));
+    const refreshed = Object.assign({}, existing, message, {
+      messageId: existing.messageId || message.messageId,
+      createdAt: existing.createdAt || message.createdAt,
+      contextRefs: [...new Set([...(existing.contextRefs || []), ...(message.contextRefs || [])])],
+    });
+    await redis.command("HSET", key, field, JSON.stringify(refreshed));
+    await redis.command("EXPIRE", key, 604800);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function releaseReadyDeferredAssignments(redis, cfg, rootTaskId) {
+  if (!redis || !rootTaskId) return 0;
+  const key = deferredAssignmentsKey(cfg, rootTaskId);
+  const rawEntries = await redis.command("HGETALL", key);
+  if (!Array.isArray(rawEntries) || rawEntries.length === 0) return 0;
+  const workflowState = await readCurrentRootWorkflowState(redis, cfg, rootTaskId);
+  if (rootWorkflowStateIsTerminal(workflowState)) {
+    await redis.command("DEL", key);
+    await redis.command("SREM", deferredRootsKey(cfg), rootTaskId);
+    return 0;
+  }
+  let released = 0;
+  for (let index = 0; index + 1 < rawEntries.length; index += 2) {
+    const field = String(rawEntries[index]);
+    let message = null;
+    try { message = JSON.parse(String(rawEntries[index + 1])); } catch { continue; }
+    const dependencies = Array.isArray(message?.dependsOn) ? message.dependsOn.map(trim).filter(Boolean) : [];
+    let ready = dependencies.length > 0;
+    let hasKnownDependency = false;
+    let compatibilityExpired = false;
+    let hasUnknownDependency = false;
+    let hasPersistedUnresolvedDependency = false;
+    for (const dependency of dependencies) {
+      const state = await dependencyDispatchState(redis, cfg, rootTaskId, dependency, workflowState);
+      hasKnownDependency = hasKnownDependency || state.known;
+      hasUnknownDependency = hasUnknownDependency || !state.known;
+      if (state.status !== "succeeded") ready = false;
+      if (state.source === "workflow" && state.status !== "succeeded") hasPersistedUnresolvedDependency = true;
+      if (state.source === "runtime" && Date.now() - Date.parse(state.createdAt || "") > 60000 && !workflowAssignment(workflowState, dependency)) {
+        compatibilityExpired = true;
+      }
+    }
+    // Unknown or mixed-version identity is not a safe scheduling fact. Fail
+    // open rather than leaving the Team frozen. Runtime-only dispatch facts get
+    // a short window for ClawManager's durable ledger to catch up first.
+    if (!ready && hasUnknownDependency) ready = true;
+    if (!ready && hasKnownDependency && compatibilityExpired && !hasPersistedUnresolvedDependency) ready = true;
+    if (!ready) continue;
+    if (await dispatchDeferredAssignment(redis, cfg, message, key, field, String(rawEntries[index + 1]))) {
+      released++;
+    }
+  }
+  if (Number(await redis.command("HLEN", key)) === 0) {
+    await redis.command("SREM", deferredRootsKey(cfg), rootTaskId);
+  }
+  return released;
+}
+
+async function releaseAllReadyDeferredAssignments(redis, cfg) {
+  const roots = await redis.command("SMEMBERS", deferredRootsKey(cfg));
+  if (!Array.isArray(roots)) return 0;
+  let released = 0;
+  for (const rootTaskId of roots) {
+    released += await releaseReadyDeferredAssignments(redis, cfg, String(rootTaskId));
+  }
+  return released;
+}
+
 // ============ Message Envelope ============
 function normalizeEnvelopeWorkspaceContext(envelope) {
   const rootTaskId = preferredRootTaskId(envelope?.rootTaskId, envelope?.taskId);
@@ -3764,7 +4057,10 @@ function createRuntime(api) {
     // must never override it, even when the model repeats a descriptive or
     // invented id (the exact Team 72 failure mode).
     if (activeEnvelope) {
-      return activeEnvelope;
+			if (options.preferBusinessAssignment && isContextOnlyEnvelope(activeEnvelope) && activeEnvelope.businessAssignmentEnvelope) {
+				return activeEnvelope.businessAssignmentEnvelope;
+			}
+			return activeEnvelope;
     }
     for (const alias of aliases) {
       const persisted = await readTaskEnvelope(cfg, alias);
@@ -3956,6 +4252,11 @@ function createRuntime(api) {
       runtimeStatus: "completion_pending",
       currentTaskId: taskId,
       currentAssignmentId: assignmentId,
+		currentWorkId: envelope.workId || assignmentId,
+		currentRevision: revision,
+		currentSourceMessageId: envelope.messageId || undefined,
+		currentValidationTargetAssignmentId: envelope.validationTargetAssignmentId || undefined,
+		currentValidationTargetRevision: intFrom(envelope.validationTargetRevision, 0) || undefined,
       progress: 99,
       lastSummary: summary,
       artifactRefs,
@@ -4543,7 +4844,104 @@ function createRuntime(api) {
         });
       }
 
+      await releaseAllReadyDeferredAssignments(redis, cfg);
+
+      // A newer revision for the same healthy in-flight validation is an
+      // idempotent reminder, not a second execution. This check is based on
+      // the target Runtime's exact active-attempt snapshot and fails open for
+      // old statuses that do not expose revision/validation identity.
+      const targetStatus = await readStatuses(cfg, message.to);
+      if (equivalentActiveAssignment(targetStatus, message)) {
+        lastOutbound = { message, target, deduplicated: true, reason: "already_in_progress" };
+        return Object.assign({}, message, {
+          sent: true,
+          deduplicated: true,
+          reason: "already_in_progress",
+          activeAttempt: {
+            assignmentId: targetStatus.currentAssignmentId,
+            revision: targetStatus.currentRevision,
+            runtimeStatus: targetStatus.runtimeStatus,
+            lastSeenAt: targetStatus.lastSeenAt,
+          },
+        });
+      }
+
+      const workflowState = message.rootTaskId
+        ? await readCurrentRootWorkflowState(redis, cfg, message.rootTaskId)
+        : null;
+      const recordedDispatch = await recentEquivalentDispatch(redis, cfg, message);
+      const workflowAttempt = equivalentWorkflowAttempt(workflowState, message);
+      if (recordedDispatch || workflowAttempt) {
+        const waiting = trim(recordedDispatch?.status).toLowerCase() === "waiting_dependencies";
+        if (waiting) await refreshDeferredAssignment(redis, cfg, message);
+        const activeAttempt = workflowAttempt || recordedDispatch;
+        lastOutbound = {
+          message,
+          target,
+          deduplicated: true,
+          deferred: waiting,
+          reason: waiting ? "waiting_dependencies" : "already_in_progress",
+        };
+        return Object.assign({}, message, {
+          sent: true,
+          deduplicated: true,
+          deferred: waiting,
+          reason: waiting ? "waiting_dependencies" : "already_in_progress",
+          deliveryState: waiting ? "registered_waiting_dependencies" : "registered_or_running",
+          noWorkerReplyExpectedUntilDependenciesReady: waiting || undefined,
+          leaderGuidance: waiting
+            ? "The assignment is registered but the Worker has not started. Do not resend it; execution releases automatically after the exact prerequisites succeed."
+            : "The equivalent attempt is already registered or running. Continue coordinating other work and wait for its result instead of creating another revision.",
+          activeAttempt: {
+            assignmentId: activeAttempt.assignmentId || message.assignmentId,
+            revision: activeAttempt.revision,
+            status: activeAttempt.status,
+            messageId: activeAttempt.messageId,
+          },
+        });
+      }
+
+      const allowEarlyStart = boolFrom(params.allowEarlyStart ?? params.allow_early_start, false);
+      if (!allowEarlyStart && message.rootTaskId && Array.isArray(message.dependsOn) && message.dependsOn.length > 0) {
+        const dependencyStates = [];
+        for (const dependency of message.dependsOn) {
+          dependencyStates.push({ dependency, ...(await dependencyDispatchState(redis, cfg, message.rootTaskId, dependency, workflowState)) });
+        }
+        const known = dependencyStates.filter((entry) => entry.known);
+        const unresolved = known.filter((entry) => entry.status !== "succeeded");
+        // Unknown/natural dependency labels remain fail-open. An exact issued
+        // or persisted prerequisite is deferred and released automatically.
+        if (known.length === dependencyStates.length && unresolved.length > 0) {
+          const key = deferredAssignmentsKey(cfg, message.rootTaskId);
+          await redis.command("HSET", key, deferredAssignmentField(message), JSON.stringify(message));
+          await redis.command("EXPIRE", key, 604800);
+          await redis.command("SADD", deferredRootsKey(cfg), message.rootTaskId);
+          await redis.command("EXPIRE", deferredRootsKey(cfg), 604800);
+          await recordAssignmentDispatch(redis, cfg, message, "waiting_dependencies");
+          await xaddJson(redis, eventsKey(cfg), eventFor(cfg, "outbound", Object.assign({}, message, {
+            to: target.originalTo,
+            executionDeferred: true,
+            dependencyState: "waiting_dependencies",
+            blockedDependencies: unresolved.map((entry) => entry.dependency),
+            runtimeStatus: "waiting_dependencies",
+            status: "dispatched",
+            visibleToChat: false,
+          })));
+          lastOutbound = { message, target, deferred: true, reason: "waiting_dependencies" };
+          return Object.assign({}, message, {
+            sent: true,
+            deferred: true,
+            reason: "waiting_dependencies",
+            deliveryState: "registered_waiting_dependencies",
+            noWorkerReplyExpectedUntilDependenciesReady: true,
+            leaderGuidance: "The assignment is registered but the Worker has not started. Do not resend it; execution releases automatically after the exact prerequisites succeed.",
+            blockedDependencies: unresolved.map((entry) => entry.dependency),
+          });
+        }
+      }
+
       await xaddJson(redis, inboxKey(cfg, message.to), message);
+		await recordAssignmentDispatch(redis, cfg, message, "dispatched");
       const outbound = {
         messageId: message.messageId,
         taskId: message.taskId,
@@ -4600,6 +4998,9 @@ function createRuntime(api) {
     const envelopeAssignmentId = trim(envelope.assignmentId) || trim(envelope.workId);
     const statusAssignmentId = trim(status.currentAssignmentId || status.assignmentId || status.workId);
     if (envelopeAssignmentId && (!statusAssignmentId || !taskIdsMatch(statusAssignmentId, envelopeAssignmentId))) return false;
+	const envelopeRevision = intFrom(envelope.revision ?? envelope.metadata?.revision, 0);
+	const statusRevision = intFrom(status.currentRevision, 0);
+	if (envelopeRevision > 0 && (!statusRevision || envelopeRevision !== statusRevision)) return false;
     return ["succeeded", "failed"].includes(String(status.runtimeStatus || "").toLowerCase());
   }
 
@@ -4609,6 +5010,9 @@ function createRuntime(api) {
     const terminalStatus = ["failed", "cancelled"].includes(trim(status.runtimeStatus).toLowerCase()) ? "failed" : "succeeded";
     const rootTaskId = preferredRootTaskId(envelope.rootTaskId, envelope.taskId);
     const assignmentId = trim(envelope.assignmentId) || trim(envelope.workId);
+	const workId = trim(envelope.workId) || assignmentId;
+	const revision = Math.max(1, intFrom(envelope.revision ?? envelope.metadata?.revision, 1));
+	const workItemId = intFrom(envelope.workItemId ?? envelope.metadata?.workItemId, 0);
     const checkId = trim(envelope.metadata?.checkId || envelope.metadata?.check_id || envelope.messageId);
     await withRedis(cfg, null, async (redis) => {
       await xaddJson(redis, eventsKey(cfg), taskEvent(cfg, "task_progress", envelope, {
@@ -4616,11 +5020,12 @@ function createRuntime(api) {
         taskId: rootTaskId,
         rootTaskId,
         rootMessageId: envelope.rootMessageId || envelope.messageId,
-        assignmentId: assignmentId || undefined,
-        workId: assignmentId || undefined,
+		assignmentId: assignmentId || undefined,
+		workId: workId || undefined,
         canonicalWorkId: assignmentId || undefined,
         sourceMessageId: envelope.messageId,
-        revision: Math.max(1, intFrom(envelope.revision, 1)),
+		revision,
+		workItemId: workItemId || undefined,
         status: terminalStatus,
         runtimeStatus: terminalStatus,
         availability: terminalStatus === "succeeded" ? "idle" : "blocked",
@@ -4632,6 +5037,7 @@ function createRuntime(api) {
         requestedAt: envelope.metadata?.requestedAt || envelope.metadata?.requested_at,
         respondedAt: nowIso(),
         terminalEvidence: true,
+		exactAttemptEvidence: true,
         visibleToChat: false,
         nonAuthoritative: true,
         rootTaskTerminal: false,
@@ -4753,6 +5159,9 @@ function createRuntime(api) {
       const contextOnly = isContextOnlyEnvelope(envelope);
       const previousPersistedEnvelope = contextOnly ? await readJson(privateActiveAssignmentPath(config)) : null;
       if (contextOnly) {
+		if (previousPersistedEnvelope && !isContextOnlyEnvelope(previousPersistedEnvelope)) {
+			envelope = Object.assign({}, envelope, { businessAssignmentEnvelope: previousPersistedEnvelope });
+		}
         const rootTaskId = preferredRootTaskId(envelope?.rootTaskId, envelope?.taskId);
         const persistedRootEnvelope = rootTaskId ? await readTaskEnvelope(config, rootTaskId) : null;
         const contextRefs = [
@@ -5034,7 +5443,9 @@ function createRuntime(api) {
       const monitorEnvelope =
         trim(currentEnvelope?.intent).toLowerCase() === "assignment_status_check" ||
         trim(currentEnvelope?.metadata?.monitorType || currentEnvelope?.metadata?.monitor_type).toLowerCase() === "assignment_status_check";
-      if ((eventKind === "assignment_check_result" || eventKind === "assignment_check_requested") && !monitorEnvelope) {
+		if (monitorEnvelope) {
+			eventKind = "assignment_check_result";
+		} else if (eventKind === "assignment_check_result" || eventKind === "assignment_check_requested") {
         eventKind = "worker_progress";
       }
       const passiveMonitorProgress =
@@ -5098,6 +5509,7 @@ function createRuntime(api) {
           workId: canonicalWorkId,
           assignmentId: canonicalAssignmentId || undefined,
           canonicalWorkId,
+			workItemId: monitorEnvelope ? intFrom(currentEnvelope?.workItemId ?? currentEnvelope?.metadata?.workItemId, 0) || undefined : undefined,
           sourceWorkId:
             memberIsLeader && inheritedAssignmentId && inheritedAssignmentId !== canonicalAssignmentId
               ? inheritedAssignmentId
@@ -5199,7 +5611,7 @@ function createRuntime(api) {
       if (!["succeeded", "failed", "cancelled"].includes(completionStatus)) {
         throw new Error("team_complete_task status must be succeeded, failed or cancelled");
       }
-      const completionEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {}, { includeTerminal: true });
+      const completionEnvelope = await resolveActiveAssignmentEnvelope(cfg, params || {}, { includeTerminal: true, preferBusinessAssignment: true });
       const resultTaskId = completionTaskIdFor(
         completionEnvelope,
         params.rootTaskId || params.root_task_id || reportedTaskId,
@@ -5465,6 +5877,7 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
         liveness: "online",
       });
       await presenceRedis.command("HSET", presenceKey(cfg), cfg.memberId, JSON.stringify(status));
+		await releaseAllReadyDeferredAssignments(presenceRedis, cfg);
     } catch (err) {
       log.warn("redis-team: presence update failed: " + (err.message || err));
     }
@@ -5623,6 +6036,8 @@ const teamSendParameters = {
     planVersion: { type: "number", minimum: 0 },
     ledgerVersion: { type: "number", minimum: 0 },
     dependsOn: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
+	allowEarlyStart: { type: "boolean", description: "Explicitly execute even when an exact declared prerequisite is not ready" },
+	allow_early_start: { type: "boolean" },
     title: { type: "string" },
     contextRefs: { type: "array", items: { type: "string" } },
     ttlSeconds: { type: "number", minimum: 1 },
@@ -5840,11 +6255,39 @@ export default definePluginEntry({
     const consumerHandles = new Map();
     const reviewerBrowserGuards = new Map();
 		const reviewerBrowserGuardKeysByCall = new Map();
+		const reviewerBrowserCalls = new Map();
+		const processedReviewerBrowserCalls = new Set();
+
+		async function observeBrowserToolResult(callKey, resultEvent) {
+			if (!callKey || processedReviewerBrowserCalls.has(callKey)) return;
+			const call = reviewerBrowserCalls.get(callKey);
+			if (!call) return;
+			processedReviewerBrowserCalls.add(callKey);
+			const current = reviewerBrowserGuards.get(call.guardKey);
+			if (!current) return;
+			const next = await runtime.afterBrowserToolCall(
+				Object.assign({}, call.event, resultEvent),
+				current,
+				Date.now(),
+			);
+			reviewerBrowserGuards.set(call.guardKey, next);
+			reviewerBrowserCalls.delete(callKey);
+			reviewerBrowserGuardKeysByCall.delete(callKey);
+			if (processedReviewerBrowserCalls.size > 512) processedReviewerBrowserCalls.clear();
+		}
 		try {
 			api.on(
 				"before_message_write",
 				(event, ctx) => {
 					runtime.observeAssistantSessionMessage(event, ctx);
+					const message = event?.message;
+					const callKey = trim(message?.toolCallId || message?.tool_call_id);
+					if (callKey && trim(message?.role).toLowerCase() === "toolresult" && trim(message?.toolName).toLowerCase() === "browser") {
+						void observeBrowserToolResult(callKey, {
+							result: message?.details && typeof message.details === "object" ? message.details : message,
+							error: message?.isError === true ? trim(message?.details?.error || message?.content?.[0]?.text) || "browser_tool_failed" : undefined,
+						});
+					}
 				},
 				{ priority: -100, timeoutMs: 250 },
 			);
@@ -5863,7 +6306,10 @@ export default definePluginEntry({
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
 				const guardKey = runtime.browserGuardKey(event, ctx);
 				const callKey = browserHookContextKey(event, ctx);
-				if (callKey) reviewerBrowserGuardKeysByCall.set(callKey, guardKey);
+				if (callKey) {
+					reviewerBrowserGuardKeysByCall.set(callKey, guardKey);
+					reviewerBrowserCalls.set(callKey, { guardKey, event: JSON.parse(JSON.stringify(event || {})) });
+				}
         const current = reviewerBrowserGuards.get(guardKey) || { calls: 0, startedAt: 0 };
         const decision = runtime.beforeBrowserToolCall(event, current, Date.now());
         if (decision?.state) reviewerBrowserGuards.set(guardKey, decision.state);
@@ -5885,7 +6331,15 @@ export default definePluginEntry({
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
 				const callKey = browserHookContextKey(event, ctx);
 				const guardKey = (callKey && reviewerBrowserGuardKeysByCall.get(callKey)) || runtime.browserGuardKey(event, ctx);
-				if (callKey) reviewerBrowserGuardKeysByCall.delete(callKey);
+				if (callKey && reviewerBrowserCalls.has(callKey)) {
+					await observeBrowserToolResult(callKey, {
+						result: event?.result,
+						output: event?.output,
+						error: event?.error,
+						durationMs: event?.durationMs,
+					});
+					return;
+				}
         const current = reviewerBrowserGuards.get(guardKey);
         if (!current) return;
 			reviewerBrowserGuards.set(guardKey, await runtime.afterBrowserToolCall(event, current, Date.now()));
@@ -6368,6 +6822,15 @@ export default definePluginEntry({
                     runtimeStatus: "running",
                     currentTaskId: taskId,
                     currentAssignmentId: envelope.assignmentId || envelope.workId || undefined,
+					currentWorkId: envelope.workId || envelope.assignmentId || undefined,
+					currentRevision: Math.max(1, intFrom(envelope.revision, 1)),
+					currentSourceMessageId: envelope.messageId || undefined,
+					currentPhaseId: envelope.phaseId || envelope.currentPhaseId || undefined,
+					currentValidationTargetAssignmentId: envelope.validationTargetAssignmentId || undefined,
+					currentValidationTargetRevision: intFrom(envelope.validationTargetRevision, 0) || undefined,
+					progress: 0,
+					resultContentHash: null,
+					artifactRefs: [],
                     lastSummary: "Redis Team task started",
                   });
                   await emitTaskEvent("task_started", {

@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, normalizeTeamSendParams, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, inferCanonicalArtifactWriteContract, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readLastToolOutcomeFromDispatch, completionProposalProvenance };\n";
+const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, normalizeTeamSendParams, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, inferCanonicalArtifactWriteContract, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, browserToolResultUrl, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readLastToolOutcomeFromDispatch, completionProposalProvenance, validationRevisionDirectory, equivalentActiveAssignment, equivalentWorkflowAttempt };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -453,6 +453,35 @@ try {
 			},
 		},
 		"only successful managed Browser tool events may produce a managed-browser verification fact",
+	);
+	const navigateBrowserState = {};
+	const isolatedPreviewUrl = "http://p-abcdefghijklmnop.clawmanager-team-preview.invalid/v2/interactive/75/_/signature/index.html";
+	const navigateDecision = pluginModule.reviewerBrowserToolDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "navigate", url: managedPreviewUrl } },
+		navigateBrowserState,
+		1020,
+	);
+	assert.notEqual(navigateDecision.block, true, "normal Browser navigate must establish a target instead of being treated as inspect-before-open");
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "navigate", url: managedPreviewUrl }, result: { url: isolatedPreviewUrl, targetId: "target-nav" } },
+		navigateBrowserState,
+		1021,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "snapshot" }, result: { status: "ok" } },
+		navigateBrowserState,
+		1022,
+	);
+	assert.equal(navigateBrowserState.targetUrl, isolatedPreviewUrl, "redirected Preview origin is retained as the verified target");
+	assert.equal(navigateBrowserState.managedPreviewOpened, true);
+	assert.equal(navigateBrowserState.managedPreviewInspected, true);
+	assert.equal(
+		pluginModule.browserToolResultUrl({ result: { details: { url: isolatedPreviewUrl } } }),
+		isolatedPreviewUrl,
+		"persisted Browser tool results recover the final URL even when after_tool_call delivery is detached",
 	);
 	const activeBrowserEnvelope = {
 		...browserEnvelope,
@@ -1248,6 +1277,57 @@ try {
     "/team/results/team-75-task-150/reviews/review-01/QA-REPORT.md",
     "a unique report in the current root work must remain readable through a stale assignment path",
   );
+	await seedActive("reviewer", "reviewer", "review-01", {
+		revision: 2,
+		validationAssignment: true,
+		validationTargetAssignmentId: "dev-01",
+		validationTargetRevision: 2,
+	});
+	const revisionTwoReview = toolResult(await reviewerTools.get("team_artifact_write").execute("review-r2", {
+		scope: "team",
+		kind: "review",
+		path: "/team/results/team-75-task-150/reviews/review-01/review-r2.md",
+		content: "# Review revision 2\n\nPASS\n",
+	}));
+	assert.equal(
+		revisionTwoReview.artifact.path,
+		"/team/results/team-75-task-150/reviews/review-01/revisions/r2/review-r2.md",
+		"each validation revision must retain an independent canonical report directory",
+	);
+	const revisionTwoMemberReport = toolResult(await reviewerTools.get("team_artifact_write").execute("review-r2-member", {
+		scope: "member",
+		path: "QA-REPORT.md",
+		content: "# Review revision 2 member report\n\nPASS\n",
+	}));
+	assert.equal(
+		revisionTwoMemberReport.artifact.path,
+		"/team/artifacts/team-75-task-150/members/reviewer/review-01/revisions/r2/QA-REPORT.md",
+	);
+	await fs.writeFile(path.join(state, "teams", "75", "reviewer", "status.json"), JSON.stringify({
+		availability: "busy",
+		runtimeStatus: "running",
+		currentTaskId: "team-75-task-150",
+		currentAssignmentId: "review-01",
+		currentRevision: 2,
+		lastSeenAt: new Date().toISOString(),
+	}), "utf8");
+	const revisionTwoCompletion = toolResult(await reviewerTools.get("team_complete_task").execute("review-r2-complete", {
+		status: "succeeded",
+		summary: "Review revision 2 complete",
+		resultMarkdown: `Report: ${revisionTwoMemberReport.artifact.path}`,
+		artifactRefs: [revisionTwoMemberReport.artifact.path],
+	}));
+	assert.ok(
+		revisionTwoCompletion.artifactRefs.includes("/team/results/team-75-task-150/reviews/review-01/revisions/r2/QA-REPORT.md"),
+		"completion mirrors a tolerant member report into the same revision-specific canonical directory",
+	);
+	assert.equal(
+		pluginModule.validationRevisionDirectory(
+			{ memberId: "reviewer", role: "reviewer" },
+			{ revision: 3, validationAssignment: true },
+		),
+		path.join("revisions", "r3"),
+	);
   await seedActive("auditor", "domain-specialist", "audit-01", {
     validationAssignment: true,
     validationTargetAssignmentId: "dev-01",
@@ -1370,6 +1450,51 @@ try {
   const monotonicEvidence = pluginModule.mergeBrowserVerificationState(openEvidence, laterSnapshotFailure);
   assert.equal(monotonicEvidence.managedPreviewOpened, true, "a later Browser error must not erase a successful open");
   assert.equal(monotonicEvidence.managedPreviewInspected, undefined);
+
+	const freshStatusAt = new Date().toISOString();
+	assert.equal(pluginModule.equivalentActiveAssignment({
+		runtimeStatus: "running",
+		availability: "busy",
+		lastSeenAt: freshStatusAt,
+		currentTaskId: "team-75-task-150",
+		currentAssignmentId: "review-01",
+		currentRevision: 2,
+		currentValidationTargetAssignmentId: "dev-01",
+		currentValidationTargetRevision: 2,
+	}, {
+		rootTaskId: "team-75-task-150",
+		assignmentId: "review-01",
+		revision: 3,
+		validationTargetAssignmentId: "dev-01",
+		validationTargetRevision: 2,
+	}), true, "a newer duplicate request must not replace a healthy equivalent validation attempt");
+	assert.equal(pluginModule.equivalentActiveAssignment({
+		runtimeStatus: "running",
+		availability: "busy",
+		lastSeenAt: freshStatusAt,
+		currentTaskId: "team-75-task-old",
+		currentAssignmentId: "review-01",
+		currentRevision: 2,
+	}, {
+		rootTaskId: "team-75-task-150",
+		assignmentId: "review-01",
+		revision: 2,
+	}), false, "an active assignment from another root task must never suppress a new dispatch");
+	assert.ok(pluginModule.equivalentWorkflowAttempt({ assignments: {
+		"review-01": {
+			assignmentId: "review-01",
+			revision: 2,
+			status: "running",
+			validationTargetAssignmentId: "dev-01",
+			validationTargetRevision: 2,
+			updatedAt: freshStatusAt,
+		},
+	} }, {
+		assignmentId: "review-01",
+		revision: 3,
+		validationTargetAssignmentId: "dev-01",
+		validationTargetRevision: 2,
+	}), "the durable ledger must close the status-propagation race without creating another Work Item");
 
   assert.match(source, /function analyzeResponseLocale\(/);
   assert.doesNotMatch(source, /must use \$\{locale \|\| "zh-CN"\}/);
