@@ -673,10 +673,11 @@ func TestWriteOpenClawGatewayConfigUsesRequestEnvironmentLLMOverrides(t *testing
 		UID:        200068,
 		GID:        200068,
 		Environment: map[string]string{
-			"CLAWMANAGER_LLM_BASE_URL":  "http://clawmanager-gateway.clawmanager-system.svc.cluster.local:9001/api/v1/gateway/llm",
-			"CLAWMANAGER_LLM_API_KEY":   "instance-token",
-			"CLAWMANAGER_LLM_MODEL":     `["auto","gpt-5.5"]`,
-			"CLAWMANAGER_LLM_REASONING": `{"auto":false,"gpt-5.5":true}`,
+			"CLAWMANAGER_LLM_BASE_URL":          "http://clawmanager-gateway.clawmanager-system.svc.cluster.local:9001/api/v1/gateway/llm",
+			"CLAWMANAGER_LLM_API_KEY":           "instance-token",
+			"CLAWMANAGER_LLM_MODEL":             `["auto","gpt-5.5"]`,
+			"CLAWMANAGER_LLM_REASONING":         `{"auto":false,"gpt-5.5":true}`,
+			"CLAWMANAGER_LLM_REASONING_CONTROL": `{"auto":"","gpt-5.5":"deepseek-thinking"}`,
 		},
 	}
 	cfg := Config{GatewayAuthMode: "trusted-proxy"}
@@ -703,6 +704,14 @@ func TestWriteOpenClawGatewayConfigUsesRequestEnvironmentLLMOverrides(t *testing
 	}
 	if providerModels[0].(map[string]any)["reasoning"] != false || providerModels[1].(map[string]any)["reasoning"] != true {
 		t.Fatalf("managed reasoning settings were not applied: %#v", providerModels)
+	}
+	reasoningCompat, ok := providerModels[1].(map[string]any)["compat"].(map[string]any)
+	if !ok || reasoningCompat["supportsReasoningEffort"] != true {
+		t.Fatalf("managed reasoning control compat was not applied: %#v", providerModels[1])
+	}
+	effortMap, ok := reasoningCompat["reasoningEffortMap"].(map[string]any)
+	if !ok || effortMap["off"] != "none" || effortMap["medium"] != "high" || effortMap["max"] != "max" {
+		t.Fatalf("managed reasoning effort map is incomplete: %#v", effortMap)
 	}
 	defaults := objectAt(t, objectAt(t, merged, "agents"), "defaults")
 	model := objectAt(t, defaults, "model")

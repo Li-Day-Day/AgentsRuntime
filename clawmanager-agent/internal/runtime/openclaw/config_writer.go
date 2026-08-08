@@ -673,6 +673,13 @@ func configWithRequestLLMEnv(cfg gateway.Config, req gateway.CreateGatewayReques
 		}
 		resolved.LLMReasoning = reasoning
 	}
+	if raw, ok := requestEnvValue(req, "CLAWMANAGER_LLM_REASONING_CONTROL"); ok && strings.TrimSpace(raw) != "" {
+		controls, err := parseLLMReasoningControl(raw)
+		if err != nil {
+			return gateway.Config{}, err
+		}
+		resolved.LLMReasoningControl = controls
+	}
 	return resolved, nil
 }
 
@@ -714,7 +721,7 @@ func mergeOpenClawLLMConfig(config map[string]any, cfg gateway.Config) {
 		provider["auth"] = "api-key"
 	}
 	if len(cfg.LLMModelIDs) > 0 {
-		provider["models"] = buildOpenClawProviderModels(provider["models"], cfg.LLMModelIDs, cfg.LLMReasoning)
+		provider["models"] = buildOpenClawProviderModels(provider["models"], cfg.LLMModelIDs, cfg.LLMReasoning, cfg.LLMReasoningControl)
 
 		agents := ensureObject(config, "agents")
 		defaults := ensureObject(agents, "defaults")
@@ -758,7 +765,7 @@ func normalizeOpenClawProviderAuthContracts(config map[string]any) {
 	}
 }
 
-func buildOpenClawProviderModels(existing any, modelIDs []string, reasoningByID map[string]bool) []any {
+func buildOpenClawProviderModels(existing any, modelIDs []string, reasoningByID map[string]bool, reasoningControlByID map[string]string) []any {
 	byID := indexOpenClawModelsByID(existing)
 	models := make([]any, 0, len(modelIDs))
 	for _, id := range modelIDs {
@@ -768,15 +775,38 @@ func buildOpenClawProviderModels(existing any, modelIDs []string, reasoningByID 
 			if reasoning, managed := reasoningByID[id]; managed {
 				cloned["reasoning"] = reasoning
 			}
+			applyOpenClawReasoningControlCompat(cloned, reasoningByID[id], reasoningControlByID[id])
 			if strings.EqualFold(id, "auto") || strings.TrimSpace(configStringValue(cloned["name"])) == "" {
 				cloned["name"] = displayOpenClawModelName(id)
 			}
 			models = append(models, cloned)
 			continue
 		}
-		models = append(models, defaultOpenClawProviderModel(id, reasoningByID[id]))
+		model := defaultOpenClawProviderModel(id, reasoningByID[id])
+		applyOpenClawReasoningControlCompat(model, reasoningByID[id], reasoningControlByID[id])
+		models = append(models, model)
 	}
 	return models
+}
+
+func applyOpenClawReasoningControlCompat(model map[string]any, enabled bool, control string) {
+	if model == nil || control != "deepseek-thinking" {
+		return
+	}
+	if !enabled {
+		return
+	}
+	compat, _ := model["compat"].(map[string]any)
+	if compat == nil {
+		compat = map[string]any{}
+		model["compat"] = compat
+	}
+	compat["supportsReasoningEffort"] = true
+	compat["supportedReasoningEfforts"] = []any{"high", "max"}
+	compat["reasoningEffortMap"] = map[string]any{
+		"off": "none", "minimal": "high", "low": "high", "medium": "high",
+		"high": "high", "xhigh": "max", "max": "max",
+	}
 }
 
 func indexOpenClawModelsByID(existing any) map[string]map[string]any {
