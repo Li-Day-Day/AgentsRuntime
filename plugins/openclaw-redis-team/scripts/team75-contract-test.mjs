@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, inferCanonicalArtifactWriteContract, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readLastToolOutcomeFromDispatch, completionProposalProvenance };\n";
+const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, normalizeTeamSendParams, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, inferCanonicalArtifactWriteContract, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readLastToolOutcomeFromDispatch, completionProposalProvenance };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -252,6 +252,39 @@ try {
     "# Team 启动介绍\n\nLeader coordinates the Developer.\n",
     "utf8",
   );
+	const fastTeamSend = await pluginModule.normalizeTeamSendParams(
+		{ teamId: "75", memberId: "leader", sharedDir: shared },
+		{ to: "developer", text: "Implement the page." },
+		null,
+	);
+	assert.deepEqual(fastTeamSend.params, { to: "developer", text: "Implement the page." });
+	const aliasedTeamSend = await pluginModule.normalizeTeamSendParams(
+		{ teamId: "75", memberId: "leader", sharedDir: shared },
+		{ recipient: "developer", message: "Implement the page." },
+		null,
+	);
+	assert.equal(aliasedTeamSend.params.to, "developer");
+	assert.equal(aliasedTeamSend.params.text, "Implement the page.");
+	const replyTeamSend = await pluginModule.normalizeTeamSendParams(
+		{ teamId: "75", memberId: "developer", sharedDir: shared },
+		{ text: "The implementation is ready." },
+		{ from: "leader", assignmentId: "dev-01" },
+	);
+	assert.equal(replyTeamSend.params.to, "leader", "an authenticated assignment sender is a safe reply target");
+	const ambiguousTeamSend = await pluginModule.normalizeTeamSendParams(
+		{ teamId: "75", memberId: "leader", sharedDir: shared },
+		{ text: "Start the next assignment." },
+		{ from: "clawmanager", rootTaskId: "team-75-task-149" },
+	);
+	assert.equal(ambiguousTeamSend.error.code, "ambiguous_team_target");
+	assert.equal(ambiguousTeamSend.error.sent, false);
+	assert.deepEqual(ambiguousTeamSend.error.candidates, ["developer"]);
+	const conflictingTeamSend = await pluginModule.normalizeTeamSendParams(
+		{ teamId: "75", memberId: "leader", sharedDir: shared },
+		{ to: "developer", recipient: "leader", text: "Do not dispatch this." },
+		null,
+	);
+	assert.equal(conflictingTeamSend.error.code, "conflicting_team_target");
   const leaderContextEnvelope = pluginModule.normalizeEnvelope({
     teamId: "75",
     from: "clawmanager",
@@ -455,6 +488,31 @@ try {
 	assert.equal(activeBrowserResult.browserVerification.managedPreviewOpened, true);
 	assert.equal(activeBrowserResult.browserVerification.managedPreviewInspected, true);
 	assert.equal(activeBrowserResult.browserVerification.lastSuccessfulAction, "evaluate");
+	let detachedBrowserState;
+	await liveRuntime.withActiveEnvelope(
+		activeBrowserEnvelope,
+		async () => {
+			detachedBrowserState = {};
+			liveRuntime.beforeBrowserToolCall(
+				{ toolName: "browser", params: { action: "open", url: managedPreviewUrl } },
+				detachedBrowserState,
+				1030,
+			);
+		},
+		{ teamId: "75", memberId: "reviewer", role: "reviewer", sharedDir: shared },
+	);
+	await liveRuntime.afterBrowserToolCall(
+		{ toolName: "browser", params: { action: "open", url: managedPreviewUrl }, result: { status: "ok" } },
+		detachedBrowserState,
+		1031,
+	);
+	await liveRuntime.afterBrowserToolCall(
+		{ toolName: "browser", params: { action: "snapshot" }, result: { status: "ok" } },
+		detachedBrowserState,
+		1032,
+	);
+	assert.equal(detachedBrowserState.verification.managedPreviewOpened, true);
+	assert.equal(detachedBrowserState.verification.managedPreviewInspected, true, "detached after_tool_call keeps the immutable assignment binding");
 	assert.equal(
 		pluginModule.browserVerificationForCompletion(browserEnvelope, {}).verificationMode,
 		"static_only",
@@ -473,6 +531,12 @@ try {
 			1003 + index,
     );
     assert.notEqual(decision.block, true);
+		pluginModule.reviewerBrowserToolResultDecision(
+			browserEnvelope,
+			{ toolName: "browser", params: { action: "snapshot" }, result: { status: "ok" } },
+			browserState,
+			1003 + index,
+		);
   }
   const exhaustedBrowser = pluginModule.reviewerBrowserToolDecision(
     browserEnvelope,
@@ -481,6 +545,49 @@ try {
 		1008,
   );
   assert.equal(exhaustedBrowser.block, true);
+	const elasticState = {};
+	pluginModule.reviewerBrowserToolDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" } },
+		elasticState,
+		3000,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "open", url: "https://example.com/review" }, result: { status: "ok" } },
+		elasticState,
+		3001,
+	);
+	pluginModule.reviewerBrowserToolDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "evaluate" } },
+		elasticState,
+		3002,
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "evaluate" }, error: "SyntaxError: unexpected token" },
+		elasticState,
+		3003,
+	);
+	assert.equal(elasticState.calls, 0, "a recoverable Browser error must not consume successful evidence budget");
+	assert.notEqual(
+		pluginModule.reviewerBrowserToolDecision(
+			browserEnvelope,
+			{ toolName: "browser", params: { action: "evaluate" } },
+			elasticState,
+			3004,
+		).block,
+		true,
+		"one corrected Browser call remains available",
+	);
+	pluginModule.reviewerBrowserToolResultDecision(
+		browserEnvelope,
+		{ toolName: "browser", params: { action: "evaluate" }, result: { status: "ok" } },
+		elasticState,
+		3005,
+	);
+	assert.equal(elasticState.calls, 1);
   assert.equal(pluginModule.browserToolCallFailed({
     result: {
       content: [{ type: "text", text: JSON.stringify({ status: "error", tool: "browser", error: "navigation blocked" }) }],
@@ -501,6 +608,22 @@ try {
 			`dangerous over-testing command must be blocked: ${command}`,
 		);
 	}
+	assert.notEqual(
+		pluginModule.teamProcessToolDecision(
+			{ instanceMode: "pro", role: "reviewer" },
+			{ toolName: "exec", params: { command: "chromium --headless --remote-debugging-port=9222" } },
+		).block,
+		true,
+		"an isolated Pro instance may use an explicitly assigned local Browser harness",
+	);
+	assert.equal(
+		pluginModule.teamProcessToolDecision(
+			{ instanceMode: "pro", role: "reviewer" },
+			{ toolName: "exec", params: { command: "pkill chromium" } },
+		).block,
+		true,
+		"broad process termination remains unsafe even in an isolated instance",
+	);
 	for (const command of ["npm test", "npm run dev", "ps -ef", "kill 12345", "python3 scripts/check.py"]) {
 		assert.notEqual(
 			pluginModule.teamProcessToolDecision(null, { toolName: "exec", params: { command } }).block,
@@ -613,6 +736,12 @@ try {
 			3002 + index,
     );
     assert.notEqual(genericValidatorBrowser.block, true);
+		pluginModule.reviewerBrowserToolResultDecision(
+			genericValidatorEnvelope,
+			{ toolName: "browser", params: { action: "snapshot" }, result: { status: "ok" } },
+			genericValidatorState,
+			3002 + index,
+		);
   }
   assert.equal(
     pluginModule.reviewerBrowserToolDecision(
@@ -749,6 +878,12 @@ try {
   assert.equal(controlTarget.completion, false);
   await seedActive("leader", "leader", "leader-final-synthesis");
   const leaderTools = createHarness("leader", "leader");
+	const missingTargetResult = toolResult(await leaderTools.get("team_send").execute("missing-target", {
+		text: "Assign the next task.",
+	}));
+	assert.equal(missingTargetResult.ok, false);
+	assert.equal(missingTargetResult.code, "ambiguous_team_target");
+	assert.equal(missingTargetResult.sent, false, "ambiguous repair must have zero transport side effects");
   const plan = toolResult(await leaderTools.get("team_artifact_write").execute("plan-write", {
     scope: "team",
     kind: "plan",

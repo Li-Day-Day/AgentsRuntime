@@ -636,6 +636,70 @@ function assertTeamArtifactWriteScope(cfg, params, activeEnvelope) {
   }
 }
 
+function teamToolNormalizationError(code, details = {}) {
+	return {
+		ok: false,
+		sent: false,
+		retryable: true,
+		code,
+		...details,
+	};
+}
+
+function distinctTeamToolValues(params, keys) {
+	const values = [];
+	for (const key of keys) {
+		const value = trim(params?.[key]);
+		if (value && !values.includes(value)) values.push(value);
+	}
+	return values;
+}
+
+async function normalizeTeamSendParams(cfg, params, envelope) {
+	const source = params && typeof params === "object" ? params : {};
+	const targetValues = distinctTeamToolValues(source, ["to", "recipient", "targetMemberId", "target_member_id"]);
+	const textValues = distinctTeamToolValues(source, ["text", "message", "prompt"]);
+	if (targetValues.length > 1) {
+		return { error: teamToolNormalizationError("conflicting_team_target", { fields: ["to", "recipient", "targetMemberId"] }) };
+	}
+	if (textValues.length > 1) {
+		return { error: teamToolNormalizationError("conflicting_team_message", { fields: ["text", "message", "prompt"] }) };
+	}
+	// The ordinary valid call stays entirely local: no roster/ledger read, no
+	// Monitor event and no extra model turn.
+	if (targetValues.length === 1 && textValues.length === 1) {
+		if (trim(source.to) === targetValues[0] && trim(source.text) === textValues[0]) return { params: source };
+		return { params: { ...source, to: targetValues[0], text: textValues[0] } };
+	}
+	if (textValues.length === 0) {
+		return { error: teamToolNormalizationError("missing_team_message", { missing: ["text"] }) };
+	}
+	if (targetValues.length === 1) {
+		return { params: { ...source, to: targetValues[0], text: textValues[0] } };
+	}
+
+	// Missing recipients are recovered only from an authenticated inbound
+	// envelope when its sender resolves to exactly one current roster member.
+	// New Leader dispatches remain ambiguous and are returned to the same Agent
+	// for correction rather than guessed from prose or role names.
+	const roster = await readTeamRoster(cfg);
+	const candidates = [envelope?.from, envelope?.replyFrom, envelope?.sourceMemberId]
+		.map(trim)
+		.filter((value) => value && value !== cfg.memberId && isKnownRosterTarget(roster, value));
+	const unique = [...new Set(candidates.map((value) => rosterMemberForTarget(roster, value)?.memberId).filter(Boolean))];
+	if (unique.length === 1) {
+		return { params: { ...source, to: unique[0], text: textValues[0] } };
+	}
+	return {
+		error: teamToolNormalizationError("ambiguous_team_target", {
+			missing: ["to"],
+			candidates: roster.members
+				.map((member) => trim(member.memberId || member.memberKey || member.id))
+				.filter((value) => value && value !== cfg.memberId),
+		}),
+	};
+}
+
 function inferCanonicalArtifactWriteContract(cfg, params, activeEnvelope) {
   const current = params || {};
   if (!activeEnvelope || !isAssignedValidationWriter(cfg, activeEnvelope)) {
@@ -1885,7 +1949,12 @@ function resolveRedisTeamVerificationRole(envelope) {
 }
 
 const REVIEW_BROWSER_MAX_CALLS = 10;
-const REVIEW_BROWSER_WINDOW_MS = 90_000;
+const REVIEW_BROWSER_WINDOW_MS = 120_000;
+const REVIEW_BROWSER_MAX_ATTEMPTS = 16;
+const REVIEW_BROWSER_MAX_PREPARATION_ATTEMPTS = 6;
+const REVIEW_BROWSER_MAX_OPEN_ATTEMPTS = 3;
+const REVIEW_BROWSER_MAX_CONSECUTIVE_FAILURES = 3;
+const REVIEW_BROWSER_MAX_SAME_FAILURES = 2;
 const REVIEW_BROWSER_PREPARATION_ACTIONS = new Set(["status", "start"]);
 const REVIEW_BROWSER_EVIDENCE_ACTIONS = new Set(["snapshot", "screenshot", "act", "evaluate", "inspect"]);
 
@@ -1946,9 +2015,18 @@ function reviewerBrowserToolDecision(envelope, event, state, now = Date.now()) {
   const guard = state || {};
 	const action = browserToolAction(event);
 	if (REVIEW_BROWSER_PREPARATION_ACTIONS.has(action)) {
+		if (Number(guard.preparationAttempts || 0) >= REVIEW_BROWSER_MAX_PREPARATION_ATTEMPTS) {
+			return { block: true, blockReason: "Browser preparation was repeated without producing a target. Continue with available static evidence." };
+		}
+		guard.preparationAttempts = Number(guard.preparationAttempts || 0) + 1;
 		return { state: guard };
 	}
-	if (!guard.startedAt && action === "open") {
+	if (action === "open") {
+		if (Number(guard.openAttempts || 0) >= REVIEW_BROWSER_MAX_OPEN_ATTEMPTS) {
+			return { block: true, blockReason: "Browser target opening was repeated without usable evidence. Continue with available static evidence." };
+		}
+		guard.openAttempts = Number(guard.openAttempts || 0) + 1;
+		guard.attempts = Number(guard.attempts || 0) + 1;
 		guard.pendingOpen = true;
 		guard.pendingTarget = browserToolTargetUrl(event);
 		return { state: guard };
@@ -1959,14 +2037,24 @@ function reviewerBrowserToolDecision(envelope, event, state, now = Date.now()) {
 			blockReason: "Open the verification target before inspecting it, or continue immediately with static review.",
 		};
 	}
-  if (now - guard.startedAt >= REVIEW_BROWSER_WINDOW_MS || Number(guard.calls || 0) >= REVIEW_BROWSER_MAX_CALLS) {
+	if (
+		guard.circuitOpen === true ||
+		now - guard.startedAt >= REVIEW_BROWSER_WINDOW_MS ||
+		Number(guard.calls || 0) >= REVIEW_BROWSER_MAX_CALLS ||
+		Number(guard.attempts || 0) >= REVIEW_BROWSER_MAX_ATTEMPTS
+	) {
     return {
       block: true,
       blockReason: "The single brief Browser verification budget is exhausted. Continue immediately with static review.",
     };
-  }
-  guard.calls = Number(guard.calls || 0) + 1;
+	}
+	guard.attempts = Number(guard.attempts || 0) + 1;
   return { state: guard };
+}
+
+function browserFailureFingerprint(action, event) {
+	const detail = trim(event?.error || event?.result?.error || event?.output?.error || event?.result?.message || event?.output?.message);
+	return createHash("sha256").update((action || "browser") + "\n" + detail.slice(0, 1000)).digest("hex");
 }
 
 function reviewerBrowserToolResultDecision(envelope, event, state, now = Date.now()) {
@@ -1975,34 +2063,54 @@ function reviewerBrowserToolResultDecision(envelope, event, state, now = Date.no
 	}
 	const guard = state || {};
 	const action = browserToolAction(event);
-	if (REVIEW_BROWSER_PREPARATION_ACTIONS.has(action)) return guard;
+	if (REVIEW_BROWSER_PREPARATION_ACTIONS.has(action)) {
+		if (browserToolCallFailed(event)) {
+			guard.lastFailureAction = action || "browser";
+			guard.lastFailure = trim(event?.error || event?.result?.error || event?.output?.error) || "browser_preparation_failed";
+			guard.lastObservedAt = now;
+		}
+		return guard;
+	}
 	if (browserToolCallFailed(event) || Number(event?.durationMs || event?.result?.durationMs || 0) >= REVIEW_BROWSER_WINDOW_MS) {
 		guard.lastFailureAction = action || "browser";
 		guard.lastFailure = trim(event?.error || event?.result?.error || event?.output?.error) || "browser_tool_failed";
 		guard.lastObservedAt = now;
 		guard.pendingOpen = false;
-		guard.calls = REVIEW_BROWSER_MAX_CALLS;
-		guard.startedAt = guard.startedAt || now;
+		guard.consecutiveFailures = Number(guard.consecutiveFailures || 0) + 1;
+		const fingerprint = browserFailureFingerprint(action, event);
+		guard.sameFailureCount = guard.lastFailureFingerprint === fingerprint ? Number(guard.sameFailureCount || 0) + 1 : 1;
+		guard.lastFailureFingerprint = fingerprint;
+		guard.circuitOpen =
+			guard.consecutiveFailures >= REVIEW_BROWSER_MAX_CONSECUTIVE_FAILURES ||
+			guard.sameFailureCount >= REVIEW_BROWSER_MAX_SAME_FAILURES ||
+			Number(guard.attempts || 0) >= REVIEW_BROWSER_MAX_ATTEMPTS;
 		return guard;
 	}
 	if (action === "open") {
 		guard.pendingOpen = false;
-		guard.startedAt = now;
+		guard.startedAt = guard.startedAt || now;
 		// Opening the managed target establishes the verification session; it is
 		// preparation, not evidence. Reserve the bounded evidence budget for the
 		// actual snapshot/evaluate/interaction sequence.
-		guard.calls = 0;
+		guard.calls = Number(guard.calls || 0);
 		guard.targetUrl = browserToolTargetUrl(event) || guard.pendingTarget || verificationTargetUrl(envelope) || guard.targetUrl;
 		guard.managedPreviewOpened = isManagedInteractivePreviewUrl(guard.targetUrl);
 		guard.targetId = trim(event?.result?.targetId || event?.output?.targetId || event?.targetId) || guard.targetId;
 		guard.lastSuccessfulAction = "open";
 		guard.lastObservedAt = now;
+		guard.consecutiveFailures = 0;
+		guard.sameFailureCount = 0;
+		guard.circuitOpen = false;
 		delete guard.pendingTarget;
-	} else if (guard.managedPreviewOpened && REVIEW_BROWSER_EVIDENCE_ACTIONS.has(action)) {
-		guard.managedPreviewInspected = true;
+	} else if (REVIEW_BROWSER_EVIDENCE_ACTIONS.has(action)) {
+		guard.calls = Number(guard.calls || 0) + 1;
+		if (guard.managedPreviewOpened) guard.managedPreviewInspected = true;
 		guard.targetId = trim(event?.result?.targetId || event?.output?.targetId || event?.targetId) || guard.targetId;
 		guard.lastSuccessfulAction = action;
 		guard.lastObservedAt = now;
+		guard.consecutiveFailures = 0;
+		guard.sameFailureCount = 0;
+		guard.circuitOpen = false;
 	}
 	return guard;
 }
@@ -2067,6 +2175,40 @@ function reviewerBrowserGuardKey(envelope, event, ctx) {
   return [run, root, assignment].join("|");
 }
 
+function browserHookContextKey(event, ctx) {
+	return trim(
+		event?.toolCallId || event?.tool_call_id || event?.callId || event?.id ||
+		ctx?.toolCallId || ctx?.callId || ctx?.runId || ctx?.sessionKey || ctx?.sessionId,
+	);
+}
+
+function browserEnvelopeSnapshot(envelope) {
+	if (!envelope || typeof envelope !== "object") return null;
+	try {
+		return JSON.parse(JSON.stringify(envelope));
+	} catch {
+		return {
+			rootTaskId: trim(envelope.rootTaskId || envelope.taskId),
+			taskId: trim(envelope.taskId),
+			assignmentId: trim(envelope.assignmentId || envelope.workId),
+			workId: trim(envelope.workId || envelope.assignmentId),
+			revision: envelope.revision,
+			role: envelope.role,
+			effectiveRole: envelope.effectiveRole,
+			profileKey: envelope.profileKey,
+			validationAssignment: envelope.validationAssignment,
+			validationTargetAssignmentId: envelope.validationTargetAssignmentId,
+		};
+	}
+}
+
+function browserEnvelopeMatches(left, right) {
+	if (!left || !right) return false;
+	return preferredRootTaskId(left.rootTaskId, left.taskId) === preferredRootTaskId(right.rootTaskId, right.taskId) &&
+		trim(left.assignmentId || left.workId) === trim(right.assignmentId || right.workId) &&
+		Math.max(1, intFrom(left.revision, 1)) === Math.max(1, intFrom(right.revision, 1));
+}
+
 function browserToolCallFailed(event) {
   if (
     trim(event?.error) ||
@@ -2103,15 +2245,18 @@ function teamProcessToolDecision(envelope, event) {
 		event?.params?.command || event?.params?.cmd || event?.arguments?.command || event?.input?.command,
 	);
 	if (!command) return {};
+	const isolatedRuntime = ["pro", "desktop"].includes(trim(
+		envelope?.instanceMode || envelope?.instance_mode || process.env.CLAWMANAGER_INSTANCE_MODE,
+	).toLowerCase());
 	const rules = [
 		{ pattern: /(^|[;&|\s])(?:sudo\s+)?(?:pkill|killall)(?:\s|$)/i, reason: "broad process-name termination" },
 		{ pattern: /(^|[;&|\s])(?:sudo\s+)?fuser\b[^\r\n;&|]*\s-k(?:\s|$)/i, reason: "port-wide process termination" },
-		{ pattern: /\b(?:chromium|chromium-browser|google-chrome|chrome)\b[^\r\n;&|]*--remote-debugging-port(?:=|\s)/i, reason: "an unmanaged Browser/CDP process" },
-		{ pattern: /\bpython(?:3)?\s+-m\s+(?:http\.server|SimpleHTTPServer)\b/i, reason: "a temporary file server" },
-		{ pattern: /\b(?:npx\s+)?(?:http-server|serve)\b[^\r\n;&|]*(?:\s\.?(?:\s|$)|--listen|-l\s)/i, reason: "a temporary file server" },
-		{ pattern: /\bbusybox\s+httpd\b/i, reason: "a temporary file server" },
+		{ sharedOnly: true, pattern: /\b(?:chromium|chromium-browser|google-chrome|chrome)\b[^\r\n;&|]*--remote-debugging-port(?:=|\s)/i, reason: "an unmanaged Browser/CDP process" },
+		{ sharedOnly: true, pattern: /\bpython(?:3)?\s+-m\s+(?:http\.server|SimpleHTTPServer)\b/i, reason: "a temporary file server" },
+		{ sharedOnly: true, pattern: /\b(?:npx\s+)?(?:http-server|serve)\b[^\r\n;&|]*(?:\s\.?(?:\s|$)|--listen|-l\s)/i, reason: "a temporary file server" },
+		{ sharedOnly: true, pattern: /\bbusybox\s+httpd\b/i, reason: "a temporary file server" },
 	];
-	const matched = rules.find((rule) => rule.pattern.test(command));
+	const matched = rules.find((rule) => (!rule.sharedOnly || !isolatedRuntime) && rule.pattern.test(command));
 	if (!matched) return {};
 	return {
 		block: true,
@@ -4110,13 +4255,16 @@ function createRuntime(api) {
   async function sendWithConfig(cfg, params) {
     params = params || {};
     if (!cfg.enabled) throw new Error("Redis Team channel is disabled");
-    if (!cfg.redisUrl || !cfg.memberId || !hasRequiredRedisTeamKeys(cfg))
-      throw new Error("Redis Team env is incomplete");
     await ensureDirs(cfg);
+		const normalized = await normalizeTeamSendParams(cfg, params, activeEnvelope);
+		if (normalized.error) return normalized.error;
+		params = normalized.params;
+		if (!cfg.redisUrl || !cfg.memberId || !hasRequiredRedisTeamKeys(cfg))
+			throw new Error("Redis Team env is incomplete");
 
     const target = await resolveRedisTeamTarget(cfg, params.to);
     const status = await readStatuses(cfg, cfg.memberId);
-    const requestedTaskId = trim(params.taskId);
+		const requestedTaskId = trim(params.taskId || params.task_id);
     const title = trim(params.title) || "Team Message";
     const text = trim(params.text) || trim(params.prompt) || "";
     const statusIsActive =
@@ -4156,7 +4304,7 @@ function createRuntime(api) {
       activeEnvelope?.rootMessageId ||
       activeEnvelope?.messageId ||
       textRootMessageId;
-    const explicitWorkId = trim(params.workId) || trim(params.assignmentId);
+		const explicitWorkId = trim(params.workId || params.work_id) || trim(params.assignmentId || params.assignment_id);
     const preserveInboundAssignment =
       !explicitWorkId &&
       isLeaderMediatedRoster(roster) &&
@@ -4173,8 +4321,8 @@ function createRuntime(api) {
             text,
           }));
     const assignmentId =
-      trim(params.assignmentId) ||
-      trim(params.workId) ||
+			trim(params.assignmentId || params.assignment_id) ||
+			trim(params.workId || params.work_id) ||
       (preserveInboundAssignment
         ? trim(inferredEnvelope?.assignmentId) || trim(inferredEnvelope?.workId)
         : workId);
@@ -4260,7 +4408,7 @@ function createRuntime(api) {
       !!reviewedAssignmentId,
     );
     const dependsOn = [...new Set([
-      ...(Array.isArray(params.dependsOn) ? params.dependsOn : []),
+			...(Array.isArray(params.dependsOn) ? params.dependsOn : trim(params.dependsOn) ? [params.dependsOn] : []),
       reviewedAssignmentId,
     ].map(trim).filter(Boolean))];
     const message = {
@@ -4531,20 +4679,33 @@ function createRuntime(api) {
 		},
 
     beforeBrowserToolCall(event, state, now) {
-      return reviewerBrowserToolDecision(activeEnvelope, event, state, now);
+			const guard = state || {};
+			guard.boundEnvelope = guard.boundEnvelope || browserEnvelopeSnapshot(activeEnvelope);
+      return reviewerBrowserToolDecision(guard.boundEnvelope || activeEnvelope, event, guard, now);
     },
 
 		async afterBrowserToolCall(event, state, now) {
-			const next = reviewerBrowserToolResultDecision(activeEnvelope, event, state, now);
-			if (["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(activeEnvelope))) {
-				const envelope = activeEnvelope;
-				activeReviewVerification = mergeBrowserVerificationState(activeReviewVerification, next, {
+			const envelope = state?.boundEnvelope || activeEnvelope;
+			const next = reviewerBrowserToolResultDecision(envelope, event, state, now);
+			if (["evidence", "code-review"].includes(resolveRedisTeamVerificationRole(envelope))) {
+				const verification = mergeBrowserVerificationState(state?.verification, next, {
 					targetHash: next.targetUrl
 						? createHash("sha256").update(next.targetUrl).digest("hex")
-						: activeReviewVerification?.targetHash,
+						: state?.verification?.targetHash,
 				});
+				next.verification = verification;
 				const cfg = readChannelConfig(runtimeApi.config || {});
-				queueActiveReviewPersistence(cfg, envelope, activeReviewVerification);
+				if (browserEnvelopeMatches(activeEnvelope, envelope)) {
+					activeReviewVerification = mergeBrowserVerificationState(activeReviewVerification, verification);
+				}
+				if (cfg.redisUrl && envelope && hasRequiredRedisTeamKeys(cfg)) {
+					try {
+						await withRedis(cfg, null, (redis) => recordTurnFacts(redis, cfg, envelope, { browserVerification: verification }));
+					} catch (err) {
+						next.verification = mergeBrowserVerificationState(verification, { evidenceIncomplete: true });
+						runtimeApi?.logger?.warn?.("redis-team: durable Browser evidence projection failed: " + (err?.message || String(err)));
+					}
+				}
 			}
 			return next;
 		},
@@ -5422,30 +5583,46 @@ async function startConsumer(cfg, onMessage, onProcessingFailure, log) {
 const teamSendParameters = {
   type: "object",
   additionalProperties: false,
-  required: ["to", "text"],
   properties: {
     to: { type: "string", description: "Recipient member ID or 'broadcast'" },
+		recipient: { type: "string", description: "Compatibility alias for to" },
+		targetMemberId: { type: "string", description: "Compatibility alias for to" },
+		target_member_id: { type: "string", description: "Compatibility alias for to" },
     text: { type: "string", description: "Message content" },
+		message: { type: "string", description: "Compatibility alias for text" },
+		prompt: { type: "string", description: "Compatibility alias for text" },
     intent: { type: "string", description: "Message intent" },
     taskId: { type: "string" },
+		task_id: { type: "string" },
     rootTaskId: { type: "string", description: "Root ClawManager task ID that this assignment belongs to" },
+		root_task_id: { type: "string" },
     rootMessageId: { type: "string", description: "Root ClawManager message ID that this assignment belongs to" },
+		root_message_id: { type: "string" },
     workId: { type: "string", description: "Stable business work item ID within the root task" },
+		work_id: { type: "string" },
     assignmentId: { type: "string", description: "Stable assignment ID; defaults to workId" },
+		assignment_id: { type: "string" },
     phaseId: { type: "string", description: "Structured workflow phase ID" },
-    revision: { type: "number", minimum: 1, description: "Assignment/artifact revision" },
+		phase_id: { type: "string" },
+		revision: { anyOf: [{ type: "number", minimum: 1 }, { type: "string", pattern: "^[1-9][0-9]*$" }], description: "Assignment/artifact revision" },
     required: { type: "boolean", description: "Whether this assignment blocks root completion" },
 	reviewRequired: { type: "boolean", description: "Set true on production-only work that has a downstream validator; tell the producer to hand off without self-testing" },
+		review_required: { anyOf: [{ type: "boolean" }, { type: "string", enum: ["true", "false"] }] },
     validationRequired: { type: "boolean", description: "Whether the target assignment requires a separate validation result before root completion" },
+		validation_required: { anyOf: [{ type: "boolean" }, { type: "string", enum: ["true", "false"] }] },
 	validationAssignment: { type: "boolean", description: "Marks this assignment as test/review/evidence work; any member role may validate and several validators may run in parallel" },
+		validation_assignment: { anyOf: [{ type: "boolean" }, { type: "string", enum: ["true", "false"] }] },
     validationTargetAssignmentId: { type: "string", description: "Existing business assignment this validator must check" },
+		validation_target_assignment_id: { type: "string" },
     validationTargetRevision: { type: "number", minimum: 1, description: "Exact target revision this validator must check" },
+		validation_target_revision: { anyOf: [{ type: "number", minimum: 1 }, { type: "string", pattern: "^[1-9][0-9]*$" }] },
     reviewedAssignmentId: { type: "string", description: "Legacy alias for validationTargetAssignmentId" },
     reviewedRevision: { type: "number", minimum: 1, description: "Legacy alias for validationTargetRevision" },
     verificationUrl: { type: "string", description: "Optional directly reachable HTTP(S) URL for one brief Browser check" },
+		verification_url: { type: "string" },
     planVersion: { type: "number", minimum: 0 },
     ledgerVersion: { type: "number", minimum: 0 },
-    dependsOn: { type: "array", items: { type: "string" } },
+    dependsOn: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "string" }] },
     title: { type: "string" },
     contextRefs: { type: "array", items: { type: "string" } },
     ttlSeconds: { type: "number", minimum: 1 },
@@ -5662,6 +5839,7 @@ export default definePluginEntry({
     const runtime = createRuntime(api);
     const consumerHandles = new Map();
     const reviewerBrowserGuards = new Map();
+		const reviewerBrowserGuardKeysByCall = new Map();
 		try {
 			api.on(
 				"before_message_write",
@@ -5684,6 +5862,8 @@ export default definePluginEntry({
 				if (processDecision.block) return processDecision;
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
 				const guardKey = runtime.browserGuardKey(event, ctx);
+				const callKey = browserHookContextKey(event, ctx);
+				if (callKey) reviewerBrowserGuardKeysByCall.set(callKey, guardKey);
         const current = reviewerBrowserGuards.get(guardKey) || { calls: 0, startedAt: 0 };
         const decision = runtime.beforeBrowserToolCall(event, current, Date.now());
         if (decision?.state) reviewerBrowserGuards.set(guardKey, decision.state);
@@ -5703,7 +5883,9 @@ export default definePluginEntry({
       "after_tool_call",
       async (event, ctx) => {
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
-				const guardKey = runtime.browserGuardKey(event, ctx);
+				const callKey = browserHookContextKey(event, ctx);
+				const guardKey = (callKey && reviewerBrowserGuardKeysByCall.get(callKey)) || runtime.browserGuardKey(event, ctx);
+				if (callKey) reviewerBrowserGuardKeysByCall.delete(callKey);
         const current = reviewerBrowserGuards.get(guardKey);
         if (!current) return;
 			reviewerBrowserGuards.set(guardKey, await runtime.afterBrowserToolCall(event, current, Date.now()));
@@ -5767,7 +5949,9 @@ export default definePluginEntry({
       description: "Send a message to another team member via Redis Streams.",
       parameters: teamSendParameters,
       async execute(_id, params) {
-        return { content: [{ type: "text", text: JSON.stringify({ ok: true, sent: await runtime.send(params || {}) }, null, 2) }] };
+				const sent = await runtime.send(params || {});
+				const payload = sent?.ok === false ? sent : { ok: true, sent };
+        return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
       },
     });
     api.registerTool({
