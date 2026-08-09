@@ -2693,6 +2693,10 @@ function runtimeSessionDirectories() {
   return [...new Set(roots.filter(Boolean))];
 }
 
+function normalizedSessionContentType(value) {
+  return trim(value).toLowerCase().replace(/[-_]/g, "");
+}
+
 function sessionActivityKind(record) {
   if (!record || typeof record !== "object") return { kind: "session_event", toolName: "" };
   const message = record.message && typeof record.message === "object" ? record.message : record;
@@ -2702,9 +2706,9 @@ function sessionActivityKind(record) {
     : Array.isArray(record.content)
       ? record.content
       : [];
-  const contentTypes = content.map((entry) => trim(entry?.type || entry?.kind).toLowerCase());
+  const contentTypes = content.map((entry) => normalizedSessionContentType(entry?.type || entry?.kind));
   const toolEntry = content.find((entry) =>
-    ["tool_use", "tool_call", "function_call"].includes(trim(entry?.type || entry?.kind).toLowerCase()),
+    ["tooluse", "toolcall", "functioncall"].includes(normalizedSessionContentType(entry?.type || entry?.kind)),
   );
   const toolName = trim(
     toolEntry?.name ||
@@ -2713,10 +2717,10 @@ function sessionActivityKind(record) {
       record.tool_name ||
       record.data?.toolName,
   );
-  if (role === "tool" || contentTypes.some((type) => ["tool_result", "function_result"].includes(type))) {
+  if (["tool", "toolresult", "tool_result"].includes(role) || contentTypes.some((type) => ["toolresult", "functionresult"].includes(type))) {
     return { kind: "tool_result", toolName };
   }
-  if (contentTypes.some((type) => ["tool_use", "tool_call", "function_call"].includes(type))) {
+  if (contentTypes.some((type) => ["tooluse", "toolcall", "functioncall"].includes(type))) {
     return { kind: "tool_call", toolName };
   }
   if (role === "assistant") return { kind: "assistant_message", toolName: "" };
@@ -2734,13 +2738,31 @@ async function latestRuntimeSessionActivity(sinceMs = 0) {
         if (latest && latest.mtimeMs >= stat.mtimeMs) continue;
         const tail = await readTextTail(file, 96 * 1024);
         let lastRecord = null;
-        for (const line of tail.split(/\r?\n/).reverse()) {
+        let lastAssistantText = "";
+        let lastAssistantAt = "";
+        let lastToolOutcome = null;
+        let lastToolAt = "";
+        const toolCalls = new Map();
+        for (const line of tail.split(/\r?\n/)) {
           if (!line.trim()) continue;
           try {
-            lastRecord = JSON.parse(line);
-            break;
+            const record = JSON.parse(line);
+            const recordMs = sessionRecordTimestampMs(record);
+            if (sinceMs > 0 && recordMs > 0 && recordMs + 1000 < sinceMs) continue;
+            lastRecord = record;
+            const assistantText = normalizeAssistantSessionText(assistantTextFromRecord(record));
+            if (assistantText) {
+              lastAssistantText = assistantText.slice(0, 4000);
+              lastAssistantAt = recordMs > 0 ? new Date(recordMs).toISOString() : "";
+            }
+            const toolOutcome = sessionToolOutcome(record, toolCalls);
+            if (toolOutcome) {
+              lastToolOutcome = toolOutcome;
+              lastToolAt = recordMs > 0 ? new Date(recordMs).toISOString() : "";
+            }
           } catch {}
         }
+        if (!lastRecord) continue;
         const classification = sessionActivityKind(lastRecord);
         const recordMs = sessionRecordTimestampMs(lastRecord);
         latest = {
@@ -2749,6 +2771,11 @@ async function latestRuntimeSessionActivity(sinceMs = 0) {
           sessionCursor: [path.basename(file), stat.size, Math.trunc(stat.mtimeMs)].join(":"),
           lastActivityKind: classification.kind,
           pendingToolName: classification.kind === "tool_call" ? classification.toolName : "",
+          lastAssistantText,
+          lastAssistantAt,
+          lastToolName: trim(lastToolOutcome?.toolName),
+          lastToolFailed: lastToolOutcome?.failed === true,
+          lastToolAt,
         };
       } catch {}
     }
@@ -2772,7 +2799,6 @@ async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }
     await redis.command("CLIENT", "SETNAME", redisClientName(cfg, "activity"));
   } catch {}
   const key = assignmentActivityKey(cfg, rootTaskId, assignmentId);
-	const factsKey = turnFactsKey(cfg, envelope);
   const ttlMs = Math.max(15 * 60 * 1000, policy.softTimeoutSec * 3 * 1000);
   const turnId = trim(envelope.messageId) || "turn_" + randomUUID();
   let stopped = false;
@@ -2797,15 +2823,6 @@ async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }
         else turnState = lastSession ? "running" : "starting";
       }
       const terminal = ["completed", "failed", "cancelled", "lost"].includes(turnState);
-		let durableFacts = {};
-		if (factsKey) {
-			try {
-				const rawFacts = await redis.command("HGETALL", factsKey);
-				for (let index = 0; Array.isArray(rawFacts) && index + 1 < rawFacts.length; index += 2) {
-					durableFacts[String(rawFacts[index])] = rawFacts[index + 1];
-				}
-			} catch {}
-		}
       const snapshot = {
         schemaVersion: 1,
         capability: "assignment_activity_v1",
@@ -2821,11 +2838,11 @@ async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }
         sessionCursor: lastSession?.sessionCursor || "",
         lastActivityKind: lastSession?.lastActivityKind || "",
         pendingToolName: lastSession?.pendingToolName || "",
-		lastAssistantText: trim(durableFacts.lastAssistantText).slice(0, 4000),
-		lastAssistantAt: trim(durableFacts.lastAssistantAt),
-		lastToolName: trim(durableFacts.lastToolName),
-		lastToolFailed: String(durableFacts.lastToolFailed || "") === "1",
-		lastToolAt: trim(durableFacts.lastToolAt),
+        lastAssistantText: trim(lastSession?.lastAssistantText).slice(0, 4000),
+        lastAssistantAt: trim(lastSession?.lastAssistantAt),
+        lastToolName: trim(lastSession?.lastToolName),
+        lastToolFailed: lastSession?.lastToolFailed === true,
+        lastToolAt: trim(lastSession?.lastToolAt),
         terminal,
       };
       await redis.command("SET", key, JSON.stringify(snapshot), "PX", terminal ? 5 * 60 * 1000 : ttlMs);
@@ -2953,17 +2970,17 @@ function sessionToolOutcome(record, toolCalls = new Map()) {
 			? record.content
 			: [];
 	for (const entry of content) {
-		const type = trim(entry?.type || entry?.kind).toLowerCase();
-		if (!["tool_use", "tool_call", "function_call"].includes(type)) continue;
+		const type = normalizedSessionContentType(entry?.type || entry?.kind);
+		if (!["tooluse", "toolcall", "functioncall"].includes(type)) continue;
 		const callId = trim(entry.id || entry.toolCallId || entry.tool_call_id || entry.call_id);
 		const toolName = trim(entry.name || entry.toolName || entry.tool_name);
 		if (callId && toolName) toolCalls.set(callId, toolName);
 	}
 	const role = trim(message.role || record.role || record.data?.role).toLowerCase();
 	const resultEntry = content.find((entry) =>
-		["tool_result", "function_result"].includes(trim(entry?.type || entry?.kind).toLowerCase()),
+		["toolresult", "functionresult"].includes(normalizedSessionContentType(entry?.type || entry?.kind)),
 	);
-	if (role !== "tool" && !resultEntry) return null;
+	if (!["tool", "toolresult", "tool_result"].includes(role) && !resultEntry) return null;
 	const toolCallId = trim(
 		resultEntry?.tool_use_id || resultEntry?.toolCallId || resultEntry?.tool_call_id || resultEntry?.call_id ||
 		message.tool_call_id || message.toolCallId || record.tool_call_id || record.toolCallId,
@@ -3131,28 +3148,6 @@ async function recordTurnFacts(redis, cfg, envelope, facts = {}) {
     }
 		if (facts.browserVerification && typeof facts.browserVerification === "object") {
 			await redis.command("HSET", factsKey, "browserVerification", JSON.stringify(facts.browserVerification));
-		}
-		if (trim(facts.lastAssistantText)) {
-			await redis.command(
-				"HSET",
-				factsKey,
-				"lastAssistantText",
-				trim(facts.lastAssistantText).slice(0, 4000),
-				"lastAssistantAt",
-				trim(facts.lastAssistantAt) || nowIso(),
-			);
-		}
-		if (trim(facts.lastToolName)) {
-			await redis.command(
-				"HSET",
-				factsKey,
-				"lastToolName",
-				trim(facts.lastToolName),
-				"lastToolFailed",
-				facts.lastToolFailed === true ? "1" : "0",
-				"lastToolAt",
-				trim(facts.lastToolAt) || nowIso(),
-			);
 		}
     const refs = Array.isArray(facts.artifactRefs) ? facts.artifactRefs.map(trim).filter(Boolean) : [];
     if (refs.length) {
@@ -3904,20 +3899,9 @@ function createRuntime(api) {
   let activeTaskCompleted = false;
   let activeTaskCompletionPending = false;
   let lastOutbound = null;
-  let activeArtifactRefs = [];
-  let activeReviewVerification = null;
+	let activeArtifactRefs = [];
+	let activeReviewVerification = null;
 	let activeReviewPersistenceQueue = Promise.resolve();
-	let activityEvidencePersistenceQueue = Promise.resolve();
-
-	function queueActivityEvidence(cfg, envelope, facts) {
-		if (!cfg?.redisUrl || !envelope || !hasRequiredRedisTeamKeys(cfg)) return Promise.resolve();
-		activityEvidencePersistenceQueue = activityEvidencePersistenceQueue
-			.then(() => withRedis(cfg, null, (redis) => recordTurnFacts(redis, cfg, envelope, facts)))
-			.catch((err) => {
-				runtimeApi?.logger?.warn?.("redis-team: activity evidence persistence failed: " + (err?.message || String(err)));
-			});
-		return activityEvidencePersistenceQueue;
-	}
 	let activeReviewPersistenceFailed = false;
 	const narrativeProjectionStorage = new AsyncLocalStorage();
 	const activeNarrativeProjections = new Set();
@@ -3970,7 +3954,7 @@ function createRuntime(api) {
 	function enqueueAssistantSessionNarrative(event, ctx = {}) {
 		const projection = narrativeProjectionForContext(event, ctx);
 		const emitter = projection?.emitter;
-		if (!projection?.envelope || projection.terminalSubmitted) return;
+		if (!emitter || !projection.envelope || projection.terminalSubmitted) return;
 		const narrativeText = normalizeAssistantSessionText(assistantTextFromRecord(event));
 		if (!narrativeText) return;
 		const message = event?.message && typeof event.message === "object" ? event.message : {};
@@ -3980,24 +3964,13 @@ function createRuntime(api) {
 			[hookSessionKey(event, ctx), sourceSequence].filter(Boolean).join(":");
 		const contentHash = createHash("sha256").update(narrativeText).digest("hex");
 		projection.queue = projection.queue
-			.then(async () => {
-				if (projection.cfg?.redisUrl) {
-					await queueActivityEvidence(projection.cfg, projection.envelope, {
-						lastAssistantText: narrativeText,
-						lastAssistantAt: new Date(sourceTimestampMs).toISOString(),
-					});
-				}
-				if (emitter) {
-					return emitter(narrativeText, "before_message_write", {}, {
-						contentHash,
-						sourceOccurredAt: new Date(sourceTimestampMs).toISOString(),
-						sourceSequence,
-						sourceRecordId: sourceRecordId || undefined,
-						lateProjection: false,
-					});
-				}
-				return false;
-			})
+			.then(() => emitter(narrativeText, "before_message_write", {}, {
+				contentHash,
+				sourceOccurredAt: new Date(sourceTimestampMs).toISOString(),
+				sourceSequence,
+				sourceRecordId: sourceRecordId || undefined,
+				lateProjection: false,
+			}))
 			.catch((err) => {
 				runtimeApi?.logger?.warn?.("redis-team: live assistant narrative projection failed: " + (err?.message || String(err)));
 			});
@@ -5083,7 +5056,6 @@ function createRuntime(api) {
 		async withNarrativeProjection(envelope, emitter, fn) {
 			const projection = {
 				envelope,
-				cfg: readChannelConfig(runtimeApi.config || {}),
 				emitter: typeof emitter === "function" ? emitter : null,
 				queue: Promise.resolve(),
 				sequence: 0,
@@ -6334,15 +6306,6 @@ export default definePluginEntry({
     api.on(
       "before_tool_call",
       async (event, ctx) => {
-				const observedEnvelope = runtime.currentActiveEnvelope();
-				const observedCfg = readChannelConfig(runtimeApi.config || {});
-				if (observedEnvelope && observedCfg.redisUrl) {
-					queueActivityEvidence(observedCfg, observedEnvelope, {
-						lastToolName: trim(event?.toolName),
-						lastToolFailed: false,
-						lastToolAt: nowIso(),
-					});
-				}
 				const processDecision = teamProcessToolDecision(runtime.currentActiveEnvelope(), event);
 				if (processDecision.block) return processDecision;
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
@@ -6370,15 +6333,6 @@ export default definePluginEntry({
     api.on(
       "after_tool_call",
       async (event, ctx) => {
-				const observedEnvelope = runtime.currentActiveEnvelope();
-				const observedCfg = readChannelConfig(runtimeApi.config || {});
-				if (observedEnvelope && observedCfg.redisUrl) {
-					queueActivityEvidence(observedCfg, observedEnvelope, {
-						lastToolName: trim(event?.toolName),
-						lastToolFailed: !!event?.error || event?.isError === true || event?.is_error === true,
-						lastToolAt: nowIso(),
-					});
-				}
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
 				const callKey = browserHookContextKey(event, ctx);
 				const guardKey = (callKey && reviewerBrowserGuardKeysByCall.get(callKey)) || runtime.browserGuardKey(event, ctx);

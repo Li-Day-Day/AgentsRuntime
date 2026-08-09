@@ -8,7 +8,7 @@ const distPath = path.resolve(import.meta.dirname, "..", "dist", "index.js");
 const source = (await fs.readFile(distPath, "utf8"))
   .replace('import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";', 'const definePluginEntry = (entry) => entry;')
   .replace('import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/direct-dm";', 'const dispatchInboundDirectDmWithRuntime = async () => ({});');
-const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, normalizeTeamSendParams, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, inferCanonicalArtifactWriteContract, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, browserToolResultUrl, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readLastToolOutcomeFromDispatch, completionProposalProvenance, validationRevisionDirectory, equivalentActiveAssignment, equivalentWorkflowAttempt };\n";
+const testSource = source + "\nexport { createRuntime, normalizeEnvelope, normalizePhaseDispositions, appendRedisTeamCompletionGuidance, appendLeaderTeamContext, turnFinishedWithoutCompletionEvent, assignmentAttemptFailedEvent, isIncompleteTurnDelivery, activeMemberRouting, mergeActiveTurnFacts, normalizeRedisTeamTarget, resolveRedisTeamTarget, normalizeTeamSendParams, canonicalArtifactAlias, canonicalTeamArtifactRefsFromText, inferCanonicalArtifactWriteContract, mergeTaskEnvelopeArtifactContext, sharedWorkspaceForTarget, lateNarrativeProjectionMeta, normalizeAssistantSessionText, assistantSessionNarrativesForProjection, verificationTargetUrl, reviewerBrowserToolDecision, reviewerBrowserToolResultDecision, reviewerBrowserGuardKey, browserVerificationForCompletion, mergeBrowserVerificationState, browserToolCallFailed, browserToolResultUrl, teamProcessToolDecision, assignmentHasIndependentReview, rootWorkflowStateIsTerminal, previewUrlForTeamArtifact, sessionToolOutcome, readLastToolOutcomeFromDispatch, latestRuntimeSessionActivity, completionProposalProvenance, validationRevisionDirectory, equivalentActiveAssignment, equivalentWorkflowAttempt };\n";
 const pluginModule = await import(`data:text/javascript;base64,${Buffer.from(testSource).toString("base64")}`);
 const plugin = pluginModule.default;
 
@@ -23,6 +23,7 @@ process.env.CLAWMANAGER_BROWSER_PROXY_URL = "http://clawmanager-egress-proxy.cla
 
 function createHarness(memberId, role) {
   const registered = new Map();
+  const hooks = new Map();
   const config = {
     channels: {
       "redis-team": {
@@ -44,9 +45,13 @@ function createHarness(memberId, role) {
     registerTool(tool) {
       registered.set(tool.name, tool);
     },
-    on() {},
+    on(name, handler) {
+      if (!hooks.has(name)) hooks.set(name, []);
+      hooks.get(name).push(handler);
+    },
     registerChannel() {},
   });
+  registered.hooks = hooks;
   return registered;
 }
 
@@ -90,6 +95,99 @@ function resultContentHash(content, refs) {
 
 try {
   await fs.mkdir(shared, { recursive: true });
+	const hookHarness = createHarness("hook-member", "developer");
+	const beforeToolHooks = hookHarness.hooks.get("before_tool_call") || [];
+	const afterToolHooks = hookHarness.hooks.get("after_tool_call") || [];
+	assert.ok(beforeToolHooks.length > 0, "the real plugin entry registers before_tool_call");
+	assert.ok(afterToolHooks.length > 0, "the real plugin entry registers after_tool_call");
+	for (const toolName of [
+		"read",
+		"exec",
+		"team_artifact_write",
+		"team_artifact_read",
+		"team_artifact_list",
+		"team_send",
+		"team_update_progress",
+		"team_complete_task",
+		"browser",
+	]) {
+		const event = {
+			toolName,
+			params: toolName === "exec"
+				? { command: "pwd" }
+				: toolName === "browser"
+					? { action: "status" }
+					: {},
+		};
+		for (const hook of beforeToolHooks) await hook(event, { sessionKey: "agent:main:test" });
+		for (const hook of afterToolHooks) await hook({ ...event, result: { ok: true } }, { sessionKey: "agent:main:test" });
+	}
+
+	const previousHome = process.env.HOME;
+	try {
+		const activityHome = path.join(root, "activity-home");
+		const sessionsDir = path.join(activityHome, ".openclaw", "agents", "main", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		process.env.HOME = activityHome;
+		const sessionFile = path.join(sessionsDir, "real-openclaw-shape.jsonl");
+		const startedAt = Date.now() - 1000;
+		const assistantAt = new Date().toISOString();
+		const resultAt = new Date(Date.now() + 1).toISOString();
+		await fs.writeFile(sessionFile, [
+			JSON.stringify({
+				type: "message",
+				id: "assistant-real-shape",
+				timestamp: assistantAt,
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "text", text: "正在写入协作计划。" },
+						{ type: "toolCall", id: "call-real-shape", name: "team_artifact_write", arguments: {} },
+					],
+				},
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "tool-result-real-shape",
+				timestamp: resultAt,
+				message: {
+					role: "toolResult",
+					toolCallId: "call-real-shape",
+					toolName: "team_artifact_write",
+					content: [{ type: "text", text: "tool failed" }],
+					isError: true,
+				},
+			}),
+		].join("\n") + "\n", "utf8");
+		const completedActivity = await pluginModule.latestRuntimeSessionActivity(startedAt);
+		assert.equal(completedActivity.lastActivityKind, "tool_result", "camelCase OpenClaw toolResult is observed");
+		assert.equal(completedActivity.lastAssistantText, "正在写入协作计划。");
+		assert.equal(completedActivity.lastToolName, "team_artifact_write");
+		assert.equal(completedActivity.lastToolFailed, true);
+		assert.equal(completedActivity.pendingToolName, "");
+
+		await fs.appendFile(sessionFile, JSON.stringify({
+			type: "message",
+			id: "assistant-pending-real-shape",
+			timestamp: new Date(Date.now() + 2).toISOString(),
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "text", text: "现在派发任务。" },
+					{ type: "toolCall", id: "call-pending", name: "team_send", arguments: {} },
+				],
+			},
+		}) + "\n", "utf8");
+		const pendingActivity = await pluginModule.latestRuntimeSessionActivity(startedAt);
+		assert.equal(pendingActivity.lastActivityKind, "tool_call", "camelCase OpenClaw toolCall is observed");
+		assert.equal(pendingActivity.pendingToolName, "team_send");
+		assert.equal(pendingActivity.lastAssistantText, "现在派发任务。");
+		assert.equal(pendingActivity.lastToolName, "team_artifact_write", "the last completed tool remains factual");
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+
 	const liveRuntime = pluginModule.createRuntime({ config: {}, logger: { warn() {} } });
 	const liveNarratives = [];
 	const liveEmitter = async (text, source, media, meta) => {

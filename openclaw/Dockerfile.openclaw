@@ -58,6 +58,7 @@ RUN npm install -g openclaw@2026.7.1-2
 COPY openclaw/patches/patch_browser_proxy_navigation.mjs /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs
 COPY openclaw/patches/test_browser_proxy_navigation.mjs /usr/local/share/openclaw/patches/test_browser_proxy_navigation.mjs
 COPY openclaw/patches/test_browser_proxy_navigation_integration.mjs /usr/local/share/openclaw/patches/test_browser_proxy_navigation_integration.mjs
+COPY openclaw/patches/test_redis_team_plugin_hooks.mjs /usr/local/share/openclaw/patches/test_redis_team_plugin_hooks.mjs
 RUN node /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs --patch \
   && node /usr/local/share/openclaw/patches/patch_browser_proxy_navigation.mjs --verify \
   && node /usr/local/share/openclaw/patches/test_browser_proxy_navigation.mjs \
@@ -97,6 +98,7 @@ RUN sed -i 's/\r$//' /etc/services.d/openclaw-agent/run \
   && HOME=/defaults openclaw plugins install @dingtalk-real-ai/dingtalk-connector@0.8.24 \
   && HOME=/defaults openclaw plugins install @wecom/wecom-openclaw-plugin@2026.7.2-beta.1 \
   && HOME=/defaults openclaw plugins install @openclaw/feishu@2026.7.1 \
+  && cd / \
   && rm -rf /tmp/openclaw-redis-team /tmp/openclaw-plugin-pack \
   && chown -R abc:abc /defaults/.openclaw \
   && chmod 0755 /defaults /defaults/.openclaw \
@@ -114,6 +116,7 @@ RUN sed -i 's/\r$//' /etc/services.d/openclaw-agent/run \
       if [ -e "${legacy_dir}" ]; then chown -R root:root "${legacy_dir}"; fi; \
     done \
   && chown -h root:root /defaults/.openclaw/npm/node_modules/openclaw \
+  && node /usr/local/share/openclaw/patches/test_redis_team_plugin_hooks.mjs \
   && chown -R abc:abc /defaults/.config \
   && mkdir -p /var/lib/openclaw-agent /var/lib/clawmanager-agent /var/log/openclaw-agent /etc/openclaw-agent
 
