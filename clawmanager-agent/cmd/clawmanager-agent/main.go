@@ -76,7 +76,7 @@ func selectMode() agentMode {
 	if runtimeagent.RuntimeAgentModeEnabled() && !instanceRequested {
 		return modeRuntimePod
 	}
-	if instanceRequested && instanceRuntimeAllowed() {
+	if instanceRequested && managedDesktopInstanceAllowed() {
 		return modeInstance
 	}
 	return modeDisabled
@@ -95,16 +95,16 @@ func instanceAgentRequested() bool {
 	return true
 }
 
-// instanceRuntimeAllowed restricts instance mode to products implemented by
-// the shared agent. CLAWMANAGER_RUNTIME_TYPE=desktop|gateway is a backend
-// placement marker and must not reject a supported product runtime.
-func instanceRuntimeAllowed() bool {
+// managedDesktopInstanceAllowed decides whether this image's clawmanager-agent
+// should run Pro instance mode for managed coding-agent desktops.
+// ClawManager uses CLAWMANAGER_RUNTIME_TYPE=desktop|gateway as a backend marker;
+// that must not reject Pro instance mode.
+func managedDesktopInstanceAllowed() bool {
 	product := strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_AGENT_RUNTIME_TYPE")))
 	if product == "" {
 		backend := strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_RUNTIME_TYPE")))
 		switch backend {
 		case "desktop", "gateway":
-			// Backend-only markers from ClawManager; ignore as product type.
 			product = ""
 		default:
 			product = backend
@@ -115,5 +115,10 @@ func instanceRuntimeAllowed() bool {
 		// product-specific CLAWMANAGER_AGENT_RUNTIME_TYPE marker.
 		return true
 	}
-	return product == "hermes" || product == "workbuddy"
+	switch product {
+	case "hermes", "workbuddy", "opencode", "codex", "claude-code":
+		return true
+	default:
+		return false
+	}
 }

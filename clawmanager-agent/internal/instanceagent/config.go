@@ -36,7 +36,7 @@ type Config struct {
 func LoadConfig(version string) (Config, error) {
 	persistentDir := getenv("CLAWMANAGER_AGENT_PERSISTENT_DIR", "/config")
 	instanceID := os.Getenv("CLAWMANAGER_AGENT_INSTANCE_ID")
-	runtimeType := instanceRuntimeType()
+	runtimeType := managedRuntimeType()
 	runtimeCommand, runtimeVersionFile, skillDirs, modelConfigPath := runtimeDefaults(runtimeType)
 
 	cfg := Config{
@@ -50,7 +50,7 @@ func LoadConfig(version string) (Config, error) {
 		PersistentDir:      persistentDir,
 		DiskLimitBytes:     getenvInt64("CLAWMANAGER_AGENT_DISK_LIMIT_BYTES", 0),
 		AgentVersion:       version,
-		RuntimeCommand:     getenv("CLAWMANAGER_AGENT_RUNTIME_COMMAND", getenv("HERMES_COMMAND", runtimeCommand)),
+		RuntimeCommand:     getenv("CLAWMANAGER_AGENT_RUNTIME_COMMAND", getenv("CLAWMANAGER_AGENT_COMMAND", getenv("HERMES_COMMAND", runtimeCommand))),
 		RuntimeVersionFile: getenv("CLAWMANAGER_AGENT_RUNTIME_VERSION_FILE", runtimeVersionFile),
 		HTTPAddr:           normalizeHTTPAddr(firstEnv("CLAWMANAGER_AGENT_HTTP_ADDR", "HERMES_AGENT_HTTP_ADDR")),
 		SkillDirs:          parseSkillDirs(getenv("CLAWMANAGER_AGENT_SKILL_DIRS", getenv("HERMES_SKILL_DIRS", skillDirs))),
@@ -86,17 +86,17 @@ func (c Config) WorkDir() string {
 	if c.RuntimeType == "workbuddy" {
 		return filepath.Join(c.PersistentDir, ".workbuddy", "agent")
 	}
-	return filepath.Join(c.PersistentDir, "hermes-agent")
+	return filepath.Join(c.PersistentDir, c.RuntimeType+"-agent")
 }
 
-func instanceRuntimeType() string {
-	runtimeType := strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_AGENT_RUNTIME_TYPE")))
-	if runtimeType == "" {
-		runtimeType = strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_RUNTIME_TYPE")))
+func managedRuntimeType() string {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_AGENT_RUNTIME_TYPE")))
+	if value == "" || value == "desktop" || value == "gateway" {
+		value = strings.ToLower(strings.TrimSpace(os.Getenv("CLAWMANAGER_RUNTIME_TYPE")))
 	}
-	switch runtimeType {
-	case "workbuddy", "hermes":
-		return runtimeType
+	switch value {
+	case "workbuddy", "opencode", "codex", "claude-code", "hermes":
+		return value
 	default:
 		// Desktop/gateway are backend placement markers used by existing Hermes
 		// deployments, not product runtime names.
@@ -105,10 +105,18 @@ func instanceRuntimeType() string {
 }
 
 func runtimeDefaults(runtimeType string) (command, versionFile, skillDirs, modelConfigPath string) {
-	if runtimeType == "workbuddy" {
+	switch runtimeType {
+	case "workbuddy":
 		return "/opt/workbuddy/electron", "/opt/workbuddy/.workbuddy-linux/build-info.json", "/config/.workbuddy/skills", "/config/.workbuddy/models.json"
+	case "opencode":
+		return "opencode", "", "/config/.opencode/skills", ""
+	case "codex":
+		return "codex", "", "/config/.codex/skills", ""
+	case "claude-code":
+		return "claude", "", "/config/.claude/skills", ""
+	default:
+		return "hermes", "", "/config/hermes/skills:/config/.hermes/skills", ""
 	}
-	return "hermes", "", "/config/hermes/skills:/config/.hermes/skills", ""
 }
 
 func firstEnv(keys ...string) string {
