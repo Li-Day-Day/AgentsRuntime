@@ -94,7 +94,7 @@ try {
     assert.equal(developer.sent, undefined, "a normal dispatch keeps the established message envelope contract");
     assert.equal(Number(await redis.command("XLEN", `${prefix}:inbox:developer`)), 1);
 
-    const deferred = await runtime.send({
+    const dependent = await runtime.send({
       to: "reviewer",
       text: "Review the page after development.",
       intent: "assignment",
@@ -108,12 +108,12 @@ try {
       validationTargetAssignmentId: "dev-page",
       validationTargetRevision: 1,
     });
-    assert.equal(deferred.sent, true);
-    assert.equal(deferred.deferred, true);
-    assert.equal(deferred.deliveryState, "registered_waiting_dependencies");
-    assert.equal(deferred.noWorkerReplyExpectedUntilDependenciesReady, true);
-    assert.match(deferred.leaderGuidance, /Do not resend/);
-    assert.equal(Number(await redis.command("XLEN", `${prefix}:inbox:reviewer`)), 0, "a known dependent assignment is registered without starting the Worker");
+    assert.equal(dependent.sent, true);
+    assert.equal(dependent.deferred, false);
+    assert.equal(dependent.deliveryState, "dispatched_with_dependency_advisory");
+    assert.equal(dependent.dependencyAdvisory.state, "known_waiting");
+    assert.deepEqual(dependent.dependencyAdvisory.waiting, ["dev-page"]);
+    assert.equal(Number(await redis.command("XLEN", `${prefix}:inbox:reviewer`)), 1, "dependency metadata must not create a hidden execution lock");
 
     const repeatedWaiting = await runtime.send({
       to: "reviewer",
@@ -130,8 +130,9 @@ try {
       validationTargetRevision: 1,
     });
     assert.equal(repeatedWaiting.deduplicated, true);
-    assert.equal(repeatedWaiting.deferred, true);
-    assert.equal(Number(await redis.command("XLEN", `${prefix}:inbox:reviewer`)), 0, "Leader retries must not create a hidden second execution");
+    assert.equal(repeatedWaiting.deferred, false);
+    assert.equal(repeatedWaiting.reason, "already_in_progress");
+    assert.equal(Number(await redis.command("XLEN", `${prefix}:inbox:reviewer`)), 1, "Leader retries must not create a second execution");
 
     await redis.command("SET", pluginModule.rootWorkflowStateKey(cfg, rootTaskId), JSON.stringify({
       status: "running",
@@ -158,10 +159,10 @@ try {
       runtime.send(releasedRequest),
       runtime.send({ ...releasedRequest }),
     ]);
-    assert.equal(afterDependency.deduplicated, true, "automatic release and Leader retry reconcile to one execution");
+    assert.equal(afterDependency.deduplicated, true, "an already-dispatched dependent attempt remains one execution");
     assert.equal(afterDependency.reason, "already_in_progress");
     assert.equal(concurrentRetry.deduplicated, true);
-    assert.equal(Number(await redis.command("XLEN", `${prefix}:inbox:reviewer`)), 1, "concurrent release/retry must atomically create one inbox message");
+    assert.equal(Number(await redis.command("XLEN", `${prefix}:inbox:reviewer`)), 1, "concurrent retries must keep one inbox message");
 
     await runtime.send({
       to: "reviewer",
@@ -175,7 +176,7 @@ try {
     });
     assert.equal(Number(await redis.command("XLEN", `${prefix}:inbox:reviewer`)), 2, "independent work must remain immediately parallel");
 
-    await runtime.send({
+    const unknownDependency = await runtime.send({
       to: "reviewer",
       text: "Compatibility assignment with an unknown dependency label.",
       intent: "assignment",
@@ -187,6 +188,8 @@ try {
       dependsOn: ["legacy-natural-language-label"],
     });
     assert.equal(Number(await redis.command("XLEN", `${prefix}:inbox:reviewer`)), 3, "unknown dependency identity must fail open instead of freezing mixed versions");
+		assert.equal(unknownDependency.deferred, false);
+		assert.equal(unknownDependency.dependencyAdvisory.state, "unknown_advisory");
   }, cfg);
 
   console.log("Redis Team dependency supervision regression: OK");

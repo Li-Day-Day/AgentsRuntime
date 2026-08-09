@@ -2772,6 +2772,7 @@ async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }
     await redis.command("CLIENT", "SETNAME", redisClientName(cfg, "activity"));
   } catch {}
   const key = assignmentActivityKey(cfg, rootTaskId, assignmentId);
+	const factsKey = turnFactsKey(cfg, envelope);
   const ttlMs = Math.max(15 * 60 * 1000, policy.softTimeoutSec * 3 * 1000);
   const turnId = trim(envelope.messageId) || "turn_" + randomUUID();
   let stopped = false;
@@ -2796,6 +2797,15 @@ async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }
         else turnState = lastSession ? "running" : "starting";
       }
       const terminal = ["completed", "failed", "cancelled", "lost"].includes(turnState);
+		let durableFacts = {};
+		if (factsKey) {
+			try {
+				const rawFacts = await redis.command("HGETALL", factsKey);
+				for (let index = 0; Array.isArray(rawFacts) && index + 1 < rawFacts.length; index += 2) {
+					durableFacts[String(rawFacts[index])] = rawFacts[index + 1];
+				}
+			} catch {}
+		}
       const snapshot = {
         schemaVersion: 1,
         capability: "assignment_activity_v1",
@@ -2811,6 +2821,11 @@ async function startAssignmentActivityObserver({ cfg, envelope, startedAt, log }
         sessionCursor: lastSession?.sessionCursor || "",
         lastActivityKind: lastSession?.lastActivityKind || "",
         pendingToolName: lastSession?.pendingToolName || "",
+		lastAssistantText: trim(durableFacts.lastAssistantText).slice(0, 4000),
+		lastAssistantAt: trim(durableFacts.lastAssistantAt),
+		lastToolName: trim(durableFacts.lastToolName),
+		lastToolFailed: String(durableFacts.lastToolFailed || "") === "1",
+		lastToolAt: trim(durableFacts.lastToolAt),
         terminal,
       };
       await redis.command("SET", key, JSON.stringify(snapshot), "PX", terminal ? 5 * 60 * 1000 : ttlMs);
@@ -3116,6 +3131,28 @@ async function recordTurnFacts(redis, cfg, envelope, facts = {}) {
     }
 		if (facts.browserVerification && typeof facts.browserVerification === "object") {
 			await redis.command("HSET", factsKey, "browserVerification", JSON.stringify(facts.browserVerification));
+		}
+		if (trim(facts.lastAssistantText)) {
+			await redis.command(
+				"HSET",
+				factsKey,
+				"lastAssistantText",
+				trim(facts.lastAssistantText).slice(0, 4000),
+				"lastAssistantAt",
+				trim(facts.lastAssistantAt) || nowIso(),
+			);
+		}
+		if (trim(facts.lastToolName)) {
+			await redis.command(
+				"HSET",
+				factsKey,
+				"lastToolName",
+				trim(facts.lastToolName),
+				"lastToolFailed",
+				facts.lastToolFailed === true ? "1" : "0",
+				"lastToolAt",
+				trim(facts.lastToolAt) || nowIso(),
+			);
 		}
     const refs = Array.isArray(facts.artifactRefs) ? facts.artifactRefs.map(trim).filter(Boolean) : [];
     if (refs.length) {
@@ -3632,26 +3669,6 @@ async function dispatchDeferredAssignment(redis, cfg, message, deferredKey, defe
   return Array.isArray(result) && Number(result[0]) === 1;
 }
 
-async function refreshDeferredAssignment(redis, cfg, message) {
-  const key = deferredAssignmentsKey(cfg, message.rootTaskId);
-  const field = deferredAssignmentField(message);
-  const raw = await redis.command("HGET", key, field);
-  if (!raw) return false;
-  try {
-    const existing = JSON.parse(String(raw));
-    const refreshed = Object.assign({}, existing, message, {
-      messageId: existing.messageId || message.messageId,
-      createdAt: existing.createdAt || message.createdAt,
-      contextRefs: [...new Set([...(existing.contextRefs || []), ...(message.contextRefs || [])])],
-    });
-    await redis.command("HSET", key, field, JSON.stringify(refreshed));
-    await redis.command("EXPIRE", key, 604800);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function releaseReadyDeferredAssignments(redis, cfg, rootTaskId) {
   if (!redis || !rootTaskId) return 0;
   const key = deferredAssignmentsKey(cfg, rootTaskId);
@@ -3668,28 +3685,28 @@ async function releaseReadyDeferredAssignments(redis, cfg, rootTaskId) {
     const field = String(rawEntries[index]);
     let message = null;
     try { message = JSON.parse(String(rawEntries[index + 1])); } catch { continue; }
+		const targetStatus = await readStatuses(cfg, message.to);
+		if (equivalentActiveAssignment(targetStatus, message)) {
+			// The legacy delayed packet has already become an active execution by a
+			// resend or mixed-version Runtime. Drop only the obsolete queue copy.
+			await redis.command("HDEL", key, field);
+			continue;
+		}
     const dependencies = Array.isArray(message?.dependsOn) ? message.dependsOn.map(trim).filter(Boolean) : [];
-    let ready = dependencies.length > 0;
-    let hasKnownDependency = false;
-    let compatibilityExpired = false;
-    let hasUnknownDependency = false;
-    let hasPersistedUnresolvedDependency = false;
+		const waiting = [];
+		const unknown = [];
     for (const dependency of dependencies) {
       const state = await dependencyDispatchState(redis, cfg, rootTaskId, dependency, workflowState);
-      hasKnownDependency = hasKnownDependency || state.known;
-      hasUnknownDependency = hasUnknownDependency || !state.known;
-      if (state.status !== "succeeded") ready = false;
-      if (state.source === "workflow" && state.status !== "succeeded") hasPersistedUnresolvedDependency = true;
-      if (state.source === "runtime" && Date.now() - Date.parse(state.createdAt || "") > 60000 && !workflowAssignment(workflowState, dependency)) {
-        compatibilityExpired = true;
-      }
+			if (!state.known) unknown.push(dependency);
+			else if (state.status !== "succeeded") waiting.push(dependency);
     }
-    // Unknown or mixed-version identity is not a safe scheduling fact. Fail
-    // open rather than leaving the Team frozen. Runtime-only dispatch facts get
-    // a short window for ClawManager's durable ledger to catch up first.
-    if (!ready && hasUnknownDependency) ready = true;
-    if (!ready && hasKnownDependency && compatibilityExpired && !hasPersistedUnresolvedDependency) ready = true;
-    if (!ready) continue;
+		message = Object.assign({}, message, {
+			dependencyState: unknown.length ? "unknown_advisory" : waiting.length ? "known_waiting" : "known_ready",
+			waitingDependencies: waiting,
+			unknownDependencies: unknown,
+			dependencyReviewSuggested: waiting.length > 0 || unknown.length > 0,
+			legacyDeferredReleasedFailOpen: true,
+		});
     if (await dispatchDeferredAssignment(redis, cfg, message, key, field, String(rawEntries[index + 1]))) {
       released++;
     }
@@ -3890,6 +3907,17 @@ function createRuntime(api) {
   let activeArtifactRefs = [];
   let activeReviewVerification = null;
 	let activeReviewPersistenceQueue = Promise.resolve();
+	let activityEvidencePersistenceQueue = Promise.resolve();
+
+	function queueActivityEvidence(cfg, envelope, facts) {
+		if (!cfg?.redisUrl || !envelope || !hasRequiredRedisTeamKeys(cfg)) return Promise.resolve();
+		activityEvidencePersistenceQueue = activityEvidencePersistenceQueue
+			.then(() => withRedis(cfg, null, (redis) => recordTurnFacts(redis, cfg, envelope, facts)))
+			.catch((err) => {
+				runtimeApi?.logger?.warn?.("redis-team: activity evidence persistence failed: " + (err?.message || String(err)));
+			});
+		return activityEvidencePersistenceQueue;
+	}
 	let activeReviewPersistenceFailed = false;
 	const narrativeProjectionStorage = new AsyncLocalStorage();
 	const activeNarrativeProjections = new Set();
@@ -3942,7 +3970,7 @@ function createRuntime(api) {
 	function enqueueAssistantSessionNarrative(event, ctx = {}) {
 		const projection = narrativeProjectionForContext(event, ctx);
 		const emitter = projection?.emitter;
-		if (!emitter || !projection.envelope || projection.terminalSubmitted) return;
+		if (!projection?.envelope || projection.terminalSubmitted) return;
 		const narrativeText = normalizeAssistantSessionText(assistantTextFromRecord(event));
 		if (!narrativeText) return;
 		const message = event?.message && typeof event.message === "object" ? event.message : {};
@@ -3952,13 +3980,24 @@ function createRuntime(api) {
 			[hookSessionKey(event, ctx), sourceSequence].filter(Boolean).join(":");
 		const contentHash = createHash("sha256").update(narrativeText).digest("hex");
 		projection.queue = projection.queue
-			.then(() => emitter(narrativeText, "before_message_write", {}, {
-				contentHash,
-				sourceOccurredAt: new Date(sourceTimestampMs).toISOString(),
-				sourceSequence,
-				sourceRecordId: sourceRecordId || undefined,
-				lateProjection: false,
-			}))
+			.then(async () => {
+				if (projection.cfg?.redisUrl) {
+					await queueActivityEvidence(projection.cfg, projection.envelope, {
+						lastAssistantText: narrativeText,
+						lastAssistantAt: new Date(sourceTimestampMs).toISOString(),
+					});
+				}
+				if (emitter) {
+					return emitter(narrativeText, "before_message_write", {}, {
+						contentHash,
+						sourceOccurredAt: new Date(sourceTimestampMs).toISOString(),
+						sourceSequence,
+						sourceRecordId: sourceRecordId || undefined,
+						lateProjection: false,
+					});
+				}
+				return false;
+			})
 			.catch((err) => {
 				runtimeApi?.logger?.warn?.("redis-team: live assistant narrative projection failed: " + (err?.message || String(err)));
 			});
@@ -4555,6 +4594,7 @@ function createRuntime(api) {
 
   async function sendWithConfig(cfg, params) {
     params = params || {};
+		let dependencyAdvisory = null;
     if (!cfg.enabled) throw new Error("Redis Team channel is disabled");
     await ensureDirs(cfg);
 		const normalized = await normalizeTeamSendParams(cfg, params, activeEnvelope);
@@ -4873,71 +4913,55 @@ function createRuntime(api) {
       const workflowAttempt = equivalentWorkflowAttempt(workflowState, message);
       if (recordedDispatch || workflowAttempt) {
         const waiting = trim(recordedDispatch?.status).toLowerCase() === "waiting_dependencies";
-        if (waiting) await refreshDeferredAssignment(redis, cfg, message);
-        const activeAttempt = workflowAttempt || recordedDispatch;
-        lastOutbound = {
-          message,
-          target,
-          deduplicated: true,
-          deferred: waiting,
-          reason: waiting ? "waiting_dependencies" : "already_in_progress",
-        };
-        return Object.assign({}, message, {
-          sent: true,
-          deduplicated: true,
-          deferred: waiting,
-          reason: waiting ? "waiting_dependencies" : "already_in_progress",
-          deliveryState: waiting ? "registered_waiting_dependencies" : "registered_or_running",
-          noWorkerReplyExpectedUntilDependenciesReady: waiting || undefined,
-          leaderGuidance: waiting
-            ? "The assignment is registered but the Worker has not started. Do not resend it; execution releases automatically after the exact prerequisites succeed."
-            : "The equivalent attempt is already registered or running. Continue coordinating other work and wait for its result instead of creating another revision.",
-          activeAttempt: {
-            assignmentId: activeAttempt.assignmentId || message.assignmentId,
-            revision: activeAttempt.revision,
-            status: activeAttempt.status,
-            messageId: activeAttempt.messageId,
-          },
-        });
+		if (waiting) {
+			// v4/v5 could leave a hidden dependency-delayed message behind. On an
+			// explicit resend, retire that legacy queue entry and deliver visibly to
+			// the member. The exact active-runtime check above still prevents a
+			// duplicate execution when the original attempt has already started.
+			const deferredKey = deferredAssignmentsKey(cfg, message.rootTaskId);
+			await redis.command("HDEL", deferredKey, deferredAssignmentField(message));
+			if (Number(await redis.command("HLEN", deferredKey)) === 0) {
+				await redis.command("SREM", deferredRootsKey(cfg), message.rootTaskId);
+			}
+		} else {
+			const activeAttempt = workflowAttempt || recordedDispatch;
+			lastOutbound = { message, target, deduplicated: true, deferred: false, reason: "already_in_progress" };
+			return Object.assign({}, message, {
+				sent: true,
+				deduplicated: true,
+				deferred: false,
+				reason: "already_in_progress",
+				deliveryState: "registered_or_running",
+				leaderGuidance: "The equivalent attempt is already registered or running. Continue coordinating other work and wait for its result instead of creating another revision.",
+				activeAttempt: {
+					assignmentId: activeAttempt.assignmentId || message.assignmentId,
+					revision: activeAttempt.revision,
+					status: activeAttempt.status,
+					messageId: activeAttempt.messageId,
+				},
+			});
+		}
       }
 
-      const allowEarlyStart = boolFrom(params.allowEarlyStart ?? params.allow_early_start, false);
-      if (!allowEarlyStart && message.rootTaskId && Array.isArray(message.dependsOn) && message.dependsOn.length > 0) {
+	  if (message.rootTaskId && Array.isArray(message.dependsOn) && message.dependsOn.length > 0) {
         const dependencyStates = [];
         for (const dependency of message.dependsOn) {
           dependencyStates.push({ dependency, ...(await dependencyDispatchState(redis, cfg, message.rootTaskId, dependency, workflowState)) });
         }
         const known = dependencyStates.filter((entry) => entry.known);
         const unresolved = known.filter((entry) => entry.status !== "succeeded");
-        // Unknown/natural dependency labels remain fail-open. An exact issued
-        // or persisted prerequisite is deferred and released automatically.
-        if (known.length === dependencyStates.length && unresolved.length > 0) {
-          const key = deferredAssignmentsKey(cfg, message.rootTaskId);
-          await redis.command("HSET", key, deferredAssignmentField(message), JSON.stringify(message));
-          await redis.command("EXPIRE", key, 604800);
-          await redis.command("SADD", deferredRootsKey(cfg), message.rootTaskId);
-          await redis.command("EXPIRE", deferredRootsKey(cfg), 604800);
-          await recordAssignmentDispatch(redis, cfg, message, "waiting_dependencies");
-          await xaddJson(redis, eventsKey(cfg), eventFor(cfg, "outbound", Object.assign({}, message, {
-            to: target.originalTo,
-            executionDeferred: true,
-            dependencyState: "waiting_dependencies",
-            blockedDependencies: unresolved.map((entry) => entry.dependency),
-            runtimeStatus: "waiting_dependencies",
-            status: "dispatched",
-            visibleToChat: false,
-          })));
-          lastOutbound = { message, target, deferred: true, reason: "waiting_dependencies" };
-          return Object.assign({}, message, {
-            sent: true,
-            deferred: true,
-            reason: "waiting_dependencies",
-            deliveryState: "registered_waiting_dependencies",
-            noWorkerReplyExpectedUntilDependenciesReady: true,
-            leaderGuidance: "The assignment is registered but the Worker has not started. Do not resend it; execution releases automatically after the exact prerequisites succeed.",
-            blockedDependencies: unresolved.map((entry) => entry.dependency),
-          });
-        }
+		const unknown = dependencyStates.filter((entry) => !entry.known);
+		if (unresolved.length || unknown.length) {
+			dependencyAdvisory = {
+				state: unknown.length ? "unknown_advisory" : "known_waiting",
+				waiting: unresolved.map((entry) => entry.dependency),
+				unknown: unknown.map((entry) => entry.dependency),
+			};
+			message.dependencyState = dependencyAdvisory.state;
+			message.waitingDependencies = dependencyAdvisory.waiting;
+			message.unknownDependencies = dependencyAdvisory.unknown;
+			message.dependencyReviewSuggested = true;
+		}
       }
 
       await xaddJson(redis, inboxKey(cfg, message.to), message);
@@ -4987,7 +5011,15 @@ function createRuntime(api) {
     } finally {
       redis.close();
     }
-    return message;
+	return dependencyAdvisory
+		? Object.assign({}, message, {
+			sent: true,
+			deferred: false,
+			deliveryState: "dispatched_with_dependency_advisory",
+			dependencyAdvisory,
+			leaderGuidance: "The assignment was delivered. Dependency metadata was not used as a hidden execution lock; review the listed dependency facts and correct the plan only if needed.",
+		})
+		: message;
   }
 
   async function isTaskTerminal(cfg, envelope) {
@@ -5051,6 +5083,7 @@ function createRuntime(api) {
 		async withNarrativeProjection(envelope, emitter, fn) {
 			const projection = {
 				envelope,
+				cfg: readChannelConfig(runtimeApi.config || {}),
 				emitter: typeof emitter === "function" ? emitter : null,
 				queue: Promise.resolve(),
 				sequence: 0,
@@ -6301,6 +6334,15 @@ export default definePluginEntry({
     api.on(
       "before_tool_call",
       async (event, ctx) => {
+				const observedEnvelope = runtime.currentActiveEnvelope();
+				const observedCfg = readChannelConfig(runtimeApi.config || {});
+				if (observedEnvelope && observedCfg.redisUrl) {
+					queueActivityEvidence(observedCfg, observedEnvelope, {
+						lastToolName: trim(event?.toolName),
+						lastToolFailed: false,
+						lastToolAt: nowIso(),
+					});
+				}
 				const processDecision = teamProcessToolDecision(runtime.currentActiveEnvelope(), event);
 				if (processDecision.block) return processDecision;
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
@@ -6328,6 +6370,15 @@ export default definePluginEntry({
     api.on(
       "after_tool_call",
       async (event, ctx) => {
+				const observedEnvelope = runtime.currentActiveEnvelope();
+				const observedCfg = readChannelConfig(runtimeApi.config || {});
+				if (observedEnvelope && observedCfg.redisUrl) {
+					queueActivityEvidence(observedCfg, observedEnvelope, {
+						lastToolName: trim(event?.toolName),
+						lastToolFailed: !!event?.error || event?.isError === true || event?.is_error === true,
+						lastToolAt: nowIso(),
+					});
+				}
         if (trim(event?.toolName).toLowerCase() !== "browser") return;
 				const callKey = browserHookContextKey(event, ctx);
 				const guardKey = (callKey && reviewerBrowserGuardKeysByCall.get(callKey)) || runtime.browserGuardKey(event, ctx);
@@ -6727,15 +6778,10 @@ export default definePluginEntry({
                       await writeLocalStatus(cfg, { lastContextAt: nowIso() });
                       return;
                     }
-                    // Do not wake a model for a stale monitor packet after its
-                    // assignment has already reached a terminal local status.
-                    // In particular, never turn an accepted result back into
-                    // a visible `running` progress event.
-                    if (monitorIntent && await runtime.isTaskTerminal(cfg, envelope)) {
-                      ctx.log?.info?.("redis-team: answered terminal monitor check without waking the model " + envelope.messageId);
-                      await runtime.reportTerminalMonitor(cfg, envelope);
-                      return;
-                    }
+					// A Monitor packet is an explicit reminder, not a business-state
+					// writer. Even when local status looks terminal, let the member inspect
+					// the supplied evidence and emit the real completion tool call if the
+					// control plane never received it.
                     try {
                       await runtime.withActiveEnvelope(envelope, async () => dispatchInboundDirectDmWithRuntime({
                         cfg: ctx.cfg,
