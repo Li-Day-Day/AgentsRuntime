@@ -16,11 +16,12 @@ func TestImageKeepsBundledPluginsReadableAndRootOwned(t *testing.T) {
 	required := []string{
 		"chmod 0755 /defaults /defaults/.openclaw",
 		"chmod -R a+rX /defaults/.openclaw/npm",
+		"mkdir -p /defaults/.openclaw/npm/node_modules",
 		"ln -s /usr/local/lib/node_modules/openclaw /defaults/.openclaw/npm/node_modules/openclaw",
+		"find /defaults/.openclaw/npm/projects -path \"*/node_modules/${plugin_package}\"",
+		"chown -R root:root \"${package_dir}\"",
+		"legacy_dir=\"/defaults/.openclaw/npm/node_modules/${plugin_package}\"",
 		"chown -h root:root /defaults/.openclaw/npm/node_modules/openclaw",
-		"/defaults/.openclaw/npm/node_modules/@dingtalk-real-ai/dingtalk-connector",
-		"/defaults/.openclaw/npm/node_modules/@openclaw/feishu",
-		"/defaults/.openclaw/npm/node_modules/@wecom/wecom-openclaw-plugin",
 	}
 	for _, fragment := range required {
 		if !strings.Contains(dockerfile, fragment) {
