@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: codex-golden-v2-smoke
+  namespace: clawmanager-ltt-user-1
+  labels:
+    app: clawmanager-codex-golden-smoke
+    clawmanager.io/golden-pvc: codex-golden-v2
+spec:
+  accessModes:
+    - ReadWriteOnce
+  dataSource:
+    apiGroup: ""
+    kind: PersistentVolumeClaim
+    name: codex-golden-v2
+  resources:
+    requests:
+      storage: 80Gi
+  storageClassName: longhorn
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: codex-golden-v2-smoke
+  namespace: clawmanager-ltt-user-1
+  labels:
+    app: clawmanager-codex-golden-smoke
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    clawmanager.io/windows-runtime: "true"
+  terminationGracePeriodSeconds: 120
+  containers:
+    - name: desktop
+      image: 10.130.14.23:5000/windows-vm-codex:2026.8.10-phase2-r2
+      imagePullPolicy: Always
+      securityContext:
+        privileged: true
+      env:
+        - name: CPU_CORES
+          value: "6"
+        - name: RAM_SIZE
+          value: 10G
+        - name: DISK_SIZE
+          value: 80G
+        - name: DISK_FMT
+          value: qcow2
+        - name: SHUTDOWN
+          value: "Y"
+        - name: QEMU_TIMEOUT
+          value: "120"
+      ports:
+        - name: http
+          containerPort: 8006
+        - name: rdp
+          containerPort: 3389
+      readinessProbe:
+        tcpSocket:
+          port: rdp
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        timeoutSeconds: 2
+        failureThreshold: 120
+      resources:
+        requests:
+          cpu: "6"
+          memory: 12Gi
+        limits:
+          cpu: "6"
+          memory: 12Gi
+      volumeMounts:
+        - name: data
+          mountPath: /storage
+        - name: shared
+          mountPath: /shared
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: codex-golden-v2-smoke
+    - name: shared
+      emptyDir: {}
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 4Gi

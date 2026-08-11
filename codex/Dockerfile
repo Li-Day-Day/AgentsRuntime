@@ -18,7 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && npm install -g "@openai/codex@${CODEX_VERSION}" && codex --version
 COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
 COPY codex/rootfs/ /
-RUN chmod 755 /usr/local/bin/clawmanager-agent /usr/local/bin/start-codex-terminal /custom-cont-init.d/99-codex-config /etc/s6-overlay/s6-rc.d/codex-agent/run /etc/s6-overlay/s6-rc.d/codex-terminal/run \
+RUN find /etc/s6-overlay/s6-rc.d -type f -exec sed -i 's/\r$//' {} + \
+    && sed -i 's/\r$//' /usr/local/bin/start-codex-terminal /custom-cont-init.d/99-codex-config \
+    && chmod 755 /usr/local/bin/clawmanager-agent /usr/local/bin/start-codex-terminal /custom-cont-init.d/99-codex-config /etc/s6-overlay/s6-rc.d/codex-agent/run /etc/s6-overlay/s6-rc.d/codex-terminal/run \
     && mkdir -p /var/lib/clawmanager-agent /config/.codex /config/workspace \
     && chown -R abc:abc /config/.codex /config/workspace || true
 EXPOSE 3001

@@ -35,6 +35,45 @@ docker build \
   .
 ```
 
+To build an image that downloads the official ChatGPT desktop app for Windows,
+including its native Codex agent, and installs it during Windows first boot:
+
+```bash
+docker build \
+  -f windows-vm/Dockerfile.codex \
+  -t windows-vm-codex:local \
+  .
+```
+
+The Codex image downloads OpenAI's current Store-signed x64 MSIX and offline
+license from the stable URLs documented for enterprise Windows deployment. The
+OEM script installs the package for the active desktop user, or provisions it
+for Windows users when the OEM phase runs as `SYSTEM`. It also creates
+`C:\Workspace` as the default location for user projects. New disks default to
+Windows 11 in Chinese (`LANGUAGE=Chinese`, `REGION=zh-CN`, and
+`KEYBOARD=zh-CN`). Git for Windows, Node.js LTS, Python, and ripgrep are
+installed during the OEM phase, together with long-path and developer-mode
+settings needed by coding agents.
+
+To build and push directly to the ClawManager registry (no SSH registry tunnel
+required):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File windows-vm/fetch-codex-devtools.ps1
+docker build `
+  -f windows-vm/Dockerfile.codex `
+  -t 10.130.14.23:5000/windows-vm-codex:2026.8.10-phase2-r2 `
+  .
+docker push 10.130.14.23:5000/windows-vm-codex:2026.8.10-phase2-r2
+```
+
+The Docker image contains the OEM payload, not the installed Windows system
+disk. Reusing an existing `/storage` volume therefore keeps its old Windows
+version, language, and installed tools. For the Windows 11 Chinese baseline,
+create a fresh 80 GiB golden PVC, complete the first boot and OEM installation,
+shut Windows down cleanly, and only then switch ClawManager from
+`codex-golden-v1` to the new `codex-golden-v2` PVC.
+
 The WorkBuddy installer is not stored in this repository. The Dockerfile reads
 the current official URL from:
 

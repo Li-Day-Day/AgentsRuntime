@@ -7,3 +7,4 @@ clawmanager-agent/clawmanager-agent-linux
 __pycache__/
 *.py[cod]
 .codex
+windows-vm/.build-cache/

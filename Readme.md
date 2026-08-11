@@ -2,6 +2,10 @@
 
 This repository contains Docker image definitions for the runtimes used by the ClawManager Agents project.
 
+For an end-to-end Chinese deployment manual covering WorkBuddy, Windows Codex,
+Claude Code, image publishing, ClawManager configuration, and Windows golden
+PVC creation, see [WorkBuddy、Codex 与 Claude Code 接入 ClawManager 部署手册](docs/workbuddy-codex-claude-code-deployment-guide.zh-CN.md).
+
 The repository currently documents these runtime images:
 
 - `hermes`

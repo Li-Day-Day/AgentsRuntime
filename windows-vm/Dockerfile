@@ -23,7 +23,10 @@ COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/claw
 COPY windows-vm/windows-vm-entrypoint /usr/local/bin/windows-vm-entrypoint
 COPY windows-vm/windows-vm-gateway /usr/local/bin/windows-vm-gateway
 
-RUN chmod 0755 \
+RUN sed -i 's/\r$//' \
+  /usr/local/bin/windows-vm-entrypoint \
+  /usr/local/bin/windows-vm-gateway \
+  && chmod 0755 \
   /usr/local/bin/clawmanager-agent \
   /usr/local/bin/windows-vm-entrypoint \
   /usr/local/bin/windows-vm-gateway

@@ -18,7 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && claude --version
 COPY --from=clawmanager-agent-builder /out/clawmanager-agent /usr/local/bin/clawmanager-agent
 COPY claude-code/rootfs/ /
-RUN chmod 755 /usr/local/bin/clawmanager-agent /usr/local/bin/start-claude-code-terminal /custom-cont-init.d/99-claude-code-config /etc/s6-overlay/s6-rc.d/claude-code-agent/run /etc/s6-overlay/s6-rc.d/claude-code-terminal/run \
+RUN find /etc/s6-overlay/s6-rc.d -type f -exec sed -i 's/\r$//' {} + \
+    && sed -i 's/\r$//' /usr/local/bin/start-claude-code-terminal /custom-cont-init.d/99-claude-code-config \
+    && chmod 755 /usr/local/bin/clawmanager-agent /usr/local/bin/start-claude-code-terminal /custom-cont-init.d/99-claude-code-config /etc/s6-overlay/s6-rc.d/claude-code-agent/run /etc/s6-overlay/s6-rc.d/claude-code-terminal/run \
     && mkdir -p /var/lib/clawmanager-agent /config/.claude /config/workspace \
     && chown -R abc:abc /config/.claude /config/workspace || true
 EXPOSE 3001

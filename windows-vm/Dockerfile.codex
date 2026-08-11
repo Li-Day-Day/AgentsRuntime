@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.7
+
+ARG WINDOWS_VM_BASE_IMAGE=windows-vm:local
+FROM ${WINDOWS_VM_BASE_IMAGE}
+
+ARG CODEX_MSIX_URL="https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix"
+ARG CODEX_LICENSE_URL="https://persistent.oaistatic.com/codex-app-prod/ChatGPT-License.xml"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN set -eux; \
+  rm -rf /oem/*; \
+  mkdir -p /oem/codex; \
+  curl -fL "${CODEX_MSIX_URL}" -o /oem/codex/ChatGPT-x64.msix; \
+  curl -fL "${CODEX_LICENSE_URL}" -o /oem/codex/ChatGPT-License.xml; \
+  chmod 0644 /oem/codex/ChatGPT-x64.msix /oem/codex/ChatGPT-License.xml
+
+COPY windows-vm/.build-cache/codex/ /oem/codex/devtools/
+
+# These defaults are consumed by dockurr/windows only when a new Windows disk
+# is installed. Existing /storage volumes keep their already-installed OS.
+ENV VERSION="11" \
+    LANGUAGE="Chinese" \
+    REGION="zh-CN" \
+    KEYBOARD="zh-CN" \
+    RAM_SIZE="10G" \
+    CPU_CORES="6" \
+    DISK_SIZE="80G"
+
+COPY windows-vm/oem/install-codex.bat /oem/install.bat
+COPY windows-vm/oem/codex-install.ps1 /oem/codex/install.ps1
+COPY windows-vm/oem/codex-bootstrap.ps1 /oem/codex/bootstrap.ps1
+COPY windows-vm/oem/codex-devtools.ps1 /oem/codex/devtools.ps1
+
+RUN sed -i 's/\r$//' /usr/local/bin/windows-vm-entrypoint /usr/local/bin/windows-vm-gateway; \
+  chmod 0755 /usr/local/bin/windows-vm-entrypoint /usr/local/bin/windows-vm-gateway; \
+  chmod 0644 /oem/install.bat /oem/codex/install.ps1 /oem/codex/bootstrap.ps1 /oem/codex/devtools.ps1 /oem/codex/devtools/*
